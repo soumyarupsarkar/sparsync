@@ -22,7 +22,6 @@ Still pending:
 
 - Transport-level overhead reduction in `spargio-quic` (crypto/memory-movement dominated first-sync cost) remains the largest open lever.
 - No additional in-repo big-ticket blockers identified from this plan; optional WAL work is parked unless profiling shows state persistence becomes a dominant cost.
-- Initial upstream transport profile tuning hooks are now in place as opt-in experiments, but did not yet produce consistent first-sync gains in the current harness.
 
 ## Execution Sequence Status
 
