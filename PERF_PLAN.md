@@ -42,6 +42,28 @@ Status: completed (BENCHMARKS.md and PERFORMANCE.md updated after this wave).
 - Continue true zero-copy-ish flow across file/network boundaries where runtime and QUIC APIs permit.
 - Re-profile first-sync after each transport change with the same benchmark harness and median methodology.
 
+## Remaining Big-Ticket Opportunities (Ranked, March 4, 2026)
+
+1. `spargio-quic` hot-path allocation/copy reduction (highest expected impact)
+  - Prioritize packet/stream buffer reuse and avoid per-op realloc/copy churn in send/recv loops.
+  - Goal: reduce first-sync instruction share in `memcpy`/`memset` and TLS/QUIC glue overhead.
+2. Long-lived streaming upload protocol (incremental write/decode, fewer framed batch round trips)
+  - Move more transfer paths from request/response batch framing to sustained stream flow.
+  - Goal: cut control-frame parsing/serialization and stream setup overhead further.
+3. Optional trusted-LAN non-crypto transport mode (only if beating `rsync://` is strict)
+  - `rsync://` daemon baseline is unencrypted while QUIC/TLS is encrypted.
+  - Goal: enable a fair unencrypted fast path for explicit trusted environments.
+4. Deeper transport tuning in `spargio-quic`
+  - Focus on pacing/ACK behavior, scheduler wakeups, send quantum/coalescing, and flow-control defaults.
+  - Goal: improve first-sync without regressing warm/changed medians.
+5. End-to-end zero-copy-ish file/network data path improvements
+  - Reduce remaining file-buffer to QUIC-payload and QUIC-payload to file-buffer copies.
+  - Goal: lower memory-movement cost across large payloads.
+
+Lower expected ROI for current benchmark profile:
+
+- Additional scan/hash optimization (current profiles show transport + memory movement dominate first sync).
+
 ## Benchmark Fairness Plan
 
 ### Track A: Unencrypted baseline

@@ -4,9 +4,9 @@
 
 Remote-style comparison was run with:
 
-- `./scripts/bench_remote_rsync_vs_sparsync.sh`
+- `RUNS=5 TRANSPORTS=daemon ./scripts/bench_remote_rsync_vs_sparsync_median.sh`
+- `RUNS=5 TRANSPORTS=ssh ./scripts/bench_remote_rsync_vs_sparsync_median.sh`
 - `SPARSYNC_BIN=./target/release/sparsync` (auto-selected by script)
-- `RSYNC_TRANSPORT=daemon` and `RSYNC_TRANSPORT=ssh`
 - Host: `nproc=16` logical cores
 - Default dataset/profile:
   - `SMALL_DIRS=10`
@@ -22,6 +22,15 @@ Dataset:
 
 - `files=1008`
 - `bytes=20873216`
+- Layout:
+  - `small/dir_0..9/file_0..99.bin` (`1000` files total, `4096` bytes each, random `/dev/urandom` payloads)
+  - `large/chunk_0..7.bin` (`8` files total, `2097152` bytes each, random `/dev/urandom` payloads)
+
+Changed phase (`CHANGED_FILES=100`):
+
+- Benchmark appends one line (`delta-<n>`) to `100` files selected in lexical order from `find <src>/small -type f | sort`.
+- With default dataset naming, this means all files under `small/dir_0` are modified in lexical filename order.
+- The mutation pass is done separately for the `sparsync` source tree and the `rsync` source tree so both tools process equivalent churn.
 
 Results below are medians of 5 consecutive runs per transport mode after integrating long-lived framed streams over QUIC (`read_chunk` incremental decode + stream reuse for multi-request transfer paths).
 
@@ -29,17 +38,17 @@ Results below are medians of 5 consecutive runs per transport mode after integra
 
 | Metric | sparsync (ms) | rsync (ms) | sparsync / rsync |
 |---|---:|---:|---:|
-| Initial sync | 406 | 229 | 1.77x |
-| Second sync (no changes) | 30 | 137 | 0.22x |
-| Changed sync | 55 | 149 | 0.37x |
+| Initial sync | 402 | 230 | 1.75x |
+| Second sync (no changes) | 29 | 136 | 0.21x |
+| Changed sync | 54 | 155 | 0.35x |
 
 ### SSH Transport (`RSYNC_TRANSPORT=ssh`)
 
 | Metric | sparsync (ms) | rsync over SSH (ms) | sparsync / rsync |
 |---|---:|---:|---:|
-| Initial sync | 410 | 571 | 0.72x |
-| Second sync (no changes) | 31 | 248 | 0.13x |
-| Changed sync | 55 | 264 | 0.21x |
+| Initial sync | 419 | 552 | 0.76x |
+| Second sync (no changes) | 28 | 246 | 0.11x |
+| Changed sync | 50 | 270 | 0.19x |
 
 Interpretation:
 
@@ -57,7 +66,7 @@ Experimental notes:
 
 - Profiling used `valgrind` (`callgrind` and `cachegrind`) plus targeted `perf stat` and `strace -c` passes.
 - Top instruction consumers were memory initialization/copy (`memset`/`memcpy`) and QUIC/TLS crypto paths (`ring`/`quinn`), indicating first-sync is currently dominated by payload movement + encrypted transport overhead rather than scan/hashing.
-- Scan/hashing is not the main bottleneck in the benchmark profile: first push logs consistently show single-digit to low-double-digit millisecond scan phases versus ~450ms+ total push elapsed.
+- Scan/hashing is not the main bottleneck in the benchmark profile: first push logs consistently show single-digit to low-double-digit millisecond scan phases versus ~400ms+ total push elapsed.
 - Full profiling/optimization log: [PERFORMANCE.md](./PERFORMANCE.md)
 - Ongoing execution roadmap: [PERF_PLAN.md](./PERF_PLAN.md)
 
