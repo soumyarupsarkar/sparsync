@@ -6,6 +6,33 @@
 - Provide fair encrypted and unencrypted comparisons in benchmark reporting.
 - Keep protocol/runtime design lightweight and maintainable for the `spargio` showcase.
 
+## Current Status (March 4, 2026)
+
+Implemented in this wave:
+
+- Dual benchmark tracks in canonical harness (`RSYNC_TRANSPORT=daemon|ssh`).
+- Median report helper script (`scripts/bench_remote_rsync_vs_sparsync_median.sh`).
+- First-sync control path reduction via batched large-file init.
+- Client-side transfer instrumentation (`SPARSYNC_PROFILE=1`) with counters/timers.
+
+Still pending:
+
+- Additional protocol/stream continuity changes beyond current batching.
+- Optional WAL-backed state persistence experiment (deprioritized for now; current profiling shows transport dominates and state commit time is low in this workload).
+
+## Execution Sequence Status
+
+1. Establish dual benchmark tracks (`daemon` and `ssh`) and lock reporting format.
+Status: completed.
+2. Run baseline snapshots on both tracks.
+Status: completed and refreshed via median helper script.
+3. Execute Phase 1 and Phase 2 optimizations with per-change benchmark checks.
+Status: completed for this wave (copy reductions + large-file batched init + control-path simplification).
+4. Execute Phase 3 and Phase 4 tuning with guardrails.
+Status: partially completed (state batching + transport knobs + benchmark tuning; WAL intentionally deferred pending a state-heavy bottleneck signal).
+5. Publish updated benchmark + profiling notes after each optimization wave.
+Status: completed (BENCHMARKS.md and PERFORMANCE.md updated after this wave).
+
 ## Benchmark Fairness Plan
 
 ### Track A: Unencrypted baseline

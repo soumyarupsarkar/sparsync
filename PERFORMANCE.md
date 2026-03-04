@@ -27,26 +27,35 @@ Dataset/profile used in this pass:
 - `RSYNC_ARGS="-a --delete"`
 - `RSYNC_TRANSPORT=daemon` for these reported numbers
 
-Representative medians from the latest 5-run sample (normal path):
+Representative medians from the latest 5-run sample:
 
-- `sparsync_first_ms=466`
-- `sparsync_second_ms=32`
-- `sparsync_changed_ms=56`
-- `rsync_remote_first_ms=229`
-- `rsync_remote_second_ms=136`
-- `rsync_remote_changed_ms=149`
+- Daemon mode (`RSYNC_TRANSPORT=daemon`):
+  - `sparsync_first_ms=433`
+  - `sparsync_second_ms=28`
+  - `sparsync_changed_ms=57`
+  - `rsync_remote_first_ms=233`
+  - `rsync_remote_second_ms=137`
+  - `rsync_remote_changed_ms=156`
+- SSH mode (`RSYNC_TRANSPORT=ssh`):
+  - `sparsync_first_ms=435`
+  - `sparsync_second_ms=29`
+  - `sparsync_changed_ms=56`
+  - `rsync_ssh_first_ms=554`
+  - `rsync_ssh_second_ms=251`
+  - `rsync_ssh_changed_ms=266`
 
 Interpretation:
 
-- Initial sync is still slower than remote rsync in this profile.
-- Warm and changed syncs remain faster than remote rsync.
+- Initial sync is still slower than unencrypted rsync daemon.
+- Across encrypted comparison (`rsync` over SSH), `sparsync` is faster in all measured phases.
+- Warm and changed syncs remain substantially faster in both comparison modes.
 
 ## Profiling Setup
 
 Environment limitations in this workspace:
 
-- `perf`: unavailable
-- `strace`: unavailable
+- `perf`: installed (`/usr/bin/perf` wrapper; kernel-matched binary available via linux-tools)
+- `strace`: available
 - `valgrind`: available
 
 Tools used:
@@ -96,6 +105,30 @@ What this means:
   - Removed client-side hashmap reconciliation for these responses.
   - Files: `src/protocol.rs`, `src/server.rs`, `src/transfer.rs`
 
+### Large-file control-path reduction
+
+- Replaced per-file init round-trips for large files with batched init requests.
+- Upload workers now consume precomputed `InitFileResponse` state from batch init.
+- Files: `src/transfer.rs`
+
+### Instrumentation and reproducibility
+
+- Added client transfer profiling counters/timers gated by `SPARSYNC_PROFILE=1`.
+  - Includes control frame count, streams opened, request/response bytes, disk read/encode/roundtrip timings.
+  - File: `src/transfer.rs`
+- Added server profiling counters/timers under the same `SPARSYNC_PROFILE=1` flag.
+  - Includes stream read/decode/process/encode/write timing and batch split/write/state-commit timing.
+  - File: `src/server.rs`
+- Added median report harness:
+  - `./scripts/bench_remote_rsync_vs_sparsync_median.sh`
+  - Supports repeated runs across daemon and ssh transports.
+
+### Transport tuning outcomes
+
+- Added optional `SPARSYNC_SMALL_FILE_MAX_BYTES` tuning knob and evaluated larger thresholds.
+- For this benchmark profile, larger small-file thresholds did not improve median first-sync time and sometimes regressed changed-sync latency, so default remained conservative (`128 KiB`).
+- Added optional `SPARSYNC_AUTO_CONNECTIONS=1` path for experimentation; default remains off to preserve warm/churn guardrails.
+
 ### Server-side batching improvements
 
 - Removed per-file payload `to_vec()` copies in small/cold batch handlers (process slices directly).
@@ -118,7 +151,8 @@ What this means:
 ## Current Outcome
 
 - The above changes improved hot-path efficiency and preserved strong warm/churned performance.
-- On this benchmark profile, initial sync is still not faster than remote rsync.
+- Initial sync is still behind unencrypted rsync daemon on this profile.
+- Encrypted comparison (`rsync` over SSH) now shows `sparsync` faster across first/warm/changed phases in the latest sample.
 - `--cold-start` remains experimental and is currently slower than the tuned default path on this dataset.
 
 ## Reproduce
@@ -141,6 +175,24 @@ Run repeated sample:
 for i in 1 2 3 4 5; do ./scripts/bench_remote_rsync_vs_sparsync.sh; done
 ```
 
+Median helper (both transports, `RUNS=5` by default):
+
+```bash
+./scripts/bench_remote_rsync_vs_sparsync_median.sh
+```
+
+Enable push transfer profile counters:
+
+```bash
+SPARSYNC_PROFILE=1 ./target/release/sparsync push --source ... --server ... --ca ...
+```
+
+Run a profiled daemon benchmark pass:
+
+```bash
+SPARSYNC_PROFILE=1 RSYNC_TRANSPORT=daemon ./scripts/bench_remote_rsync_vs_sparsync.sh
+```
+
 Optional server write-fanout tuning:
 
 ```bash
@@ -149,9 +201,9 @@ SPARSYNC_BATCH_WRITE_CONCURRENCY=48 ./scripts/bench_remote_rsync_vs_sparsync.sh
 
 ## Next Profiling Targets
 
-- Instrument frame-size and stream-count distributions during first sync.
+- Add periodic/summary export of server profile counters to a machine-readable artifact for automated regression checks.
 - Measure time split between:
   - Client encode/compress/copy
   - Network/crypto
   - Server decode/write/state commit
-- Evaluate protocol changes that reduce first-sync stream churn (larger contiguous data streams and fewer control round trips).
+- Evaluate protocol changes that reduce first-sync transport overhead further (fewer encrypted stream handshakes and improved payload continuity).

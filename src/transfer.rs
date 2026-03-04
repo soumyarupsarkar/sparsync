@@ -13,12 +13,15 @@ use spargio::{RuntimeHandle, fs};
 use spargio_quic::{QuicConnection, QuicEndpoint, QuicEndpointOptions};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const BATCH_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const COLD_BATCH_TARGET_BYTES: usize = 32 * 1024 * 1024;
-const SMALL_FILE_MAX_BYTES: u64 = 128 * 1024;
+const DEFAULT_SMALL_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SMALL_BATCH_MAX_FILES: usize = 4096;
+const INIT_BATCH_MAX_FILES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct PushOptions {
@@ -100,10 +103,139 @@ struct FileTransferOptions {
     compression_level: i32,
     max_stream_payload: usize,
     resume: bool,
+    stats: TransferStats,
+    small_file_max_bytes: u64,
+}
+
+#[derive(Default)]
+struct TransferStatsInner {
+    connections: AtomicU64,
+    control_frames: AtomicU64,
+    streams_opened: AtomicU64,
+    request_bytes: AtomicU64,
+    response_bytes: AtomicU64,
+    disk_read_bytes: AtomicU64,
+    encoded_bytes: AtomicU64,
+    connect_ns: AtomicU64,
+    disk_read_ns: AtomicU64,
+    encode_ns: AtomicU64,
+    roundtrip_ns: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+struct TransferStats {
+    enabled: bool,
+    inner: Arc<TransferStatsInner>,
+}
+
+impl TransferStats {
+    fn from_env() -> Self {
+        let enabled = std::env::var("SPARSYNC_PROFILE")
+            .map(|value| value != "0")
+            .unwrap_or(false);
+        Self {
+            enabled,
+            inner: Arc::new(TransferStatsInner::default()),
+        }
+    }
+
+    fn add_connections(&self, count: usize) {
+        self.inner
+            .connections
+            .store(count as u64, Ordering::Relaxed);
+    }
+
+    fn add_connect_time(&self, elapsed: Duration) {
+        self.inner
+            .connect_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_disk_read(&self, elapsed: Duration, bytes: u64) {
+        self.inner
+            .disk_read_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        self.inner
+            .disk_read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_encode(&self, elapsed: Duration, bytes: usize) {
+        self.inner
+            .encode_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        self.inner
+            .encoded_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn add_control_frame(&self) {
+        self.inner.control_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_stream_opened(&self) {
+        self.inner.streams_opened.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_request_bytes(&self, bytes: usize) {
+        self.inner
+            .request_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn add_response_bytes(&self, bytes: usize) {
+        self.inner
+            .response_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn add_roundtrip_time(&self, elapsed: Duration) {
+        self.inner
+            .roundtrip_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn print_if_enabled(&self, total_elapsed: Duration, cold_start: bool) {
+        if !self.enabled {
+            return;
+        }
+        let label = if cold_start { "cold" } else { "normal" };
+        println!(
+            "profile mode={} connections={} control_frames={} streams_opened={} request_bytes={} response_bytes={} disk_read_bytes={} encoded_bytes={} connect_ms={} disk_read_ms={} encode_ms={} roundtrip_ms={} total_ms={}",
+            label,
+            self.inner.connections.load(Ordering::Relaxed),
+            self.inner.control_frames.load(Ordering::Relaxed),
+            self.inner.streams_opened.load(Ordering::Relaxed),
+            self.inner.request_bytes.load(Ordering::Relaxed),
+            self.inner.response_bytes.load(Ordering::Relaxed),
+            self.inner.disk_read_bytes.load(Ordering::Relaxed),
+            self.inner.encoded_bytes.load(Ordering::Relaxed),
+            Duration::from_nanos(self.inner.connect_ns.load(Ordering::Relaxed)).as_millis(),
+            Duration::from_nanos(self.inner.disk_read_ns.load(Ordering::Relaxed)).as_millis(),
+            Duration::from_nanos(self.inner.encode_ns.load(Ordering::Relaxed)).as_millis(),
+            Duration::from_nanos(self.inner.roundtrip_ns.load(Ordering::Relaxed)).as_millis(),
+            total_elapsed.as_millis(),
+        );
+    }
+}
+
+fn small_file_max_bytes_from_env() -> u64 {
+    std::env::var("SPARSYNC_SMALL_FILE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_SMALL_FILE_MAX_BYTES)
+}
+
+fn auto_connections_enabled() -> bool {
+    std::env::var("SPARSYNC_AUTO_CONNECTIONS")
+        .map(|value| value == "1")
+        .unwrap_or(false)
 }
 
 pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Result<PushSummary> {
     let started = Instant::now();
+    let stats = TransferStats::from_env();
     let client_config = certs::load_client_config(&options.ca)
         .with_context(|| format!("load CA {}", options.ca.display()))?;
 
@@ -118,6 +250,7 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
     endpoint.set_default_client_config(client_config);
 
     let mut connections = Vec::with_capacity(options.connections.max(1));
+    let connect_started = Instant::now();
     for _ in 0..options.connections.max(1) {
         let connection = endpoint
             .connect(options.server, &options.server_name)
@@ -125,9 +258,12 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
             .with_context(|| format!("connect to {} ({})", options.server, options.server_name))?;
         connections.push(connection);
     }
+    stats.add_connect_time(connect_started.elapsed());
+    stats.add_connections(connections.len());
 
     if options.cold_start {
-        let summary = push_directory_cold(handle.clone(), &options, &connections, started).await?;
+        let summary =
+            push_directory_cold(handle.clone(), &options, &connections, started, stats).await?;
         return Ok(summary);
     }
 
@@ -157,10 +293,15 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         compression_level: options.compression_level,
         max_stream_payload: options.max_stream_payload,
         resume: options.resume,
+        stats: stats.clone(),
+        small_file_max_bytes: small_file_max_bytes_from_env(),
     };
 
-    let (small_files, large_files) =
-        partition_small_files(manifest.files, transfer_options.chunk_size);
+    let (small_files, large_files) = partition_small_files(
+        manifest.files,
+        transfer_options.chunk_size,
+        transfer_options.small_file_max_bytes,
+    );
 
     let small_batches = build_small_batches(small_files, transfer_options.max_stream_payload);
     let small_join = if small_batches.is_empty() {
@@ -190,19 +331,42 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
     };
 
     let mut totals = BatchResult::default();
+    let (init_totals, uploads) =
+        initialize_large_files(&connections[0], &transfer_options, large_files).await?;
+    totals.merge(init_totals);
 
-    let mut files = large_files.into_iter();
+    if auto_connections_enabled() && options.connections == 1 {
+        let upload_bytes = uploads.iter().map(|(file, _)| file.size).sum::<u64>();
+        if !uploads.is_empty() && upload_bytes >= 8 * 1024 * 1024 {
+            let connect_started = Instant::now();
+            let connection = endpoint
+                .connect(options.server, &options.server_name)
+                .await
+                .with_context(|| {
+                    format!(
+                        "connect additional stream to {} ({})",
+                        options.server, options.server_name
+                    )
+                })?;
+            connections.push(connection);
+            stats.add_connect_time(connect_started.elapsed());
+            stats.add_connections(connections.len());
+        }
+    }
+
+    let mut files = uploads.into_iter();
     let mut running = FuturesUnordered::new();
     let mut next_connection = 0usize;
     for _ in 0..options.parallel_files.max(1) {
-        if let Some(file) = files.next() {
+        if let Some((file, init)) = files.next() {
             let connection = connections[next_connection % connections.len()].clone();
             next_connection = next_connection.saturating_add(1);
-            running.push(spawn_transfer_job(
+            running.push(spawn_upload_job(
                 handle.clone(),
                 connection,
                 transfer_options.clone(),
                 file,
+                init,
             )?);
         }
     }
@@ -211,14 +375,15 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         let result = joined.map_err(|err| join_error("file transfer task canceled", err))??;
         totals.add_file_result(result);
 
-        if let Some(file) = files.next() {
+        if let Some((file, init)) = files.next() {
             let connection = connections[next_connection % connections.len()].clone();
             next_connection = next_connection.saturating_add(1);
-            running.push(spawn_transfer_job(
+            running.push(spawn_upload_job(
                 handle.clone(),
                 connection,
                 transfer_options.clone(),
                 file,
+                init,
             )?);
         }
     }
@@ -230,12 +395,15 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         totals.merge(small_totals);
     }
 
+    let elapsed = started.elapsed();
+    stats.print_if_enabled(elapsed, false);
+
     Ok(PushSummary {
         files_transferred: totals.files_transferred,
         files_skipped: totals.files_skipped,
         bytes_sent: totals.bytes_sent,
         bytes_raw: totals.bytes_raw,
-        elapsed: started.elapsed(),
+        elapsed,
     })
 }
 
@@ -244,6 +412,7 @@ async fn push_directory_cold(
     options: &PushOptions,
     connections: &[QuicConnection],
     started: Instant,
+    stats: TransferStats,
 ) -> Result<PushSummary> {
     let chunk_size = options.scan.chunk_size.max(1);
     let (source_root, files, enumeration_elapsed, metadata_elapsed) = scan::build_file_list(
@@ -302,9 +471,11 @@ async fn push_directory_cold(
 
     for file in files {
         let source_path = source_root.join(Path::new(&file.relative_path));
+        let read_started = Instant::now();
         let raw = fs::read(&handle, &source_path)
             .await
             .with_context(|| format!("read source {}", source_path.display()))?;
+        stats.add_disk_read(read_started.elapsed(), raw.len() as u64);
         if raw.len() as u64 != file.size {
             bail!(
                 "file size changed during cold read for {}: expected {} got {}",
@@ -321,8 +492,10 @@ async fn push_directory_cold(
         } else {
             ((file.size + (chunk_size as u64).saturating_sub(1)) / chunk_size as u64) as usize
         };
+        let encode_started = Instant::now();
         let (encoded, compressed) = compression::maybe_compress_vec(raw, options.compression_level)
             .with_context(|| format!("compress {}", file.relative_path))?;
+        stats.add_encode(encode_started.elapsed(), encoded.len());
         let encoded_len = encoded.len();
 
         if !metas.is_empty() && payload.len().saturating_add(encoded_len) > batch_limit {
@@ -334,6 +507,7 @@ async fn push_directory_cold(
                 std::mem::take(&mut payload),
                 std::mem::take(&mut pending),
                 options.max_stream_payload,
+                stats.clone(),
             ));
 
             if running.len() >= connections.len() {
@@ -372,6 +546,7 @@ async fn push_directory_cold(
             std::mem::take(&mut payload),
             std::mem::take(&mut pending),
             options.max_stream_payload,
+            stats.clone(),
         ));
     }
 
@@ -379,12 +554,15 @@ async fn push_directory_cold(
         totals.merge(joined?);
     }
 
+    let elapsed = started.elapsed();
+    stats.print_if_enabled(elapsed, true);
+
     Ok(PushSummary {
         files_transferred: totals.files_transferred,
         files_skipped: totals.files_skipped,
         bytes_sent: totals.bytes_sent,
         bytes_raw: totals.bytes_raw,
-        elapsed: started.elapsed(),
+        elapsed,
     })
 }
 
@@ -394,6 +572,7 @@ async fn upload_cold_batch(
     payload: Vec<u8>,
     pending: Vec<(String, u64, u64)>,
     max_stream_payload: usize,
+    stats: TransferStats,
 ) -> Result<BatchResult> {
     if metas.is_empty() {
         return Ok(BatchResult::default());
@@ -407,6 +586,7 @@ async fn upload_cold_batch(
         }),
         Some(&payload),
         max_stream_payload,
+        &stats,
     )
     .await?;
 
@@ -444,12 +624,13 @@ async fn upload_cold_batch(
 fn partition_small_files(
     files: Vec<FileManifest>,
     chunk_size: usize,
+    small_file_max_bytes: u64,
 ) -> (Vec<FileManifest>, Vec<FileManifest>) {
     let mut small = Vec::new();
     let mut large = Vec::new();
 
     for file in files {
-        if is_small_file_candidate(&file, chunk_size) {
+        if is_small_file_candidate(&file, chunk_size, small_file_max_bytes) {
             small.push(file);
         } else {
             large.push(file);
@@ -459,8 +640,12 @@ fn partition_small_files(
     (small, large)
 }
 
-fn is_small_file_candidate(file: &FileManifest, chunk_size: usize) -> bool {
-    file.total_chunks == 1 && file.size <= SMALL_FILE_MAX_BYTES && file.size <= chunk_size as u64
+fn is_small_file_candidate(
+    file: &FileManifest,
+    chunk_size: usize,
+    small_file_max_bytes: u64,
+) -> bool {
+    file.total_chunks == 1 && file.size <= small_file_max_bytes && file.size <= chunk_size as u64
 }
 
 fn build_small_batches(
@@ -497,60 +682,122 @@ fn build_small_batches(
     batches
 }
 
-fn spawn_transfer_job(
+fn build_init_batches(
+    files: Vec<FileManifest>,
+    max_stream_payload: usize,
+) -> Vec<Vec<FileManifest>> {
+    let header_budget = max_stream_payload
+        .saturating_sub(512 * 1024)
+        .clamp(256 * 1024, 8 * 1024 * 1024);
+
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut estimated = 0usize;
+
+    for file in files {
+        // Rough estimate for rkyv request metadata size per entry.
+        let per_file = 128usize.saturating_add(file.relative_path.len());
+        let would_overflow = !current.is_empty()
+            && (current.len() >= INIT_BATCH_MAX_FILES
+                || estimated.saturating_add(per_file) > header_budget);
+        if would_overflow {
+            batches.push(current);
+            current = Vec::new();
+            estimated = 0;
+        }
+        estimated = estimated.saturating_add(per_file);
+        current.push(file);
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
+}
+
+fn spawn_upload_job(
     handle: RuntimeHandle,
     connection: QuicConnection,
     options: FileTransferOptions,
     file: FileManifest,
+    init: InitFileResponse,
 ) -> Result<spargio::JoinHandle<Result<FileResult>>> {
     let task_handle = handle.clone();
     handle
         .spawn_stealable(async move {
-            transfer_one_file(task_handle.clone(), connection, options, file)
+            upload_file_batches(&task_handle, &connection, &options, &file, &init)
                 .await
                 .with_context(|| "transfer one file")
         })
         .map_err(|err| runtime_error("spawn transfer task", err))
 }
 
-async fn transfer_one_file(
-    handle: RuntimeHandle,
-    connection: QuicConnection,
-    options: FileTransferOptions,
-    file: FileManifest,
-) -> Result<FileResult> {
-    let init_request = Frame::InitFileRequest(InitFileRequest {
-        relative_path: file.relative_path.clone(),
-        size: file.size,
-        mode: file.mode,
-        mtime_sec: file.mtime_sec,
-        file_hash: file.file_hash.clone(),
-        chunk_size: options.chunk_size,
-        total_chunks: file.total_chunks,
-        resume: options.resume,
-    });
+async fn initialize_large_files(
+    connection: &QuicConnection,
+    options: &FileTransferOptions,
+    files: Vec<FileManifest>,
+) -> Result<(BatchResult, Vec<(FileManifest, InitFileResponse)>)> {
+    let init_batches = build_init_batches(files, options.max_stream_payload);
+    let mut totals = BatchResult::default();
+    let mut uploads = Vec::new();
 
-    let init_response =
-        send_frame_roundtrip(&connection, init_request, None, options.max_stream_payload).await?;
-
-    let init = match init_response {
-        Frame::InitFileResponse(resp) => resp,
-        Frame::Error(err) => bail!("init rejected for {}: {}", file.relative_path, err.message),
-        other => bail!(
-            "unexpected init response for {}: {other:?}",
-            file.relative_path
-        ),
-    };
-
-    if matches!(init.action, InitAction::Skip) {
-        return Ok(FileResult {
-            transferred: false,
-            bytes_sent: 0,
-            bytes_raw: 0,
+    for batch in init_batches {
+        let init_request = Frame::InitBatchRequest(InitBatchRequest {
+            files: batch
+                .iter()
+                .map(|file| InitFileRequest {
+                    relative_path: file.relative_path.clone(),
+                    size: file.size,
+                    mode: file.mode,
+                    mtime_sec: file.mtime_sec,
+                    file_hash: file.file_hash.clone(),
+                    chunk_size: options.chunk_size,
+                    total_chunks: file.total_chunks,
+                    resume: options.resume,
+                })
+                .collect(),
         });
+
+        let init_response = send_frame_roundtrip(
+            connection,
+            init_request,
+            None,
+            options.max_stream_payload,
+            &options.stats,
+        )
+        .await?;
+        let init = match init_response {
+            Frame::InitBatchResponse(resp) => resp,
+            Frame::Error(err) => bail!("large batch init rejected: {}", err.message),
+            other => bail!("unexpected large batch init response: {other:?}"),
+        };
+
+        if init.results.len() != batch.len() {
+            bail!(
+                "large batch init response size mismatch: got {} expected {}",
+                init.results.len(),
+                batch.len()
+            );
+        }
+
+        for (file, result) in batch.into_iter().zip(init.results.into_iter()) {
+            if matches!(result.action, InitAction::Skip) {
+                totals.files_skipped = totals.files_skipped.saturating_add(1);
+                continue;
+            }
+            uploads.push((
+                file,
+                InitFileResponse {
+                    action: InitAction::Upload,
+                    next_chunk: result.next_chunk,
+                    message: result.message,
+                },
+            ));
+        }
     }
 
-    upload_file_batches(&handle, &connection, &options, &file, &init).await
+    Ok((totals, uploads))
 }
 
 async fn transfer_small_batch(
@@ -579,8 +826,14 @@ async fn transfer_small_batch(
             .collect(),
     });
 
-    let init_response =
-        send_frame_roundtrip(connection, init_request, None, options.max_stream_payload).await?;
+    let init_response = send_frame_roundtrip(
+        connection,
+        init_request,
+        None,
+        options.max_stream_payload,
+        &options.stats,
+    )
+    .await?;
     let init = match init_response {
         Frame::InitBatchResponse(resp) => resp,
         Frame::Error(err) => bail!("small batch init rejected: {}", err.message),
@@ -620,9 +873,13 @@ async fn transfer_small_batch(
         }
 
         let source_path = options.source_root.join(Path::new(&file.relative_path));
+        let read_started = Instant::now();
         let raw = fs::read(handle, &source_path)
             .await
             .with_context(|| format!("read source {}", source_path.display()))?;
+        options
+            .stats
+            .add_disk_read(read_started.elapsed(), raw.len() as u64);
         if raw.len() as u64 != file.size {
             bail!(
                 "small file size changed while reading {}: expected {} got {}",
@@ -633,8 +890,12 @@ async fn transfer_small_batch(
         }
 
         let raw_len = raw.len();
+        let encode_started = Instant::now();
         let (encoded, compressed) = compression::maybe_compress_vec(raw, options.compression_level)
             .with_context(|| format!("compress {}", file.relative_path))?;
+        options
+            .stats
+            .add_encode(encode_started.elapsed(), encoded.len());
 
         totals.bytes_raw = totals.bytes_raw.saturating_add(raw_len as u64);
         totals.bytes_sent = totals.bytes_sent.saturating_add(encoded.len() as u64);
@@ -663,6 +924,7 @@ async fn transfer_small_batch(
             upload_request,
             Some(&upload_payload),
             options.max_stream_payload,
+            &options.stats,
         )
         .await?;
 
@@ -732,6 +994,7 @@ async fn upload_file_batches(
                 break;
             }
             let offset = (next_chunk as u64).saturating_mul(options.chunk_size as u64);
+            let read_started = Instant::now();
             let chunk = source_file
                 .read_at(offset, options.chunk_size)
                 .await
@@ -743,14 +1006,21 @@ async fn upload_file_batches(
                         offset
                     )
                 })?;
+            options
+                .stats
+                .add_disk_read(read_started.elapsed(), chunk.len() as u64);
 
             if chunk.is_empty() {
                 break;
             }
 
             let raw_len = chunk.len();
+            let encode_started = Instant::now();
             let (encoded_payload, compressed) =
                 compression::maybe_compress_vec(chunk, options.compression_level)?;
+            options
+                .stats
+                .add_encode(encode_started.elapsed(), encoded_payload.len());
             let encoded_len = encoded_payload.len();
             packets.push(crate::protocol::ChunkPacket {
                 raw_len,
@@ -792,6 +1062,7 @@ async fn upload_file_batches(
             frame,
             Some(&batch_payload),
             options.max_stream_payload,
+            &options.stats,
         )
         .await?;
 
@@ -856,11 +1127,14 @@ async fn send_frame_roundtrip(
     request: Frame,
     payload: Option<&[u8]>,
     max_stream_payload: usize,
+    stats: &TransferStats,
 ) -> Result<Frame> {
+    let encode_started = Instant::now();
     let payload_len = payload.map_or(0usize, |p| p.len());
     let frame_header =
         crate::protocol::encode_header(&request, payload_len).context("encode request frame")?;
     let encoded_len = frame_header.len().saturating_add(payload_len);
+    stats.add_encode(encode_started.elapsed(), frame_header.len());
     if encoded_len > max_stream_payload {
         bail!(
             "encoded frame too large: {} > max_stream_payload {}",
@@ -868,11 +1142,15 @@ async fn send_frame_roundtrip(
             max_stream_payload
         );
     }
+    stats.add_control_frame();
+    stats.add_request_bytes(encoded_len);
 
+    let roundtrip_started = Instant::now();
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .context("open bidirectional stream")?;
+    stats.add_stream_opened();
 
     send.write_all(&frame_header)
         .await
@@ -888,6 +1166,7 @@ async fn send_frame_roundtrip(
         .read_to_end(max_stream_payload)
         .await
         .context("read frame response")?;
+    stats.add_response_bytes(response.len());
     let (frame, payload) = crate::protocol::decode(&response).context("decode frame response")?;
     if !payload.is_empty() {
         bail!(
@@ -895,5 +1174,6 @@ async fn send_frame_roundtrip(
             payload.len()
         );
     }
+    stats.add_roundtrip_time(roundtrip_started.elapsed());
     Ok(frame)
 }

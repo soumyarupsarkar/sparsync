@@ -230,7 +230,7 @@ CFG
   SSH_PID=$!
   sleep 1
 
-  ssh_cmd="ssh -i $SSH_DIR/bench_id_ed25519 -p $RSYNC_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+  ssh_cmd="ssh -i $SSH_DIR/bench_id_ed25519 -p $RSYNC_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
   rs1_start=$(ms_now)
   rsync $RSYNC_ARGS -e "$ssh_cmd" "$SRC_RS_SSH/" "${RSYNC_SSH_USER}@127.0.0.1:$DST_RS_SSH/" >/tmp/rsync-bench1.log

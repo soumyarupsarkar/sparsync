@@ -16,8 +16,8 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
@@ -38,6 +38,125 @@ struct ServerContext {
     max_stream_payload: usize,
     preserve_metadata: bool,
     partials_maybe_empty: Arc<AtomicBool>,
+    profile: ServerProfile,
+}
+
+#[derive(Default)]
+struct ServerProfileInner {
+    streams: AtomicU64,
+    request_bytes: AtomicU64,
+    response_bytes: AtomicU64,
+    read_ns: AtomicU64,
+    decode_ns: AtomicU64,
+    process_ns: AtomicU64,
+    encode_ns: AtomicU64,
+    write_ns: AtomicU64,
+    batch_split_ns: AtomicU64,
+    batch_write_ns: AtomicU64,
+    state_commit_ns: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+struct ServerProfile {
+    enabled: bool,
+    inner: Arc<ServerProfileInner>,
+}
+
+impl ServerProfile {
+    fn from_env() -> Self {
+        let enabled = std::env::var("SPARSYNC_PROFILE")
+            .map(|value| value != "0")
+            .unwrap_or(false);
+        Self {
+            enabled,
+            inner: Arc::new(ServerProfileInner::default()),
+        }
+    }
+
+    fn add_stream(&self, request_bytes: usize) -> u64 {
+        self.inner
+            .request_bytes
+            .fetch_add(request_bytes as u64, Ordering::Relaxed);
+        self.inner.streams.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn add_response_bytes(&self, bytes: usize) {
+        self.inner
+            .response_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn add_read(&self, elapsed: Duration) {
+        self.inner
+            .read_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_decode(&self, elapsed: Duration) {
+        self.inner
+            .decode_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_process(&self, elapsed: Duration) {
+        self.inner
+            .process_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_encode(&self, elapsed: Duration) {
+        self.inner
+            .encode_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_write(&self, elapsed: Duration) {
+        self.inner
+            .write_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_batch_split(&self, elapsed: Duration) {
+        self.inner
+            .batch_split_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_batch_write(&self, elapsed: Duration) {
+        self.inner
+            .batch_write_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_state_commit(&self, elapsed: Duration) {
+        self.inner
+            .state_commit_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn maybe_log_stream_totals(&self, stream_idx: u64) {
+        if !self.enabled {
+            return;
+        }
+        if stream_idx % 8 != 0 {
+            return;
+        }
+        info!(
+            target: "sparsync::server_profile",
+            streams = self.inner.streams.load(Ordering::Relaxed),
+            request_bytes = self.inner.request_bytes.load(Ordering::Relaxed),
+            response_bytes = self.inner.response_bytes.load(Ordering::Relaxed),
+            read_ms = Duration::from_nanos(self.inner.read_ns.load(Ordering::Relaxed)).as_millis(),
+            decode_ms = Duration::from_nanos(self.inner.decode_ns.load(Ordering::Relaxed)).as_millis(),
+            process_ms = Duration::from_nanos(self.inner.process_ns.load(Ordering::Relaxed)).as_millis(),
+            encode_ms = Duration::from_nanos(self.inner.encode_ns.load(Ordering::Relaxed)).as_millis(),
+            write_ms = Duration::from_nanos(self.inner.write_ns.load(Ordering::Relaxed)).as_millis(),
+            batch_split_ms = Duration::from_nanos(self.inner.batch_split_ns.load(Ordering::Relaxed)).as_millis(),
+            batch_write_ms = Duration::from_nanos(self.inner.batch_write_ns.load(Ordering::Relaxed)).as_millis(),
+            state_commit_ms = Duration::from_nanos(self.inner.state_commit_ns.load(Ordering::Relaxed)).as_millis(),
+            "server_profile"
+        );
+    }
 }
 
 const BATCH_WRITE_CONCURRENCY_MIN: usize = 16;
@@ -110,6 +229,7 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
         max_stream_payload: options.max_stream_payload,
         preserve_metadata: options.preserve_metadata,
         partials_maybe_empty: Arc::new(AtomicBool::new(partials_maybe_empty)),
+        profile: ServerProfile::from_env(),
     };
 
     loop {
@@ -186,12 +306,19 @@ async fn handle_stream(
     mut send: spargio_quic::QuicSendStream,
     mut recv: spargio_quic::QuicRecvStream,
 ) -> Result<()> {
+    let read_started = Instant::now();
     let bytes = recv
         .read_to_end(context.max_stream_payload)
         .await
         .context("read stream payload")?;
-    let (frame, payload) = crate::protocol::decode(&bytes).context("decode frame")?;
+    context.profile.add_read(read_started.elapsed());
+    let stream_idx = context.profile.add_stream(bytes.len());
 
+    let decode_started = Instant::now();
+    let (frame, payload) = crate::protocol::decode(&bytes).context("decode frame")?;
+    context.profile.add_decode(decode_started.elapsed());
+
+    let process_started = Instant::now();
     let response = match frame {
         Frame::InitFileRequest(req) => process_init_file(&context, req).await,
         Frame::InitBatchRequest(req) => process_init_batch(&context, req).await,
@@ -213,12 +340,19 @@ async fn handle_stream(
             message: format!("{err:#}"),
         }),
     };
+    context.profile.add_process(process_started.elapsed());
 
+    let encode_started = Instant::now();
     let response_bytes = crate::protocol::encode(&response, None).context("encode response")?;
+    context.profile.add_encode(encode_started.elapsed());
+    context.profile.add_response_bytes(response_bytes.len());
+    let write_started = Instant::now();
     send.write_all(&response_bytes)
         .await
         .context("write response")?;
     send.finish().context("finish response stream")?;
+    context.profile.add_write(write_started.elapsed());
+    context.profile.maybe_log_stream_totals(stream_idx);
     Ok(())
 }
 
@@ -404,8 +538,10 @@ async fn process_upload_batch(
         }));
     }
 
+    let split_started = Instant::now();
     let packets = crate::protocol::decode_chunk_batch(payload, req.sent_chunks)
         .with_context(|| format!("decode chunk batch for {}", req.relative_path))?;
+    context.profile.add_batch_split(split_started.elapsed());
 
     let partial_path = partial_path(context.state.partial_root(), &relative);
     if let Some(parent) = partial_path.parent() {
@@ -427,6 +563,7 @@ async fn process_upload_batch(
         .await
         .with_context(|| format!("open partial {}", partial_path.display()))?;
 
+    let write_started = Instant::now();
     let mut next_chunk = req.start_chunk;
     for packet in packets {
         let decoded = compression::maybe_decode(packet.data, packet.compressed, packet.raw_len)?;
@@ -450,12 +587,15 @@ async fn process_upload_batch(
             .with_context(|| format!("write partial {} at {}", partial_path.display(), offset))?;
         next_chunk = next_chunk.saturating_add(1);
     }
+    context.profile.add_batch_write(write_started.elapsed());
 
+    let state_started = Instant::now();
     context
         .state
         .update_partial_progress(key, next_chunk, false)
         .await
         .with_context(|| format!("update batch progress {}", req.relative_path))?;
+    context.profile.add_state_commit(state_started.elapsed());
 
     if !req.finalize {
         return Ok(Frame::UploadBatchResponse(UploadBatchResponse {
@@ -480,7 +620,9 @@ async fn process_upload_batch(
         }));
     }
 
+    let finalize_started = Instant::now();
     let bytes_written = finalize_uploaded_file(context, &req, &relative, &partial_path).await?;
+    context.profile.add_state_commit(finalize_started.elapsed());
     Ok(Frame::UploadBatchResponse(UploadBatchResponse {
         accepted: true,
         message: "file finalized".to_string(),
@@ -497,8 +639,10 @@ async fn process_upload_small_batch(
 ) -> Result<Frame> {
     let write_concurrency =
         choose_write_concurrency(req.files.len(), req.files.iter().map(|f| f.size).sum());
+    let split_started = Instant::now();
     let payload_parts = crate::protocol::split_small_file_payload(payload, &req.files)
         .context("split small-file batch payload")?;
+    context.profile.add_batch_split(split_started.elapsed());
 
     let mut destination_parents = HashSet::new();
     let mut partial_parents = HashSet::new();
@@ -544,6 +688,7 @@ async fn process_upload_small_batch(
         ));
     }
 
+    let write_started = Instant::now();
     let mut ordered = vec![None; total_files];
     let mut completions = Vec::new();
     while let Some((index, result)) = running.next().await {
@@ -566,12 +711,15 @@ async fn process_upload_small_batch(
         let result = item.ok_or_else(|| anyhow::anyhow!("missing small-batch result {index}"))?;
         results.push(result);
     }
+    context.profile.add_batch_write(write_started.elapsed());
 
+    let state_started = Instant::now();
     context
         .state
         .complete_files_batch(&completions)
         .await
         .context("persist small batch completion state")?;
+    context.profile.add_state_commit(state_started.elapsed());
 
     Ok(Frame::UploadSmallBatchResponse(UploadSmallBatchResponse {
         results,
@@ -585,8 +733,10 @@ async fn process_upload_cold_batch(
 ) -> Result<Frame> {
     let write_concurrency =
         choose_write_concurrency(req.files.len(), req.files.iter().map(|f| f.size).sum());
+    let split_started = Instant::now();
     let payload_parts = crate::protocol::split_cold_file_payload(payload, &req.files)
         .context("split cold-file batch payload")?;
+    context.profile.add_batch_split(split_started.elapsed());
     let allow_skip = req.allow_skip;
 
     let mut destination_parents = HashSet::new();
@@ -624,6 +774,7 @@ async fn process_upload_cold_batch(
         ));
     }
 
+    let write_started = Instant::now();
     let mut ordered = vec![None; total_files];
     let mut completions = Vec::new();
     while let Some((index, result)) = running.next().await {
@@ -647,12 +798,15 @@ async fn process_upload_cold_batch(
         let result = item.ok_or_else(|| anyhow::anyhow!("missing cold-batch result {index}"))?;
         results.push(result);
     }
+    context.profile.add_batch_write(write_started.elapsed());
 
+    let state_started = Instant::now();
     context
         .state
         .complete_files_batch(&completions)
         .await
         .context("persist cold batch completion state")?;
+    context.profile.add_state_commit(state_started.elapsed());
 
     Ok(Frame::UploadColdBatchResponse(UploadColdBatchResponse {
         results,

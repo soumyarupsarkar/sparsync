@@ -63,6 +63,7 @@ Add `--preserve-metadata` for rsync-like mode/mtime preservation.
 Re-running `push` skips already complete files via persisted hashes.
 
 Use `--cold-start` for the experimental cold-copy fast path (optimized for initial empty-target syncs).
+Set `SPARSYNC_PROFILE=1` to emit per-push transfer counters/timers.
 
 ## Scan Command
 
@@ -118,11 +119,19 @@ RSYNC_ARGS="-a --delete" \
 
 `SPARSYNC_BATCH_WRITE_CONCURRENCY` is optional; by default the server auto-tunes write fan-out per batch.
 `RSYNC_TRANSPORT` controls comparison mode: `daemon` (default, unencrypted) or `ssh` (encrypted).
+`SPARSYNC_PROFILE=1` enables client/server transfer profiling counters in logs.
+`SPARSYNC_SMALL_FILE_MAX_BYTES` and `SPARSYNC_AUTO_CONNECTIONS` are optional tuning knobs for throughput experiments.
 
 Encrypted comparison example:
 
 ```bash
 RSYNC_TRANSPORT=ssh ./scripts/bench_remote_rsync_vs_sparsync.sh
+```
+
+Median report helper (defaults to `RUNS=5`, both transports):
+
+```bash
+./scripts/bench_remote_rsync_vs_sparsync_median.sh
 ```
 
 ## Architecture
