@@ -30,19 +30,19 @@ Dataset/profile used in this pass:
 Representative medians from the latest 5-run sample:
 
 - Daemon mode (`RSYNC_TRANSPORT=daemon`):
-  - `sparsync_first_ms=406`
-  - `sparsync_second_ms=30`
-  - `sparsync_changed_ms=55`
-  - `rsync_remote_first_ms=229`
-  - `rsync_remote_second_ms=137`
-  - `rsync_remote_changed_ms=149`
-- SSH mode (`RSYNC_TRANSPORT=ssh`):
-  - `sparsync_first_ms=410`
+  - `sparsync_first_ms=417`
   - `sparsync_second_ms=31`
-  - `sparsync_changed_ms=55`
-  - `rsync_ssh_first_ms=571`
-  - `rsync_ssh_second_ms=248`
-  - `rsync_ssh_changed_ms=264`
+  - `sparsync_changed_ms=56`
+  - `rsync_remote_first_ms=224`
+  - `rsync_remote_second_ms=135`
+  - `rsync_remote_changed_ms=155`
+- SSH mode (`RSYNC_TRANSPORT=ssh`):
+  - `sparsync_first_ms=422`
+  - `sparsync_second_ms=28`
+  - `sparsync_changed_ms=52`
+  - `rsync_ssh_first_ms=528`
+  - `rsync_ssh_second_ms=251`
+  - `rsync_ssh_changed_ms=263`
 
 Interpretation:
 
@@ -146,6 +146,8 @@ What this means:
 - Added optional `SPARSYNC_SMALL_FILE_MAX_BYTES` tuning knob and evaluated larger thresholds.
 - For this benchmark profile, larger small-file thresholds did not improve median first-sync time and sometimes regressed changed-sync latency, so default remained conservative (`128 KiB`).
 - Added optional `SPARSYNC_AUTO_CONNECTIONS=1` path for experimentation; default remains off to preserve warm/churn guardrails.
+- Added optional `SPARGIO_QUIC_TUNE=1` transport profile path upstream (`spargio-quic`) for larger QUIC windows/buffers and keepalive tuning.
+- In current benchmark runs this profile did not yield consistent first-sync wins, so it remains opt-in and disabled by default.
 
 ### Server-side batching improvements
 

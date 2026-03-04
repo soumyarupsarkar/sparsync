@@ -23,23 +23,23 @@ Dataset:
 - `files=1008`
 - `bytes=20873216`
 
-Results below are medians of 5 consecutive runs per transport mode after integrating long-lived framed streams over QUIC (`read_chunk` incremental decode + stream reuse for multi-request transfer paths).
+Results below are medians of 5 consecutive runs per transport mode after integrating long-lived framed streams over QUIC and applying the latest `spargio-quic` hot-path copy/loop reductions.
 
 ### Daemon Transport (`RSYNC_TRANSPORT=daemon`)
 
 | Metric | sparsync (ms) | rsync (ms) | sparsync / rsync |
 |---|---:|---:|---:|
-| Initial sync | 406 | 229 | 1.77x |
-| Second sync (no changes) | 30 | 137 | 0.22x |
-| Changed sync | 55 | 149 | 0.37x |
+| Initial sync | 417 | 224 | 1.86x |
+| Second sync (no changes) | 31 | 135 | 0.23x |
+| Changed sync | 56 | 155 | 0.36x |
 
 ### SSH Transport (`RSYNC_TRANSPORT=ssh`)
 
 | Metric | sparsync (ms) | rsync over SSH (ms) | sparsync / rsync |
 |---|---:|---:|---:|
-| Initial sync | 410 | 571 | 0.72x |
-| Second sync (no changes) | 31 | 248 | 0.13x |
-| Changed sync | 55 | 264 | 0.21x |
+| Initial sync | 422 | 528 | 0.80x |
+| Second sync (no changes) | 28 | 251 | 0.11x |
+| Changed sync | 52 | 263 | 0.20x |
 
 Interpretation:
 
@@ -49,9 +49,10 @@ Interpretation:
 
 Experimental notes:
 
-- `--cold-start` is implemented. In a 3-run sample on this dataset, first-sync median was `491ms` (`sparsync_first_ms`) versus `229ms` (`rsync_remote_first_ms`), so it remains slower than the normal path here.
+- `--cold-start` is implemented. In a 3-run sample on this dataset, first-sync median was `491ms` (`sparsync_first_ms`) versus `224ms` (`rsync_remote_first_ms`), so it remains slower than the normal path here.
 - Server write fan-out can be tuned with `SPARSYNC_BATCH_WRITE_CONCURRENCY` (auto-tuned by default).
 - Latest profiled first-sync pass shows `control_frames=5` and `streams_opened=4` (from `SPARSYNC_PROFILE=1`), reflecting one fewer client stream open than prior snapshots due to long-lived framed stream reuse.
+- New `spargio-quic` transport profile tuning exists but is opt-in (`SPARGIO_QUIC_TUNE=1`) because it has not shown consistent first-sync improvements on this benchmark profile yet.
 
 ## Profiling Notes (March 4, 2026)
 
