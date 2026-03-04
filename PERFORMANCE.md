@@ -174,6 +174,18 @@ What this means:
 - `--cold-start` remains experimental and is currently slower than the tuned default path on this dataset.
 - Profile counters on this dataset now show lower first-sync control/stream churn (`control_frames=5`, `streams_opened=4` in latest profiled pass, down from `11`/`11` in prior snapshots).
 
+## Experiment Log (Reverted)
+
+- Experiment: upstream `spargio-quic` transport-profile tuning and scheduler probe.
+- Upstream experiment commit: `81a290d` in `/workspace/spargio`.
+- Upstream revert commit: `5bde001` in `/workspace/spargio`.
+- `sparsync` docs snapshot for that experiment: `d49560b`; reverted by `a4492ab`.
+- Reason for revert: no consistent first-sync gain, with repeated regressions in daemon-mode first sync.
+- Representative regression during experiment (5-run median, same dataset): daemon first sync moved from roughly `~405ms` baseline to `~417ms`.
+- Post-revert confirmation run (5-run median) on this host:
+- `RSYNC_TRANSPORT=daemon`: `sparsync_first_ms=415`, `rsync_remote_first_ms=229`, `sparsync_second_ms=33`, `sparsync_changed_ms=58`.
+- `RSYNC_TRANSPORT=ssh`: `sparsync_first_ms=405`, `rsync_ssh_first_ms=554`, `sparsync_second_ms=30`, `sparsync_changed_ms=54`.
+
 ## Reproduce
 
 Build:
