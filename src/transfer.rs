@@ -1137,7 +1137,6 @@ async fn transfer_small_batch(
 #[derive(Debug)]
 struct PreparedUploadBatch {
     frame: Frame,
-    payload: Vec<u8>,
     start_chunk: usize,
     end_chunk: usize,
     sent_chunks: usize,
@@ -1176,18 +1175,23 @@ async fn upload_file_batches(
     let per_chunk_budget = options.chunk_size.saturating_add(16).max(1);
     let max_chunks_per_batch = (payload_budget / per_chunk_budget).max(1);
     let upload_window = upload_window_from_env().max(1);
+    let payload_capacity = payload_budget.min(BATCH_TARGET_BYTES);
 
     let mut next_chunk_to_send = init.next_chunk.min(file.total_chunks);
     let mut finalize_sent = false;
     let mut sent_bytes = 0u64;
     let mut raw_bytes = 0u64;
     let mut inflight = VecDeque::with_capacity(upload_window);
+    let mut payload_pool: Vec<Vec<u8>> = Vec::with_capacity(upload_window);
     let mut session = FrameSession::open(connection, options.max_stream_payload, &options.stats)
         .await
         .with_context(|| format!("open upload stream for {}", file.relative_path))?;
 
     loop {
         while inflight.len() < upload_window && !finalize_sent {
+            let mut batch_payload = payload_pool
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(payload_capacity.min(256 * 1024)));
             let prepared = prepare_upload_batch(
                 &source_file,
                 &source_path,
@@ -1195,14 +1199,16 @@ async fn upload_file_batches(
                 file,
                 next_chunk_to_send,
                 max_chunks_per_batch,
-                payload_budget,
+                &mut batch_payload,
             )
             .await?;
 
             let sent_at = session
-                .send_request(prepared.frame, Some(&prepared.payload))
+                .send_request(prepared.frame, Some(&batch_payload))
                 .await
                 .with_context(|| format!("send upload batch for {}", file.relative_path))?;
+            batch_payload.clear();
+            payload_pool.push(batch_payload);
 
             next_chunk_to_send = prepared.end_chunk;
             finalize_sent |= prepared.finalize;
@@ -1310,11 +1316,11 @@ async fn prepare_upload_batch(
     file: &FileManifest,
     start_chunk: usize,
     max_chunks_per_batch: usize,
-    payload_budget: usize,
+    batch_payload: &mut Vec<u8>,
 ) -> Result<PreparedUploadBatch> {
     let mut next_chunk = start_chunk;
     let mut sent_chunks = 0usize;
-    let mut batch_payload = Vec::with_capacity(payload_budget.min(BATCH_TARGET_BYTES));
+    batch_payload.clear();
     let mut batch_estimate = 0usize;
     let mut batch_sent = 0u64;
     let mut batch_raw = 0u64;
@@ -1398,7 +1404,6 @@ async fn prepare_upload_batch(
 
     Ok(PreparedUploadBatch {
         frame,
-        payload: batch_payload,
         start_chunk,
         end_chunk: next_chunk,
         sent_chunks,
