@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 const BATCH_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const COLD_BATCH_TARGET_BYTES: usize = 32 * 1024 * 1024;
+const DIRECT_BATCH_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_SMALL_FILE_MAX_BYTES: u64 = 128 * 1024;
+const DEFAULT_DIRECT_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SMALL_BATCH_MAX_FILES: usize = 4096;
 const INIT_BATCH_MAX_FILES: usize = 4096;
 
@@ -105,6 +107,7 @@ struct FileTransferOptions {
     resume: bool,
     stats: TransferStats,
     small_file_max_bytes: u64,
+    direct_file_max_bytes: u64,
 }
 
 #[derive(Default)]
@@ -227,6 +230,14 @@ fn small_file_max_bytes_from_env() -> u64 {
         .unwrap_or(DEFAULT_SMALL_FILE_MAX_BYTES)
 }
 
+fn direct_file_max_bytes_from_env() -> u64 {
+    std::env::var("SPARSYNC_DIRECT_FILE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_DIRECT_FILE_MAX_BYTES)
+}
+
 fn auto_connections_enabled() -> bool {
     std::env::var("SPARSYNC_AUTO_CONNECTIONS")
         .map(|value| value == "1")
@@ -295,6 +306,7 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         resume: options.resume,
         stats: stats.clone(),
         small_file_max_bytes: small_file_max_bytes_from_env(),
+        direct_file_max_bytes: direct_file_max_bytes_from_env(),
     };
 
     let (small_files, large_files) = partition_small_files(
@@ -354,7 +366,18 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         }
     }
 
-    let mut files = uploads.into_iter();
+    let (direct_files, streamed_files) =
+        split_direct_uploads(uploads, transfer_options.direct_file_max_bytes);
+    let direct_totals = transfer_initialized_direct_batches(
+        handle.clone(),
+        &connections,
+        &transfer_options,
+        direct_files,
+    )
+    .await?;
+    totals.merge(direct_totals);
+
+    let mut files = streamed_files.into_iter();
     let mut running = FuturesUnordered::new();
     let mut next_connection = 0usize;
     for _ in 0..options.parallel_files.max(1) {
@@ -461,6 +484,7 @@ async fn push_directory_cold(
             .max(4 * 1024 * 1024);
         batch_limit = batch_limit.min(split_target);
     }
+    let max_inflight_batches = connections.len().saturating_mul(2).max(1);
 
     let mut totals = BatchResult::default();
     let mut payload = Vec::new();
@@ -510,7 +534,7 @@ async fn push_directory_cold(
                 stats.clone(),
             ));
 
-            if running.len() >= connections.len() {
+            if running.len() >= max_inflight_batches {
                 let joined = running
                     .next()
                     .await
@@ -621,6 +645,122 @@ async fn upload_cold_batch(
     Ok(totals)
 }
 
+async fn transfer_initialized_direct_batches(
+    handle: RuntimeHandle,
+    connections: &[QuicConnection],
+    options: &FileTransferOptions,
+    files: Vec<FileManifest>,
+) -> Result<BatchResult> {
+    if files.is_empty() {
+        return Ok(BatchResult::default());
+    }
+
+    let total_bytes = files.iter().map(|file| file.size).sum::<u64>();
+    let mut batch_limit = options
+        .max_stream_payload
+        .saturating_sub(512 * 1024)
+        .clamp(512 * 1024, DIRECT_BATCH_TARGET_BYTES);
+    if connections.len() > 1 {
+        let split_target = (total_bytes as usize)
+            .saturating_div(connections.len())
+            .max(4 * 1024 * 1024);
+        batch_limit = batch_limit.min(split_target);
+    }
+    let max_inflight_batches = connections.len().saturating_mul(2).max(1);
+
+    let mut totals = BatchResult::default();
+    let mut payload = Vec::new();
+    let mut metas = Vec::new();
+    let mut pending = Vec::new();
+    let mut running = FuturesUnordered::new();
+    let mut next_connection = 0usize;
+
+    for file in files {
+        let source_path = options.source_root.join(Path::new(&file.relative_path));
+        let read_started = Instant::now();
+        let raw = fs::read(&handle, &source_path)
+            .await
+            .with_context(|| format!("read source {}", source_path.display()))?;
+        options
+            .stats
+            .add_disk_read(read_started.elapsed(), raw.len() as u64);
+        if raw.len() as u64 != file.size {
+            bail!(
+                "file size changed during direct read for {}: expected {} got {}",
+                file.relative_path,
+                file.size,
+                raw.len()
+            );
+        }
+
+        let raw_len = raw.len();
+        let encode_started = Instant::now();
+        let (encoded, compressed) = compression::maybe_compress_vec(raw, options.compression_level)
+            .with_context(|| format!("compress {}", file.relative_path))?;
+        options
+            .stats
+            .add_encode(encode_started.elapsed(), encoded.len());
+        let encoded_len = encoded.len();
+
+        if !metas.is_empty() && payload.len().saturating_add(encoded_len) > batch_limit {
+            let connection = connections[next_connection % connections.len()].clone();
+            next_connection = next_connection.saturating_add(1);
+            running.push(upload_cold_batch(
+                connection,
+                std::mem::take(&mut metas),
+                std::mem::take(&mut payload),
+                std::mem::take(&mut pending),
+                options.max_stream_payload,
+                options.stats.clone(),
+            ));
+
+            if running.len() >= max_inflight_batches {
+                let joined = running
+                    .next()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("missing in-flight direct upload result"))??;
+                totals.merge(joined);
+            }
+        }
+
+        payload.extend_from_slice(&encoded);
+        pending.push((
+            file.relative_path.clone(),
+            raw_len as u64,
+            encoded_len as u64,
+        ));
+        metas.push(UploadColdFileMeta {
+            relative_path: file.relative_path,
+            size: file.size,
+            mode: file.mode,
+            mtime_sec: file.mtime_sec,
+            file_hash: file.file_hash,
+            total_chunks: file.total_chunks,
+            compressed,
+            raw_len,
+            data_len: encoded_len,
+        });
+    }
+
+    if !metas.is_empty() {
+        let connection = connections[next_connection % connections.len()].clone();
+        running.push(upload_cold_batch(
+            connection,
+            std::mem::take(&mut metas),
+            std::mem::take(&mut payload),
+            std::mem::take(&mut pending),
+            options.max_stream_payload,
+            options.stats.clone(),
+        ));
+    }
+
+    while let Some(joined) = running.next().await {
+        totals.merge(joined?);
+    }
+
+    Ok(totals)
+}
+
 fn partition_small_files(
     files: Vec<FileManifest>,
     chunk_size: usize,
@@ -638,6 +778,24 @@ fn partition_small_files(
     }
 
     (small, large)
+}
+
+fn split_direct_uploads(
+    uploads: Vec<(FileManifest, InitFileResponse)>,
+    direct_file_max_bytes: u64,
+) -> (Vec<FileManifest>, Vec<(FileManifest, InitFileResponse)>) {
+    let mut direct = Vec::new();
+    let mut streamed = Vec::new();
+
+    for (file, init) in uploads {
+        if init.next_chunk == 0 && file.size <= direct_file_max_bytes {
+            direct.push(file);
+        } else {
+            streamed.push((file, init));
+        }
+    }
+
+    (direct, streamed)
 }
 
 fn is_small_file_candidate(
@@ -987,8 +1145,11 @@ async fn upload_file_batches(
 
     loop {
         let start_chunk = next_chunk;
-        let mut packets = Vec::new();
+        let mut sent_chunks = 0usize;
+        let mut batch_payload = Vec::with_capacity(payload_budget.min(BATCH_TARGET_BYTES));
         let mut batch_estimate = 0usize;
+        let mut batch_sent = 0u64;
+        let mut batch_raw = 0u64;
         for _ in 0..max_chunks_per_batch {
             if next_chunk >= file.total_chunks {
                 break;
@@ -1022,11 +1183,19 @@ async fn upload_file_batches(
                 .stats
                 .add_encode(encode_started.elapsed(), encoded_payload.len());
             let encoded_len = encoded_payload.len();
-            packets.push(crate::protocol::ChunkPacket {
-                raw_len,
-                compressed,
-                data: encoded_payload,
-            });
+            if raw_len > u32::MAX as usize {
+                bail!("chunk raw length too large for framing: {}", raw_len);
+            }
+            if encoded_len > u32::MAX as usize {
+                bail!("chunk encoded length too large for framing: {}", encoded_len);
+            }
+            batch_payload.extend_from_slice(&(raw_len as u32).to_be_bytes());
+            batch_payload.extend_from_slice(&(encoded_len as u32).to_be_bytes());
+            batch_payload.push(if compressed { 1 } else { 0 });
+            batch_payload.extend_from_slice(&encoded_payload);
+            batch_sent = batch_sent.saturating_add(encoded_len as u64);
+            batch_raw = batch_raw.saturating_add(raw_len as u64);
+            sent_chunks = sent_chunks.saturating_add(1);
             batch_estimate = batch_estimate.saturating_add(9).saturating_add(encoded_len);
             next_chunk = next_chunk.saturating_add(1);
 
@@ -1036,14 +1205,13 @@ async fn upload_file_batches(
         }
 
         let finalize = next_chunk >= file.total_chunks;
-        if packets.is_empty() && !finalize {
+        if sent_chunks == 0 && !finalize {
             bail!(
                 "batch assembly produced no packets before finalize for {}",
                 file.relative_path
             );
         }
 
-        let batch_payload = crate::protocol::encode_chunk_batch(&packets)?;
         let frame = Frame::UploadBatchRequest(UploadBatchRequest {
             relative_path: file.relative_path.clone(),
             size: file.size,
@@ -1053,7 +1221,7 @@ async fn upload_file_batches(
             total_chunks: file.total_chunks,
             start_chunk,
             chunk_size: options.chunk_size,
-            sent_chunks: packets.len(),
+            sent_chunks,
             finalize,
         });
 
@@ -1090,14 +1258,6 @@ async fn upload_file_batches(
             );
         }
 
-        let batch_sent = packets
-            .iter()
-            .map(|packet| packet.data.len() as u64)
-            .sum::<u64>();
-        let batch_raw = packets
-            .iter()
-            .map(|packet| packet.raw_len as u64)
-            .sum::<u64>();
         sent_bytes = sent_bytes.saturating_add(batch_sent);
         raw_bytes = raw_bytes.saturating_add(batch_raw);
 

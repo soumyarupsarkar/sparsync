@@ -29,17 +29,17 @@ Results below are medians of 5 consecutive runs per transport mode.
 
 | Metric | sparsync (ms) | rsync (ms) | sparsync / rsync |
 |---|---:|---:|---:|
-| Initial sync | 433 | 233 | 1.86x |
-| Second sync (no changes) | 28 | 137 | 0.20x |
-| Changed sync | 57 | 156 | 0.37x |
+| Initial sync | 416 | 232 | 1.79x |
+| Second sync (no changes) | 29 | 135 | 0.21x |
+| Changed sync | 52 | 177 | 0.29x |
 
 ### SSH Transport (`RSYNC_TRANSPORT=ssh`)
 
 | Metric | sparsync (ms) | rsync over SSH (ms) | sparsync / rsync |
 |---|---:|---:|---:|
-| Initial sync | 435 | 554 | 0.79x |
-| Second sync (no changes) | 29 | 251 | 0.12x |
-| Changed sync | 56 | 266 | 0.21x |
+| Initial sync | 451 | 546 | 0.83x |
+| Second sync (no changes) | 31 | 247 | 0.13x |
+| Changed sync | 55 | 261 | 0.21x |
 
 Interpretation:
 
@@ -51,6 +51,7 @@ Experimental notes:
 
 - `--cold-start` is implemented. In a 3-run sample on this dataset, first-sync median was `491ms` (`sparsync_first_ms`) versus `229ms` (`rsync_remote_first_ms`), so it remains slower than the normal path here.
 - Server write fan-out can be tuned with `SPARSYNC_BATCH_WRITE_CONCURRENCY` (auto-tuned by default).
+- Latest profiled first-sync pass reduced client control stream count from `11` to `5` via direct-file initialized batching plus larger payload continuity in those paths.
 
 ## Profiling Notes (March 4, 2026)
 

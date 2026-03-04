@@ -14,11 +14,13 @@ Implemented in this wave:
 - Median report helper script (`scripts/bench_remote_rsync_vs_sparsync_median.sh`).
 - First-sync control path reduction via batched large-file init.
 - Client-side transfer instrumentation (`SPARSYNC_PROFILE=1`) with counters/timers.
+- Initialized direct-file batching for non-resumed medium files to reduce first-sync stream churn.
+- In-place chunk batch payload assembly to remove an extra transfer-path copy.
 
 Still pending:
 
-- Additional protocol/stream continuity changes beyond current batching.
-- Optional WAL-backed state persistence experiment (deprioritized for now; current profiling shows transport dominates and state commit time is low in this workload).
+- Upstream `spargio-quic` API enhancements for long-lived framed streams and lower stream-open overhead.
+- No additional in-repo big-ticket blockers identified from this plan; optional WAL work is parked unless profiling shows state persistence becomes a dominant cost.
 
 ## Execution Sequence Status
 
@@ -27,11 +29,17 @@ Status: completed.
 2. Run baseline snapshots on both tracks.
 Status: completed and refreshed via median helper script.
 3. Execute Phase 1 and Phase 2 optimizations with per-change benchmark checks.
-Status: completed for this wave (copy reductions + large-file batched init + control-path simplification).
+Status: completed for this wave (copy reductions + large-file batched init + direct-file initialized batching + control-path simplification).
 4. Execute Phase 3 and Phase 4 tuning with guardrails.
-Status: partially completed (state batching + transport knobs + benchmark tuning; WAL intentionally deferred pending a state-heavy bottleneck signal).
+Status: completed for in-repo scope (state batching + transport knobs + benchmark tuning; WAL intentionally deferred pending a state-heavy bottleneck signal).
 5. Publish updated benchmark + profiling notes after each optimization wave.
 Status: completed (BENCHMARKS.md and PERFORMANCE.md updated after this wave).
+
+## Post-Plan Upstream Follow-up (`spargio-quic`)
+
+- Add incremental receive/read APIs (streaming frame decode support, not only full `read_to_end` payload collection).
+- Add sender-side helpers for long-lived multiplexed framed streams to reduce stream-open churn.
+- Re-profile first-sync after upstream changes with the same benchmark harness and median methodology.
 
 ## Benchmark Fairness Plan
 

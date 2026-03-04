@@ -149,13 +149,6 @@ pub struct ErrorFrame {
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct ChunkPacket {
-    pub raw_len: usize,
-    pub compressed: bool,
-    pub data: Vec<u8>,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkPacketRef<'a> {
     pub raw_len: usize,
@@ -225,37 +218,6 @@ pub fn decode(bytes: &[u8]) -> Result<(Frame, &[u8])> {
         .context("deserialize frame (rkyv)")?;
 
     Ok((frame, &bytes[payload_start..payload_end]))
-}
-
-pub fn encode_chunk_batch(chunks: &[ChunkPacket]) -> Result<Vec<u8>> {
-    let mut total = 0usize;
-    for chunk in chunks {
-        total = total
-            .checked_add(CHUNK_ENTRY_HEADER_SIZE)
-            .and_then(|v| v.checked_add(chunk.data.len()))
-            .ok_or_else(|| anyhow::anyhow!("chunk batch length overflow"))?;
-
-        if chunk.raw_len > u32::MAX as usize {
-            bail!("chunk raw length too large: {}", chunk.raw_len);
-        }
-        if chunk.data.len() > u32::MAX as usize {
-            bail!("chunk encoded length too large: {}", chunk.data.len());
-        }
-    }
-
-    let mut out = Vec::with_capacity(total);
-    for chunk in chunks {
-        out.extend_from_slice(&(chunk.raw_len as u32).to_be_bytes());
-        out.extend_from_slice(&(chunk.data.len() as u32).to_be_bytes());
-        out.push(if chunk.compressed {
-            CHUNK_FLAG_COMPRESSED
-        } else {
-            0
-        });
-        out.extend_from_slice(&chunk.data);
-    }
-
-    Ok(out)
 }
 
 pub fn decode_chunk_batch<'a>(

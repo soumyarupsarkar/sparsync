@@ -30,19 +30,19 @@ Dataset/profile used in this pass:
 Representative medians from the latest 5-run sample:
 
 - Daemon mode (`RSYNC_TRANSPORT=daemon`):
-  - `sparsync_first_ms=433`
-  - `sparsync_second_ms=28`
-  - `sparsync_changed_ms=57`
-  - `rsync_remote_first_ms=233`
-  - `rsync_remote_second_ms=137`
-  - `rsync_remote_changed_ms=156`
-- SSH mode (`RSYNC_TRANSPORT=ssh`):
-  - `sparsync_first_ms=435`
+  - `sparsync_first_ms=416`
   - `sparsync_second_ms=29`
-  - `sparsync_changed_ms=56`
-  - `rsync_ssh_first_ms=554`
-  - `rsync_ssh_second_ms=251`
-  - `rsync_ssh_changed_ms=266`
+  - `sparsync_changed_ms=52`
+  - `rsync_remote_first_ms=232`
+  - `rsync_remote_second_ms=135`
+  - `rsync_remote_changed_ms=177`
+- SSH mode (`RSYNC_TRANSPORT=ssh`):
+  - `sparsync_first_ms=451`
+  - `sparsync_second_ms=31`
+  - `sparsync_changed_ms=55`
+  - `rsync_ssh_first_ms=546`
+  - `rsync_ssh_second_ms=247`
+  - `rsync_ssh_changed_ms=261`
 
 Interpretation:
 
@@ -111,6 +111,13 @@ What this means:
 - Upload workers now consume precomputed `InitFileResponse` state from batch init.
 - Files: `src/transfer.rs`
 
+### Direct-file initialized batching and payload assembly
+
+- Added direct-file batch path for initialized non-resumed files up to `SPARSYNC_DIRECT_FILE_MAX_BYTES` (default `4 MiB`), reusing cold-batch upload frames to reduce per-file stream churn.
+- Added pipelined direct-batch scheduling with bounded in-flight upload batches.
+- Reworked chunked upload batch assembly to encode chunk entries in-place, removing one extra per-batch payload re-copy.
+- Files: `src/transfer.rs`, `src/protocol.rs`
+
 ### Instrumentation and reproducibility
 
 - Added client transfer profiling counters/timers gated by `SPARSYNC_PROFILE=1`.
@@ -154,6 +161,12 @@ What this means:
 - Initial sync is still behind unencrypted rsync daemon on this profile.
 - Encrypted comparison (`rsync` over SSH) now shows `sparsync` faster across first/warm/changed phases in the latest sample.
 - `--cold-start` remains experimental and is currently slower than the tuned default path on this dataset.
+- Profile counters on this dataset now show lower first-sync control/stream churn than earlier waves (`control_frames=5`, `streams_opened=5`, down from `11`/`11` in prior client profile snapshots).
+
+## Deferred Upstream Work (`spargio-quic`)
+
+- The next major first-sync gain likely requires upstream `spargio-quic` API support for long-lived framed streams (incremental recv/read APIs, not only full `read_to_end` boundaries) so sparsync can keep control/data continuity on fewer stream opens.
+- This was intentionally left out of this repo pass and is the primary follow-up optimization track.
 
 ## Reproduce
 
@@ -199,6 +212,12 @@ Optional server write-fanout tuning:
 SPARSYNC_BATCH_WRITE_CONCURRENCY=48 ./scripts/bench_remote_rsync_vs_sparsync.sh
 ```
 
+Optional direct-file batching threshold tuning:
+
+```bash
+SPARSYNC_DIRECT_FILE_MAX_BYTES=$((8*1024*1024)) ./scripts/bench_remote_rsync_vs_sparsync.sh
+```
+
 ## Next Profiling Targets
 
 - Add periodic/summary export of server profile counters to a machine-readable artifact for automated regression checks.
@@ -206,4 +225,4 @@ SPARSYNC_BATCH_WRITE_CONCURRENCY=48 ./scripts/bench_remote_rsync_vs_sparsync.sh
   - Client encode/compress/copy
   - Network/crypto
   - Server decode/write/state commit
-- Evaluate protocol changes that reduce first-sync transport overhead further (fewer encrypted stream handshakes and improved payload continuity).
+- Upstream `spargio-quic`: add long-lived framed stream primitives and retest first-sync control/stream overhead.

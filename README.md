@@ -13,6 +13,7 @@ Goal: become the fastest lightweight Rust rsync-style sync tool for large trees 
 - Binary protocol framing with `rkyv` control messages (no JSON wire headers)
 - Batched init + small-file multi-upload streams (fewer round trips)
 - Batched chunk upload streams for resumed/large-file paths
+- Direct initialized-file batching for medium files (reduced first-sync stream churn)
 - Optional per-chunk compression (Zstd)
 - Synthetic benchmark harness for scan/task/I/O pressure
 
@@ -120,7 +121,7 @@ RSYNC_ARGS="-a --delete" \
 `SPARSYNC_BATCH_WRITE_CONCURRENCY` is optional; by default the server auto-tunes write fan-out per batch.
 `RSYNC_TRANSPORT` controls comparison mode: `daemon` (default, unencrypted) or `ssh` (encrypted).
 `SPARSYNC_PROFILE=1` enables client/server transfer profiling counters in logs.
-`SPARSYNC_SMALL_FILE_MAX_BYTES` and `SPARSYNC_AUTO_CONNECTIONS` are optional tuning knobs for throughput experiments.
+`SPARSYNC_SMALL_FILE_MAX_BYTES`, `SPARSYNC_DIRECT_FILE_MAX_BYTES`, and `SPARSYNC_AUTO_CONNECTIONS` are optional tuning knobs for throughput experiments.
 
 Encrypted comparison example:
 
@@ -148,6 +149,7 @@ Median report helper (defaults to `RUNS=5`, both transports):
 
 - Add rolling delta signatures to avoid full-file retransmit on modified files
 - Stream multiple chunks per stream to reduce QUIC stream-open overhead
+- Upstream `spargio-quic`: add long-lived framed stream APIs for lower control/stream overhead
 - Batch state persistence and add WAL for lower metadata overhead
 - Add cross-file chunk dedup cache and send-side content-addressed reuse
 - Add reproducible benchmark suites against tuned `rsync` and `syncthing`
