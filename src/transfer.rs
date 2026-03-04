@@ -10,7 +10,9 @@ use crate::util::{join_error, runtime_error};
 use anyhow::{Context, Result, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use spargio::{RuntimeHandle, fs};
-use spargio_quic::{QuicConnection, QuicEndpoint, QuicEndpointOptions};
+use spargio_quic::{
+    QuicConnection, QuicEndpoint, QuicEndpointOptions, QuicRecvStream, QuicSendStream,
+};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -899,6 +901,12 @@ async fn initialize_large_files(
     let init_batches = build_init_batches(files, options.max_stream_payload);
     let mut totals = BatchResult::default();
     let mut uploads = Vec::new();
+    if init_batches.is_empty() {
+        return Ok((totals, uploads));
+    }
+    let mut session = FrameSession::open(connection, options.max_stream_payload, &options.stats)
+        .await
+        .context("open large-file init stream")?;
 
     for batch in init_batches {
         let init_request = Frame::InitBatchRequest(InitBatchRequest {
@@ -917,14 +925,10 @@ async fn initialize_large_files(
                 .collect(),
         });
 
-        let init_response = send_frame_roundtrip(
-            connection,
-            init_request,
-            None,
-            options.max_stream_payload,
-            &options.stats,
-        )
-        .await?;
+        let init_response = session
+            .roundtrip(init_request, None)
+            .await
+            .context("roundtrip large-file init batch")?;
         let init = match init_response {
             Frame::InitBatchResponse(resp) => resp,
             Frame::Error(err) => bail!("large batch init rejected: {}", err.message),
@@ -955,6 +959,8 @@ async fn initialize_large_files(
         }
     }
 
+    session.finish().context("finish large-file init stream")?;
+
     Ok((totals, uploads))
 }
 
@@ -967,6 +973,10 @@ async fn transfer_small_batch(
     if files.is_empty() {
         return Ok(BatchResult::default());
     }
+
+    let mut session = FrameSession::open(connection, options.max_stream_payload, &options.stats)
+        .await
+        .context("open small-batch stream")?;
 
     let init_request = Frame::InitBatchRequest(InitBatchRequest {
         files: files
@@ -984,14 +994,10 @@ async fn transfer_small_batch(
             .collect(),
     });
 
-    let init_response = send_frame_roundtrip(
-        connection,
-        init_request,
-        None,
-        options.max_stream_payload,
-        &options.stats,
-    )
-    .await?;
+    let init_response = session
+        .roundtrip(init_request, None)
+        .await
+        .context("roundtrip small-batch init")?;
     let init = match init_response {
         Frame::InitBatchResponse(resp) => resp,
         Frame::Error(err) => bail!("small batch init rejected: {}", err.message),
@@ -1077,14 +1083,10 @@ async fn transfer_small_batch(
             files: upload_metas,
         });
 
-        let upload_response = send_frame_roundtrip(
-            connection,
-            upload_request,
-            Some(&upload_payload),
-            options.max_stream_payload,
-            &options.stats,
-        )
-        .await?;
+        let upload_response = session
+            .roundtrip(upload_request, Some(&upload_payload))
+            .await
+            .context("roundtrip small-batch upload")?;
 
         let upload = match upload_response {
             Frame::UploadSmallBatchResponse(resp) => resp,
@@ -1111,6 +1113,8 @@ async fn transfer_small_batch(
             }
         }
     }
+
+    session.finish().context("finish small-batch stream")?;
 
     for (file, init) in fallback {
         let result = upload_file_batches(handle, connection, options, &file, &init).await?;
@@ -1142,6 +1146,9 @@ async fn upload_file_batches(
     let mut next_chunk = init.next_chunk.min(file.total_chunks);
     let mut sent_bytes = 0u64;
     let mut raw_bytes = 0u64;
+    let mut session = FrameSession::open(connection, options.max_stream_payload, &options.stats)
+        .await
+        .with_context(|| format!("open upload stream for {}", file.relative_path))?;
 
     loop {
         let start_chunk = next_chunk;
@@ -1187,7 +1194,10 @@ async fn upload_file_batches(
                 bail!("chunk raw length too large for framing: {}", raw_len);
             }
             if encoded_len > u32::MAX as usize {
-                bail!("chunk encoded length too large for framing: {}", encoded_len);
+                bail!(
+                    "chunk encoded length too large for framing: {}",
+                    encoded_len
+                );
             }
             batch_payload.extend_from_slice(&(raw_len as u32).to_be_bytes());
             batch_payload.extend_from_slice(&(encoded_len as u32).to_be_bytes());
@@ -1225,14 +1235,10 @@ async fn upload_file_batches(
             finalize,
         });
 
-        let response = send_frame_roundtrip(
-            connection,
-            frame,
-            Some(&batch_payload),
-            options.max_stream_payload,
-            &options.stats,
-        )
-        .await?;
+        let response = session
+            .roundtrip(frame, Some(&batch_payload))
+            .await
+            .with_context(|| format!("roundtrip upload batch for {}", file.relative_path))?;
 
         let response = match response {
             Frame::UploadBatchResponse(resp) => resp,
@@ -1262,6 +1268,9 @@ async fn upload_file_batches(
         raw_bytes = raw_bytes.saturating_add(batch_raw);
 
         if response.completed {
+            session
+                .finish()
+                .with_context(|| format!("finish upload stream for {}", file.relative_path))?;
             return Ok(FileResult {
                 transferred: true,
                 bytes_sent: sent_bytes,
@@ -1289,51 +1298,165 @@ async fn send_frame_roundtrip(
     max_stream_payload: usize,
     stats: &TransferStats,
 ) -> Result<Frame> {
-    let encode_started = Instant::now();
-    let payload_len = payload.map_or(0usize, |p| p.len());
-    let frame_header =
-        crate::protocol::encode_header(&request, payload_len).context("encode request frame")?;
-    let encoded_len = frame_header.len().saturating_add(payload_len);
-    stats.add_encode(encode_started.elapsed(), frame_header.len());
-    if encoded_len > max_stream_payload {
-        bail!(
-            "encoded frame too large: {} > max_stream_payload {}",
-            encoded_len,
-            max_stream_payload
-        );
-    }
-    stats.add_control_frame();
-    stats.add_request_bytes(encoded_len);
-
-    let roundtrip_started = Instant::now();
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .context("open bidirectional stream")?;
-    stats.add_stream_opened();
-
-    send.write_all(&frame_header)
-        .await
-        .context("write frame request")?;
-    if let Some(payload) = payload {
-        send.write_all(payload)
-            .await
-            .context("write frame request payload")?;
-    }
-    send.finish().context("finish request stream")?;
-
-    let response = recv
-        .read_to_end(max_stream_payload)
-        .await
-        .context("read frame response")?;
-    stats.add_response_bytes(response.len());
-    let (frame, payload) = crate::protocol::decode(&response).context("decode frame response")?;
-    if !payload.is_empty() {
-        bail!(
-            "unexpected payload in response frame ({} bytes)",
-            payload.len()
-        );
-    }
-    stats.add_roundtrip_time(roundtrip_started.elapsed());
+    let mut session = FrameSession::open(connection, max_stream_payload, stats).await?;
+    let frame = session.roundtrip(request, payload).await?;
+    session.finish().context("finish request stream")?;
     Ok(frame)
+}
+
+struct FrameSession<'a> {
+    send: QuicSendStream,
+    recv: QuicRecvStream,
+    max_stream_payload: usize,
+    stats: &'a TransferStats,
+    response_buffer: Vec<u8>,
+    response_frame_len: Option<usize>,
+}
+
+impl<'a> FrameSession<'a> {
+    async fn open(
+        connection: &QuicConnection,
+        max_stream_payload: usize,
+        stats: &'a TransferStats,
+    ) -> Result<Self> {
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .context("open bidirectional stream")?;
+        stats.add_stream_opened();
+        Ok(Self {
+            send,
+            recv,
+            max_stream_payload,
+            stats,
+            response_buffer: Vec::with_capacity(64 * 1024),
+            response_frame_len: None,
+        })
+    }
+
+    async fn roundtrip(&mut self, request: Frame, payload: Option<&[u8]>) -> Result<Frame> {
+        let encode_started = Instant::now();
+        let payload_len = payload.map_or(0usize, |p| p.len());
+        let frame_header = crate::protocol::encode_header(&request, payload_len)
+            .context("encode request frame")?;
+        let encoded_len = frame_header.len().saturating_add(payload_len);
+        self.stats
+            .add_encode(encode_started.elapsed(), frame_header.len());
+        if encoded_len > self.max_stream_payload {
+            bail!(
+                "encoded frame too large: {} > max_stream_payload {}",
+                encoded_len,
+                self.max_stream_payload
+            );
+        }
+        self.stats.add_control_frame();
+        self.stats.add_request_bytes(encoded_len);
+
+        let roundtrip_started = Instant::now();
+        self.send
+            .write_all(&frame_header)
+            .await
+            .context("write frame request")?;
+        if let Some(payload) = payload {
+            self.send
+                .write_all(payload)
+                .await
+                .context("write frame request payload")?;
+        }
+
+        let response = self.read_response_frame().await?;
+        self.stats.add_response_bytes(response.len());
+        let (frame, payload) =
+            crate::protocol::decode(&response).context("decode frame response")?;
+        if !payload.is_empty() {
+            bail!(
+                "unexpected payload in response frame ({} bytes)",
+                payload.len()
+            );
+        }
+        self.stats.add_roundtrip_time(roundtrip_started.elapsed());
+        Ok(frame)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.send.finish().context("finish request stream")
+    }
+
+    async fn read_response_frame(&mut self) -> Result<Vec<u8>> {
+        loop {
+            if let Some(frame) = try_extract_frame(
+                &mut self.response_buffer,
+                &mut self.response_frame_len,
+                self.max_stream_payload,
+            )? {
+                return Ok(frame);
+            }
+
+            let remaining = self
+                .max_stream_payload
+                .saturating_sub(self.response_buffer.len());
+            if remaining == 0 {
+                bail!(
+                    "response frame exceeded max_stream_payload {}",
+                    self.max_stream_payload
+                );
+            }
+
+            let chunk = self
+                .recv
+                .read_chunk(remaining)
+                .await
+                .context("read frame response chunk")?;
+            let Some(chunk) = chunk else {
+                if let Some(expected) = self.response_frame_len {
+                    bail!(
+                        "response stream closed with partial frame: have {} expected {}",
+                        self.response_buffer.len(),
+                        expected
+                    );
+                }
+                bail!("response stream closed before response frame");
+            };
+            if !chunk.is_empty() {
+                self.response_buffer.extend_from_slice(chunk.as_ref());
+            }
+        }
+    }
+}
+
+fn try_extract_frame(
+    buffered: &mut Vec<u8>,
+    expected_len: &mut Option<usize>,
+    max_stream_payload: usize,
+) -> Result<Option<Vec<u8>>> {
+    if expected_len.is_none() && buffered.len() >= crate::protocol::FRAME_PREFIX_LEN {
+        let frame_len =
+            crate::protocol::frame_total_len(&buffered[..crate::protocol::FRAME_PREFIX_LEN])
+                .context("decode frame prefix")?;
+        if frame_len > max_stream_payload {
+            bail!(
+                "frame length {} exceeds max_stream_payload {}",
+                frame_len,
+                max_stream_payload
+            );
+        }
+        *expected_len = Some(frame_len);
+    }
+
+    let Some(frame_len) = *expected_len else {
+        return Ok(None);
+    };
+
+    if buffered.len() < frame_len {
+        return Ok(None);
+    }
+
+    *expected_len = None;
+    if buffered.len() == frame_len {
+        return Ok(Some(std::mem::take(buffered)));
+    }
+
+    let tail = buffered.split_off(frame_len);
+    let frame = std::mem::replace(buffered, tail);
+    Ok(Some(frame))
 }

@@ -8,7 +8,7 @@ use crate::protocol::{
 };
 use crate::state::{CompleteFileInput, StateStore};
 use crate::util::{partial_path, sanitize_relative};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use spargio::{RuntimeHandle, fs};
 use spargio_quic::{QuicEndpoint, QuicEndpointOptions};
@@ -73,11 +73,14 @@ impl ServerProfile {
         }
     }
 
-    fn add_stream(&self, request_bytes: usize) -> u64 {
+    fn add_stream(&self) -> u64 {
+        self.inner.streams.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn add_request_bytes(&self, bytes: usize) {
         self.inner
             .request_bytes
-            .fetch_add(request_bytes as u64, Ordering::Relaxed);
-        self.inner.streams.fetch_add(1, Ordering::Relaxed) + 1
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     fn add_response_bytes(&self, bytes: usize) {
@@ -306,54 +309,150 @@ async fn handle_stream(
     mut send: spargio_quic::QuicSendStream,
     mut recv: spargio_quic::QuicRecvStream,
 ) -> Result<()> {
-    let read_started = Instant::now();
-    let bytes = recv
-        .read_to_end(context.max_stream_payload)
-        .await
-        .context("read stream payload")?;
-    context.profile.add_read(read_started.elapsed());
-    let stream_idx = context.profile.add_stream(bytes.len());
+    let stream_idx = context.profile.add_stream();
+    let mut read_buffer = Vec::with_capacity(64 * 1024);
+    let mut expected_len = None;
 
-    let decode_started = Instant::now();
-    let (frame, payload) = crate::protocol::decode(&bytes).context("decode frame")?;
-    context.profile.add_decode(decode_started.elapsed());
+    loop {
+        let bytes =
+            read_next_frame(&context, &mut recv, &mut read_buffer, &mut expected_len).await?;
+        let Some(bytes) = bytes else {
+            break;
+        };
+        context.profile.add_request_bytes(bytes.len());
 
-    let process_started = Instant::now();
-    let response = match frame {
-        Frame::InitFileRequest(req) => process_init_file(&context, req).await,
-        Frame::InitBatchRequest(req) => process_init_batch(&context, req).await,
-        Frame::UploadBatchRequest(req) => process_upload_batch(&context, req, payload).await,
-        Frame::UploadSmallBatchRequest(req) => {
-            process_upload_small_batch(&context, req, payload).await
-        }
-        Frame::UploadColdBatchRequest(req) => {
-            process_upload_cold_batch(&context, req, payload).await
-        }
-        other => Ok(Frame::Error(ErrorFrame {
-            message: format!("unexpected frame on server: {other:?}"),
-        })),
-    };
+        let decode_started = Instant::now();
+        let (frame, payload) = crate::protocol::decode(&bytes).context("decode frame")?;
+        context.profile.add_decode(decode_started.elapsed());
 
-    let response = match response {
-        Ok(frame) => frame,
-        Err(err) => Frame::Error(ErrorFrame {
-            message: format!("{err:#}"),
-        }),
-    };
-    context.profile.add_process(process_started.elapsed());
+        let process_started = Instant::now();
+        let response = match frame {
+            Frame::InitFileRequest(req) => process_init_file(&context, req).await,
+            Frame::InitBatchRequest(req) => process_init_batch(&context, req).await,
+            Frame::UploadBatchRequest(req) => process_upload_batch(&context, req, payload).await,
+            Frame::UploadSmallBatchRequest(req) => {
+                process_upload_small_batch(&context, req, payload).await
+            }
+            Frame::UploadColdBatchRequest(req) => {
+                process_upload_cold_batch(&context, req, payload).await
+            }
+            other => Ok(Frame::Error(ErrorFrame {
+                message: format!("unexpected frame on server: {other:?}"),
+            })),
+        };
 
-    let encode_started = Instant::now();
-    let response_bytes = crate::protocol::encode(&response, None).context("encode response")?;
-    context.profile.add_encode(encode_started.elapsed());
-    context.profile.add_response_bytes(response_bytes.len());
-    let write_started = Instant::now();
-    send.write_all(&response_bytes)
-        .await
-        .context("write response")?;
+        let response = match response {
+            Ok(frame) => frame,
+            Err(err) => Frame::Error(ErrorFrame {
+                message: format!("{err:#}"),
+            }),
+        };
+        context.profile.add_process(process_started.elapsed());
+
+        let encode_started = Instant::now();
+        let response_bytes = crate::protocol::encode(&response, None).context("encode response")?;
+        context.profile.add_encode(encode_started.elapsed());
+        context.profile.add_response_bytes(response_bytes.len());
+        let write_started = Instant::now();
+        send.write_all(&response_bytes)
+            .await
+            .context("write response")?;
+        context.profile.add_write(write_started.elapsed());
+    }
+
+    let finish_started = Instant::now();
     send.finish().context("finish response stream")?;
-    context.profile.add_write(write_started.elapsed());
+    context.profile.add_write(finish_started.elapsed());
     context.profile.maybe_log_stream_totals(stream_idx);
     Ok(())
+}
+
+async fn read_next_frame(
+    context: &ServerContext,
+    recv: &mut spargio_quic::QuicRecvStream,
+    read_buffer: &mut Vec<u8>,
+    expected_len: &mut Option<usize>,
+) -> Result<Option<Vec<u8>>> {
+    loop {
+        if let Some(frame) =
+            try_extract_frame(read_buffer, expected_len, context.max_stream_payload)?
+        {
+            return Ok(Some(frame));
+        }
+
+        let remaining = context.max_stream_payload.saturating_sub(read_buffer.len());
+        if remaining == 0 {
+            bail!(
+                "request frame exceeded max_stream_payload {}",
+                context.max_stream_payload
+            );
+        }
+
+        let read_started = Instant::now();
+        let chunk = recv
+            .read_chunk(remaining)
+            .await
+            .context("read stream chunk")?;
+        context.profile.add_read(read_started.elapsed());
+
+        match chunk {
+            Some(bytes) => {
+                if !bytes.is_empty() {
+                    read_buffer.extend_from_slice(bytes.as_ref());
+                }
+            }
+            None => {
+                if read_buffer.is_empty() && expected_len.is_none() {
+                    return Ok(None);
+                }
+                if let Some(total) = expected_len {
+                    bail!(
+                        "stream closed with partial frame: have {} expected {}",
+                        read_buffer.len(),
+                        total
+                    );
+                }
+                bail!("stream closed with {} buffered bytes", read_buffer.len());
+            }
+        }
+    }
+}
+
+fn try_extract_frame(
+    read_buffer: &mut Vec<u8>,
+    expected_len: &mut Option<usize>,
+    max_stream_payload: usize,
+) -> Result<Option<Vec<u8>>> {
+    if expected_len.is_none() && read_buffer.len() >= crate::protocol::FRAME_PREFIX_LEN {
+        let total_len =
+            crate::protocol::frame_total_len(&read_buffer[..crate::protocol::FRAME_PREFIX_LEN])
+                .context("decode frame prefix")?;
+        if total_len > max_stream_payload {
+            bail!(
+                "frame length {} exceeds max_stream_payload {}",
+                total_len,
+                max_stream_payload
+            );
+        }
+        *expected_len = Some(total_len);
+    }
+
+    let Some(total_len) = *expected_len else {
+        return Ok(None);
+    };
+
+    if read_buffer.len() < total_len {
+        return Ok(None);
+    }
+
+    *expected_len = None;
+    if read_buffer.len() == total_len {
+        return Ok(Some(std::mem::take(read_buffer)));
+    }
+
+    let tail = read_buffer.split_off(total_len);
+    let frame = std::mem::replace(read_buffer, tail);
+    Ok(Some(frame))
 }
 
 async fn process_init_file(context: &ServerContext, req: InitFileRequest) -> Result<Frame> {

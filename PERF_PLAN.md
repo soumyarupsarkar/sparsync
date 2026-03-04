@@ -16,10 +16,11 @@ Implemented in this wave:
 - Client-side transfer instrumentation (`SPARSYNC_PROFILE=1`) with counters/timers.
 - Initialized direct-file batching for non-resumed medium files to reduce first-sync stream churn.
 - In-place chunk batch payload assembly to remove an extra transfer-path copy.
+- Long-lived framed stream reuse across client/server request loops (incremental `read_chunk` framing).
 
 Still pending:
 
-- Upstream `spargio-quic` API enhancements for long-lived framed streams and lower stream-open overhead.
+- Transport-level overhead reduction in `spargio-quic` (crypto/memory-movement dominated first-sync cost) remains the largest open lever.
 - No additional in-repo big-ticket blockers identified from this plan; optional WAL work is parked unless profiling shows state persistence becomes a dominant cost.
 
 ## Execution Sequence Status
@@ -37,9 +38,9 @@ Status: completed (BENCHMARKS.md and PERFORMANCE.md updated after this wave).
 
 ## Post-Plan Upstream Follow-up (`spargio-quic`)
 
-- Add incremental receive/read APIs (streaming frame decode support, not only full `read_to_end` payload collection).
-- Add sender-side helpers for long-lived multiplexed framed streams to reduce stream-open churn.
-- Re-profile first-sync after upstream changes with the same benchmark harness and median methodology.
+- Reduce encrypted transport overhead further: packet/buffer reuse, fewer allocs/copies, and scheduler pacing/ACK tuning.
+- Continue true zero-copy-ish flow across file/network boundaries where runtime and QUIC APIs permit.
+- Re-profile first-sync after each transport change with the same benchmark harness and median methodology.
 
 ## Benchmark Fairness Plan
 

@@ -158,6 +158,7 @@ pub struct ChunkPacketRef<'a> {
 
 const CHUNK_ENTRY_HEADER_SIZE: usize = 9;
 const CHUNK_FLAG_COMPRESSED: u8 = 1;
+pub const FRAME_PREFIX_LEN: usize = 8;
 
 pub fn encode(frame: &Frame, payload: Option<&[u8]>) -> Result<Vec<u8>> {
     let payload_len = payload.map_or(0usize, |p| p.len());
@@ -180,25 +181,39 @@ pub fn encode_header(frame: &Frame, payload_len: usize) -> Result<Vec<u8>> {
         bail!("frame payload too large: {payload_len} bytes");
     }
 
-    let mut out = Vec::with_capacity(8 + frame_bytes.len());
+    let mut out = Vec::with_capacity(FRAME_PREFIX_LEN + frame_bytes.len());
     out.extend_from_slice(&(frame_bytes.len() as u32).to_be_bytes());
     out.extend_from_slice(&(payload_len as u32).to_be_bytes());
     out.extend_from_slice(&frame_bytes);
     Ok(out)
 }
 
+pub fn frame_total_len(prefix: &[u8]) -> Result<usize> {
+    if prefix.len() < FRAME_PREFIX_LEN {
+        bail!(
+            "frame prefix too short: {} bytes (need {})",
+            prefix.len(),
+            FRAME_PREFIX_LEN
+        );
+    }
+
+    let header_len = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+    let payload_len = u32::from_be_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as usize;
+
+    FRAME_PREFIX_LEN
+        .checked_add(header_len)
+        .and_then(|v| v.checked_add(payload_len))
+        .ok_or_else(|| anyhow::anyhow!("frame length overflow"))
+}
+
 pub fn decode(bytes: &[u8]) -> Result<(Frame, &[u8])> {
-    if bytes.len() < 8 {
+    if bytes.len() < FRAME_PREFIX_LEN {
         bail!("frame is too short: {} bytes", bytes.len());
     }
 
+    let expected = frame_total_len(bytes)?;
     let header_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let payload_len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-
-    let expected = 8usize
-        .checked_add(header_len)
-        .and_then(|v| v.checked_add(payload_len))
-        .ok_or_else(|| anyhow::anyhow!("frame length overflow"))?;
 
     if expected != bytes.len() {
         bail!(
@@ -208,7 +223,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Frame, &[u8])> {
         );
     }
 
-    let header_start = 8;
+    let header_start = FRAME_PREFIX_LEN;
     let header_end = header_start + header_len;
     let payload_start = header_end;
     let payload_end = payload_start + payload_len;

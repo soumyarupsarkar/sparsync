@@ -1157,8 +1157,6 @@ dependencies = [
 [[package]]
 name = "spargio"
 version = "0.5.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a93dfb9853205bd4234deb0b76819f477217388efbd3a354ff6d2f44717f887a"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
@@ -1171,8 +1169,6 @@ dependencies = [
 [[package]]
 name = "spargio-quic"
 version = "0.5.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00ba320baa84f6c00fc6c4ed5cf2832a96af69afb457c02e4768aa73f8c5add9"
 dependencies = [
  "bytes",
  "quinn",

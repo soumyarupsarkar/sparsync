@@ -30,19 +30,19 @@ Dataset/profile used in this pass:
 Representative medians from the latest 5-run sample:
 
 - Daemon mode (`RSYNC_TRANSPORT=daemon`):
-  - `sparsync_first_ms=416`
-  - `sparsync_second_ms=29`
-  - `sparsync_changed_ms=52`
-  - `rsync_remote_first_ms=232`
-  - `rsync_remote_second_ms=135`
-  - `rsync_remote_changed_ms=177`
+  - `sparsync_first_ms=406`
+  - `sparsync_second_ms=30`
+  - `sparsync_changed_ms=55`
+  - `rsync_remote_first_ms=229`
+  - `rsync_remote_second_ms=137`
+  - `rsync_remote_changed_ms=149`
 - SSH mode (`RSYNC_TRANSPORT=ssh`):
-  - `sparsync_first_ms=451`
+  - `sparsync_first_ms=410`
   - `sparsync_second_ms=31`
   - `sparsync_changed_ms=55`
-  - `rsync_ssh_first_ms=546`
-  - `rsync_ssh_second_ms=247`
-  - `rsync_ssh_changed_ms=261`
+  - `rsync_ssh_first_ms=571`
+  - `rsync_ssh_second_ms=248`
+  - `rsync_ssh_changed_ms=264`
 
 Interpretation:
 
@@ -94,6 +94,17 @@ What this means:
 - Added header-only encoder (`encode_header`) and switched send path to write header + payload separately.
   - Avoids one extra request buffer concatenation copy for payload-heavy frames.
   - Files: `src/protocol.rs`, `src/transfer.rs`
+
+### Long-lived framed stream protocol (this wave)
+
+- Added incremental frame-length parsing helper (`frame_total_len`) in protocol framing layer.
+- Client transfer paths now reuse a single bidirectional stream session for multi-request sequences:
+  - large-file init batches
+  - small-batch init + upload
+  - per-file chunk upload batch loops
+- Server stream handler now processes multiple framed requests on one stream using incremental `read_chunk` decode instead of one-shot `read_to_end`.
+- This reduces stream setup churn and avoids buffering whole stream payloads before decode.
+- Files: `src/protocol.rs`, `src/transfer.rs`, `src/server.rs`
 
 ### Batch response/control-plane simplification
 
@@ -161,12 +172,7 @@ What this means:
 - Initial sync is still behind unencrypted rsync daemon on this profile.
 - Encrypted comparison (`rsync` over SSH) now shows `sparsync` faster across first/warm/changed phases in the latest sample.
 - `--cold-start` remains experimental and is currently slower than the tuned default path on this dataset.
-- Profile counters on this dataset now show lower first-sync control/stream churn than earlier waves (`control_frames=5`, `streams_opened=5`, down from `11`/`11` in prior client profile snapshots).
-
-## Deferred Upstream Work (`spargio-quic`)
-
-- The next major first-sync gain likely requires upstream `spargio-quic` API support for long-lived framed streams (incremental recv/read APIs, not only full `read_to_end` boundaries) so sparsync can keep control/data continuity on fewer stream opens.
-- This was intentionally left out of this repo pass and is the primary follow-up optimization track.
+- Profile counters on this dataset now show lower first-sync control/stream churn (`control_frames=5`, `streams_opened=4` in latest profiled pass, down from `11`/`11` in prior snapshots).
 
 ## Reproduce
 
@@ -225,4 +231,4 @@ SPARSYNC_DIRECT_FILE_MAX_BYTES=$((8*1024*1024)) ./scripts/bench_remote_rsync_vs_
   - Client encode/compress/copy
   - Network/crypto
   - Server decode/write/state commit
-- Upstream `spargio-quic`: add long-lived framed stream primitives and retest first-sync control/stream overhead.
+- Upstream `spargio-quic`: optimize encrypted transport hot paths (buffer reuse, copy reduction, pacing/ACK behavior) and retest first-sync medians.
