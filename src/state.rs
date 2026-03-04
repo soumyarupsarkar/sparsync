@@ -29,6 +29,16 @@ pub struct PartialFile {
     pub updated_at_sec: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompleteFileInput {
+    pub relative_path: String,
+    pub file_hash: String,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_sec: i64,
+    pub total_chunks: usize,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct ResumeState {
     complete: HashMap<String, CompleteFile>,
@@ -226,6 +236,37 @@ impl StateStore {
                     updated_at_sec: now,
                 },
             );
+        }
+
+        self.persist_if_needed(false).await
+    }
+
+    pub async fn complete_files_batch(&self, entries: &[CompleteFileInput]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let now = now_sec();
+        {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state mutex poisoned"))?;
+
+            for entry in entries {
+                guard.partial.remove(&entry.relative_path);
+                guard.complete.insert(
+                    entry.relative_path.clone(),
+                    CompleteFile {
+                        file_hash: entry.file_hash.clone(),
+                        size: entry.size,
+                        mode: entry.mode,
+                        mtime_sec: entry.mtime_sec,
+                        total_chunks: entry.total_chunks,
+                        updated_at_sec: now,
+                    },
+                );
+            }
         }
 
         self.persist_if_needed(false).await

@@ -11,6 +11,8 @@ pub enum Frame {
     UploadBatchResponse(UploadBatchResponse),
     UploadSmallBatchRequest(UploadSmallBatchRequest),
     UploadSmallBatchResponse(UploadSmallBatchResponse),
+    UploadColdBatchRequest(UploadColdBatchRequest),
+    UploadColdBatchResponse(UploadColdBatchResponse),
     Error(ErrorFrame),
 }
 
@@ -74,7 +76,6 @@ pub struct InitBatchResponse {
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct InitBatchResult {
-    pub relative_path: String,
     pub action: InitAction,
     pub next_chunk: usize,
     pub message: String,
@@ -105,7 +106,38 @@ pub struct UploadSmallBatchResponse {
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct UploadSmallFileResult {
+    pub accepted: bool,
+    pub skipped: bool,
+    pub message: String,
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub struct UploadColdBatchRequest {
+    pub allow_skip: bool,
+    pub files: Vec<UploadColdFileMeta>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub struct UploadColdFileMeta {
     pub relative_path: String,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_sec: i64,
+    pub file_hash: String,
+    pub total_chunks: usize,
+    pub compressed: bool,
+    pub raw_len: usize,
+    pub data_len: usize,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub struct UploadColdBatchResponse {
+    pub results: Vec<UploadColdFileResult>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub struct UploadColdFileResult {
     pub accepted: bool,
     pub skipped: bool,
     pub message: String,
@@ -135,10 +167,18 @@ const CHUNK_ENTRY_HEADER_SIZE: usize = 9;
 const CHUNK_FLAG_COMPRESSED: u8 = 1;
 
 pub fn encode(frame: &Frame, payload: Option<&[u8]>) -> Result<Vec<u8>> {
+    let payload_len = payload.map_or(0usize, |p| p.len());
+    let mut out = encode_header(frame, payload_len)?;
+    if let Some(bytes) = payload {
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+pub fn encode_header(frame: &Frame, payload_len: usize) -> Result<Vec<u8>> {
     let frame_bytes = rkyv::to_bytes::<_, 4096>(frame)
         .context("serialize frame (rkyv)")?
         .to_vec();
-    let payload_len = payload.map_or(0usize, |p| p.len());
 
     if frame_bytes.len() > u32::MAX as usize {
         bail!("frame header too large: {} bytes", frame_bytes.len());
@@ -147,13 +187,10 @@ pub fn encode(frame: &Frame, payload: Option<&[u8]>) -> Result<Vec<u8>> {
         bail!("frame payload too large: {payload_len} bytes");
     }
 
-    let mut out = Vec::with_capacity(8 + frame_bytes.len() + payload_len);
+    let mut out = Vec::with_capacity(8 + frame_bytes.len());
     out.extend_from_slice(&(frame_bytes.len() as u32).to_be_bytes());
     out.extend_from_slice(&(payload_len as u32).to_be_bytes());
     out.extend_from_slice(&frame_bytes);
-    if let Some(bytes) = payload {
-        out.extend_from_slice(bytes);
-    }
     Ok(out)
 }
 
@@ -312,6 +349,41 @@ pub fn split_small_file_payload<'a>(
     if offset != bytes.len() {
         bail!(
             "small-file payload trailing bytes: consumed {} total {}",
+            offset,
+            bytes.len()
+        );
+    }
+
+    Ok(out)
+}
+
+pub fn split_cold_file_payload<'a>(
+    bytes: &'a [u8],
+    files: &[UploadColdFileMeta],
+) -> Result<Vec<&'a [u8]>> {
+    let mut offset = 0usize;
+    let mut out = Vec::with_capacity(files.len());
+
+    for file in files {
+        let end = offset
+            .checked_add(file.data_len)
+            .ok_or_else(|| anyhow::anyhow!("cold-file payload length overflow"))?;
+        if end > bytes.len() {
+            bail!(
+                "cold-file payload truncated for {}: need {} at offset {} total {}",
+                file.relative_path,
+                file.data_len,
+                offset,
+                bytes.len()
+            );
+        }
+        out.push(&bytes[offset..end]);
+        offset = end;
+    }
+
+    if offset != bytes.len() {
+        bail!(
+            "cold-file payload trailing bytes: consumed {} total {}",
             offset,
             bytes.len()
         );

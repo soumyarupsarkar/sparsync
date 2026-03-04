@@ -28,6 +28,14 @@ pub struct ScanStats {
     pub total_elapsed: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    pub relative_path: String,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_sec: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HashCacheEntry {
     size: u64,
@@ -88,6 +96,28 @@ pub async fn build_manifest(
     };
 
     Ok((manifest, stats))
+}
+
+pub async fn build_file_list(
+    handle: RuntimeHandle,
+    root: &Path,
+    scan_workers: usize,
+    metadata_workers: usize,
+) -> Result<(PathBuf, Vec<FileEntry>, Duration, Duration)> {
+    let root = fs::canonicalize(&handle, root)
+        .await
+        .with_context(|| format!("canonicalize {}", root.display()))?;
+
+    let enum_started = Instant::now();
+    let files = enumerate_files(handle.clone(), &root, scan_workers.max(1)).await?;
+    let enumeration_elapsed = enum_started.elapsed();
+
+    let metadata_started = Instant::now();
+    let entries =
+        collect_file_metadata(handle.clone(), &root, files, metadata_workers.max(1)).await?;
+    let metadata_elapsed = metadata_started.elapsed();
+
+    Ok((root, entries, enumeration_elapsed, metadata_elapsed))
 }
 
 async fn enumerate_files(
@@ -217,6 +247,36 @@ async fn hash_files(
     Ok(out)
 }
 
+async fn collect_file_metadata(
+    handle: RuntimeHandle,
+    root: &Path,
+    files: Vec<PathBuf>,
+    workers: usize,
+) -> Result<Vec<FileEntry>> {
+    let root = root.to_path_buf();
+    let mut iter = files.into_iter();
+    let mut running = FuturesUnordered::new();
+
+    for _ in 0..workers {
+        if let Some(path) = iter.next() {
+            running.push(spawn_metadata_job(handle.clone(), root.clone(), path)?);
+        }
+    }
+
+    let mut out = Vec::new();
+    while let Some(joined) = running.next().await {
+        let item = joined.map_err(|err| join_error("metadata worker canceled", err))??;
+        out.push(item);
+
+        if let Some(path) = iter.next() {
+            running.push(spawn_metadata_job(handle.clone(), root.clone(), path)?);
+        }
+    }
+
+    out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(out)
+}
+
 fn spawn_hash_job(
     handle: RuntimeHandle,
     root: PathBuf,
@@ -237,6 +297,17 @@ fn spawn_hash_job(
             .await
         })
         .map_err(|err| runtime_error("spawn hash task", err))
+}
+
+fn spawn_metadata_job(
+    handle: RuntimeHandle,
+    root: PathBuf,
+    absolute_path: PathBuf,
+) -> Result<spargio::JoinHandle<Result<FileEntry>>> {
+    let task_handle = handle.clone();
+    handle
+        .spawn_stealable(async move { metadata_one_file(task_handle, &root, &absolute_path).await })
+        .map_err(|err| runtime_error("spawn metadata task", err))
 }
 
 async fn hash_one_file(
@@ -301,6 +372,27 @@ async fn hash_one_file(
         mtime_sec: metadata.mtime_sec,
         file_hash: file_hasher.finalize().to_hex().to_string(),
         total_chunks,
+    })
+}
+
+async fn metadata_one_file(
+    handle: RuntimeHandle,
+    root: &Path,
+    absolute_path: &Path,
+) -> Result<FileEntry> {
+    let metadata = fs::metadata_lite(&handle, absolute_path)
+        .await
+        .with_context(|| format!("stat {}", absolute_path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!("{} is not a file", absolute_path.display()));
+    }
+
+    let relative_path = relative_path_string(root, absolute_path)?;
+    Ok(FileEntry {
+        relative_path,
+        size: metadata.size,
+        mode: metadata.mode as u32,
+        mtime_sec: metadata.mtime_sec,
     })
 }
 

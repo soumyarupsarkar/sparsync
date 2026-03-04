@@ -20,8 +20,12 @@ SPARSYNC_PARALLEL_FILES=${SPARSYNC_PARALLEL_FILES:-16}
 SPARSYNC_CONNECTIONS=${SPARSYNC_CONNECTIONS:-1}
 SPARSYNC_SCAN_WORKERS=${SPARSYNC_SCAN_WORKERS:-8}
 SPARSYNC_HASH_WORKERS=${SPARSYNC_HASH_WORKERS:-16}
+SPARSYNC_FIRST_COLD=${SPARSYNC_FIRST_COLD:-0}
 KEEP_TMP=${KEEP_TMP:-0}
 RSYNC_ARGS=${RSYNC_ARGS:-"-a --delete"}
+RSYNC_TRANSPORT=${RSYNC_TRANSPORT:-daemon}
+RSYNC_SSH_PORT=${RSYNC_SSH_PORT:-2222}
+RSYNC_SSH_USER=${RSYNC_SSH_USER:-root}
 
 if ! command -v rsync >/dev/null 2>&1; then
   echo "rsync not found" >&2
@@ -37,12 +41,15 @@ fi
 ROOT=$(mktemp -d)
 BASE="$ROOT/base"
 SRC_SP="$ROOT/src_sparsync"
-SRC_RS="$ROOT/src_rsync"
+SRC_RS_DAEMON="$ROOT/src_rsync_daemon"
+SRC_RS_SSH="$ROOT/src_rsync_ssh"
 DST_SP="$ROOT/dst_sparsync"
-DST_RS="$ROOT/dst_rsync"
+DST_RS_DAEMON="$ROOT/dst_rsync_daemon"
+DST_RS_SSH="$ROOT/dst_rsync_ssh"
 CERT_DIR="$ROOT/certs"
 RSYNC_CONF="$ROOT/rsyncd.conf"
-mkdir -p "$BASE" "$SRC_SP" "$SRC_RS" "$DST_SP" "$DST_RS" "$CERT_DIR"
+SSH_DIR="$ROOT/ssh"
+mkdir -p "$BASE" "$SRC_SP" "$SRC_RS_DAEMON" "$SRC_RS_SSH" "$DST_SP" "$DST_RS_DAEMON" "$DST_RS_SSH" "$CERT_DIR" "$SSH_DIR"
 
 cleanup() {
   if [ -n "${SP_PID:-}" ]; then
@@ -52,6 +59,10 @@ cleanup() {
   if [ -n "${RS_PID:-}" ]; then
     kill "$RS_PID" 2>/dev/null || true
     wait "$RS_PID" 2>/dev/null || true
+  fi
+  if [ -n "${SSH_PID:-}" ]; then
+    kill "$SSH_PID" 2>/dev/null || true
+    wait "$SSH_PID" 2>/dev/null || true
   fi
   if [ "$KEEP_TMP" != "1" ]; then
     rm -rf "$ROOT"
@@ -73,7 +84,8 @@ for f in $(seq 0 $((LARGE_FILES - 1))); do
 done
 
 cp -a "$BASE/." "$SRC_SP/"
-cp -a "$BASE/." "$SRC_RS/"
+cp -a "$BASE/." "$SRC_RS_DAEMON/"
+cp -a "$BASE/." "$SRC_RS_SSH/"
 
 FILES=$(find "$BASE" -type f | wc -l | tr -d ' ')
 BYTES=$(du -sb "$BASE" | awk '{print $1}')
@@ -93,6 +105,11 @@ sleep 1
 
 ms_now() { date +%s%N; }
 
+SPARSYNC_FIRST_ARGS=()
+if [ "$SPARSYNC_FIRST_COLD" = "1" ]; then
+  SPARSYNC_FIRST_ARGS+=(--cold-start)
+fi
+
 sp1_start=$(ms_now)
 "$SPARSYNC_BIN" push \
   --source "$SRC_SP" \
@@ -103,6 +120,7 @@ sp1_start=$(ms_now)
   --connections "$SPARSYNC_CONNECTIONS" \
   --scan-workers "$SPARSYNC_SCAN_WORKERS" \
   --hash-workers "$SPARSYNC_HASH_WORKERS" \
+  "${SPARSYNC_FIRST_ARGS[@]}" \
   --compression-level 0 >/tmp/sparsync-bench-push1.log
 sp1_end=$(ms_now)
 
@@ -144,39 +162,119 @@ pid file = $ROOT/rsyncd.pid
 use chroot = false
 port = $RSYNC_PORT
 [syncdst]
-path = $DST_RS
+path = $DST_RS_DAEMON
 read only = false
 list = yes
 uid = root
 gid = root
 CFG
 
-rsync --daemon --no-detach --config "$RSYNC_CONF" >/tmp/rsync-bench-daemon.log 2>&1 &
-RS_PID=$!
-sleep 1
+run_rsync_daemon() {
+  rsync --daemon --no-detach --config "$RSYNC_CONF" >/tmp/rsync-bench-daemon.log 2>&1 &
+  RS_PID=$!
+  sleep 1
 
-rs1_start=$(ms_now)
-rsync $RSYNC_ARGS "$SRC_RS/" "rsync://127.0.0.1:${RSYNC_PORT}/syncdst/" >/tmp/rsync-bench1.log
-rs1_end=$(ms_now)
+  rs1_start=$(ms_now)
+  rsync $RSYNC_ARGS "$SRC_RS_DAEMON/" "rsync://127.0.0.1:${RSYNC_PORT}/syncdst/" >/tmp/rsync-bench1.log
+  rs1_end=$(ms_now)
 
-rs2_start=$(ms_now)
-rsync $RSYNC_ARGS "$SRC_RS/" "rsync://127.0.0.1:${RSYNC_PORT}/syncdst/" >/tmp/rsync-bench2.log
-rs2_end=$(ms_now)
+  rs2_start=$(ms_now)
+  rsync $RSYNC_ARGS "$SRC_RS_DAEMON/" "rsync://127.0.0.1:${RSYNC_PORT}/syncdst/" >/tmp/rsync-bench2.log
+  rs2_end=$(ms_now)
 
-changed=0
-while IFS= read -r path; do
-  printf 'delta-%s\n' "$changed" >> "$path"
-  changed=$((changed + 1))
-  [ "$changed" -ge "$CHANGED_FILES" ] && break
-done < <(find "$SRC_RS/small" -type f | sort)
+  changed=0
+  while IFS= read -r path; do
+    printf 'delta-%s\n' "$changed" >> "$path"
+    changed=$((changed + 1))
+    [ "$changed" -ge "$CHANGED_FILES" ] && break
+  done < <(find "$SRC_RS_DAEMON/small" -type f | sort)
 
-rs3_start=$(ms_now)
-rsync $RSYNC_ARGS "$SRC_RS/" "rsync://127.0.0.1:${RSYNC_PORT}/syncdst/" >/tmp/rsync-bench3.log
-rs3_end=$(ms_now)
+  rs3_start=$(ms_now)
+  rsync $RSYNC_ARGS "$SRC_RS_DAEMON/" "rsync://127.0.0.1:${RSYNC_PORT}/syncdst/" >/tmp/rsync-bench3.log
+  rs3_end=$(ms_now)
+}
+
+run_rsync_ssh() {
+  if ! command -v ssh >/dev/null 2>&1; then
+    echo "ssh client not found for RSYNC_TRANSPORT=ssh" >&2
+    exit 1
+  fi
+  if [ ! -x /usr/sbin/sshd ]; then
+    echo "sshd not found for RSYNC_TRANSPORT=ssh (install openssh-server)" >&2
+    exit 1
+  fi
+
+  ssh-keygen -t ed25519 -N "" -f "$SSH_DIR/bench_id_ed25519" >/dev/null
+  cp "$SSH_DIR/bench_id_ed25519.pub" "$SSH_DIR/authorized_keys"
+  chmod 600 "$SSH_DIR/authorized_keys"
+  ssh-keygen -t ed25519 -N "" -f "$SSH_DIR/ssh_host_ed25519_key" >/dev/null
+
+  cat > "$SSH_DIR/sshd_config" <<CFG
+Port $RSYNC_SSH_PORT
+ListenAddress 127.0.0.1
+HostKey $SSH_DIR/ssh_host_ed25519_key
+PidFile $SSH_DIR/sshd.pid
+AuthorizedKeysFile $SSH_DIR/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin yes
+UsePAM no
+StrictModes no
+LogLevel ERROR
+Subsystem sftp internal-sftp
+CFG
+
+  /usr/sbin/sshd -f "$SSH_DIR/sshd_config" -E /tmp/rsync-bench-sshd.log -D &
+  SSH_PID=$!
+  sleep 1
+
+  ssh_cmd="ssh -i $SSH_DIR/bench_id_ed25519 -p $RSYNC_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+  rs1_start=$(ms_now)
+  rsync $RSYNC_ARGS -e "$ssh_cmd" "$SRC_RS_SSH/" "${RSYNC_SSH_USER}@127.0.0.1:$DST_RS_SSH/" >/tmp/rsync-bench1.log
+  rs1_end=$(ms_now)
+
+  rs2_start=$(ms_now)
+  rsync $RSYNC_ARGS -e "$ssh_cmd" "$SRC_RS_SSH/" "${RSYNC_SSH_USER}@127.0.0.1:$DST_RS_SSH/" >/tmp/rsync-bench2.log
+  rs2_end=$(ms_now)
+
+  changed=0
+  while IFS= read -r path; do
+    printf 'delta-%s\n' "$changed" >> "$path"
+    changed=$((changed + 1))
+    [ "$changed" -ge "$CHANGED_FILES" ] && break
+  done < <(find "$SRC_RS_SSH/small" -type f | sort)
+
+  rs3_start=$(ms_now)
+  rsync $RSYNC_ARGS -e "$ssh_cmd" "$SRC_RS_SSH/" "${RSYNC_SSH_USER}@127.0.0.1:$DST_RS_SSH/" >/tmp/rsync-bench3.log
+  rs3_end=$(ms_now)
+}
+
+RSYNC_LABEL=""
+case "$RSYNC_TRANSPORT" in
+  daemon)
+    RSYNC_LABEL="rsync_remote"
+    run_rsync_daemon
+    ;;
+  ssh)
+    RSYNC_LABEL="rsync_ssh"
+    run_rsync_ssh
+    ;;
+  *)
+    echo "invalid RSYNC_TRANSPORT='$RSYNC_TRANSPORT' (expected 'daemon' or 'ssh')" >&2
+    exit 1
+    ;;
+esac
 
 rm -rf "$DST_SP/.sparsync"
 diff -qr "$SRC_SP" "$DST_SP" >/dev/null
-diff -qr "$SRC_RS" "$DST_RS" >/dev/null
+if [ "$RSYNC_TRANSPORT" = "daemon" ]; then
+  diff -qr "$SRC_RS_DAEMON" "$DST_RS_DAEMON" >/dev/null
+else
+  diff -qr "$SRC_RS_SSH" "$DST_RS_SSH" >/dev/null
+fi
 
 SP1_MS=$(( (sp1_end - sp1_start) / 1000000 ))
 SP2_MS=$(( (sp2_end - sp2_start) / 1000000 ))
@@ -192,6 +290,7 @@ sp3=$SP3_MS
 rs1=$RS1_MS
 rs2=$RS2_MS
 rs3=$RS3_MS
+label="$RSYNC_LABEL"
 files=$FILES
 bytes_=$BYTES
 print(f"dataset_files={files}")
@@ -199,9 +298,9 @@ print(f"dataset_bytes={bytes_}")
 print(f"sparsync_first_ms={sp1}")
 print(f"sparsync_second_ms={sp2}")
 print(f"sparsync_changed_ms={sp3}")
-print(f"rsync_remote_first_ms={rs1}")
-print(f"rsync_remote_second_ms={rs2}")
-print(f"rsync_remote_changed_ms={rs3}")
+print(f"{label}_first_ms={rs1}")
+print(f"{label}_second_ms={rs2}")
+print(f"{label}_changed_ms={rs3}")
 print(f"ratio_first_sparsync_over_rsync={sp1/rs1:.2f}x" if rs1 else "ratio_first_sparsync_over_rsync=inf")
 print(f"ratio_second_sparsync_over_rsync={sp2/rs2:.2f}x" if rs2 else "ratio_second_sparsync_over_rsync=inf")
 print(f"ratio_changed_sparsync_over_rsync={sp3/rs3:.2f}x" if rs3 else "ratio_changed_sparsync_over_rsync=inf")

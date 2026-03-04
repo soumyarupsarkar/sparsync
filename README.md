@@ -62,6 +62,8 @@ Add `--preserve-metadata` for rsync-like mode/mtime preservation.
 
 Re-running `push` skips already complete files via persisted hashes.
 
+Use `--cold-start` for the experimental cold-copy fast path (optimized for initial empty-target syncs).
+
 ## Scan Command
 
 ```bash
@@ -99,13 +101,28 @@ Use the built-in remote benchmark harness (rsync daemon mode over TCP). It will 
 ./scripts/bench_remote_rsync_vs_sparsync.sh
 ```
 
+Latest measured summary is tracked in [BENCHMARKS.md](./BENCHMARKS.md).
+Profiling findings and optimization log are tracked in [PERFORMANCE.md](./PERFORMANCE.md).
+Ongoing optimization roadmap is tracked in [PERF_PLAN.md](./PERF_PLAN.md).
+
 Useful overrides:
 
 ```bash
 SMALL_DIRS=20 SMALL_FILES_PER_DIR=200 LARGE_FILES=16 CHANGED_FILES=200 \
 SPARSYNC_CONNECTIONS=1 SPARSYNC_PARALLEL_FILES=32 \
-SPARSYNC_SCAN_WORKERS=16 SPARSYNC_HASH_WORKERS=32 RSYNC_ARGS="-a --delete" \
+SPARSYNC_SCAN_WORKERS=16 SPARSYNC_HASH_WORKERS=32 SPARSYNC_FIRST_COLD=0 \
+SPARSYNC_BATCH_WRITE_CONCURRENCY=48 \
+RSYNC_ARGS="-a --delete" \
 ./scripts/bench_remote_rsync_vs_sparsync.sh
+```
+
+`SPARSYNC_BATCH_WRITE_CONCURRENCY` is optional; by default the server auto-tunes write fan-out per batch.
+`RSYNC_TRANSPORT` controls comparison mode: `daemon` (default, unencrypted) or `ssh` (encrypted).
+
+Encrypted comparison example:
+
+```bash
+RSYNC_TRANSPORT=ssh ./scripts/bench_remote_rsync_vs_sparsync.sh
 ```
 
 ## Architecture

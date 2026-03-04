@@ -102,6 +102,9 @@ struct PushArgs {
     no_resume: bool,
 
     #[arg(long)]
+    cold_start: bool,
+
+    #[arg(long)]
     manifest_out: Option<PathBuf>,
 }
 
@@ -214,6 +217,7 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 operation_timeout: Duration::from_millis(args.op_timeout_ms),
                 max_stream_payload: args.max_stream_payload,
                 resume: !args.no_resume,
+                cold_start: args.cold_start,
                 manifest_out: args.manifest_out,
             };
             let summary = transfer::push_directory(handle, options).await?;

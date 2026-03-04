@@ -3,7 +3,7 @@ use crate::compression;
 use crate::model::FileManifest;
 use crate::protocol::{
     Frame, InitAction, InitBatchRequest, InitFileRequest, InitFileResponse, UploadBatchRequest,
-    UploadSmallBatchRequest, UploadSmallFileMeta,
+    UploadColdBatchRequest, UploadColdFileMeta, UploadSmallBatchRequest, UploadSmallFileMeta,
 };
 use crate::scan::{self, ScanOptions};
 use crate::util::{join_error, runtime_error};
@@ -11,12 +11,12 @@ use anyhow::{Context, Result, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use spargio::{RuntimeHandle, fs};
 use spargio_quic::{QuicConnection, QuicEndpoint, QuicEndpointOptions};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const BATCH_TARGET_BYTES: usize = 8 * 1024 * 1024;
+const COLD_BATCH_TARGET_BYTES: usize = 32 * 1024 * 1024;
 const SMALL_FILE_MAX_BYTES: u64 = 128 * 1024;
 const SMALL_BATCH_MAX_FILES: usize = 4096;
 
@@ -34,6 +34,7 @@ pub struct PushOptions {
     pub operation_timeout: Duration,
     pub max_stream_payload: usize,
     pub resume: bool,
+    pub cold_start: bool,
     pub manifest_out: Option<PathBuf>,
 }
 
@@ -123,6 +124,11 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
             .await
             .with_context(|| format!("connect to {} ({})", options.server, options.server_name))?;
         connections.push(connection);
+    }
+
+    if options.cold_start {
+        let summary = push_directory_cold(handle.clone(), &options, &connections, started).await?;
+        return Ok(summary);
     }
 
     let (manifest, scan_stats) =
@@ -231,6 +237,208 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         bytes_raw: totals.bytes_raw,
         elapsed: started.elapsed(),
     })
+}
+
+async fn push_directory_cold(
+    handle: RuntimeHandle,
+    options: &PushOptions,
+    connections: &[QuicConnection],
+    started: Instant,
+) -> Result<PushSummary> {
+    let chunk_size = options.scan.chunk_size.max(1);
+    let (source_root, files, enumeration_elapsed, metadata_elapsed) = scan::build_file_list(
+        handle.clone(),
+        &options.source,
+        options.scan.scan_workers.max(1),
+        options.scan.hash_workers.max(1),
+    )
+    .await
+    .with_context(|| format!("build cold file list {}", options.source.display()))?;
+
+    let total_bytes = files.iter().map(|item| item.size).sum::<u64>();
+    println!(
+        "scan complete files={} bytes={} enumerate_ms={} hash_ms={}",
+        files.len(),
+        total_bytes,
+        enumeration_elapsed.as_millis(),
+        metadata_elapsed.as_millis(),
+    );
+
+    if let Some(path) = &options.manifest_out {
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "root": source_root,
+            "chunk_size": chunk_size,
+            "files": files.iter().map(|item| serde_json::json!({
+                "relative_path": item.relative_path,
+                "size": item.size,
+                "mode": item.mode,
+                "mtime_sec": item.mtime_sec,
+            })).collect::<Vec<_>>(),
+            "total_bytes": total_bytes,
+            "cold_start": true,
+        }))?;
+        fs::write(&handle, path, bytes)
+            .await
+            .with_context(|| format!("write manifest {}", path.display()))?;
+    }
+
+    let mut batch_limit = options
+        .max_stream_payload
+        .saturating_sub(512 * 1024)
+        .clamp(512 * 1024, COLD_BATCH_TARGET_BYTES);
+    if connections.len() > 1 {
+        let split_target = (total_bytes as usize)
+            .saturating_div(connections.len())
+            .max(4 * 1024 * 1024);
+        batch_limit = batch_limit.min(split_target);
+    }
+
+    let mut totals = BatchResult::default();
+    let mut payload = Vec::new();
+    let mut metas = Vec::new();
+    let mut pending = Vec::new();
+    let mut running = FuturesUnordered::new();
+    let mut next_connection = 0usize;
+
+    for file in files {
+        let source_path = source_root.join(Path::new(&file.relative_path));
+        let raw = fs::read(&handle, &source_path)
+            .await
+            .with_context(|| format!("read source {}", source_path.display()))?;
+        if raw.len() as u64 != file.size {
+            bail!(
+                "file size changed during cold read for {}: expected {} got {}",
+                file.relative_path,
+                file.size,
+                raw.len()
+            );
+        }
+
+        let raw_len = raw.len();
+        let file_hash = blake3::hash(&raw).to_hex().to_string();
+        let total_chunks = if file.size == 0 {
+            0
+        } else {
+            ((file.size + (chunk_size as u64).saturating_sub(1)) / chunk_size as u64) as usize
+        };
+        let (encoded, compressed) = compression::maybe_compress_vec(raw, options.compression_level)
+            .with_context(|| format!("compress {}", file.relative_path))?;
+        let encoded_len = encoded.len();
+
+        if !metas.is_empty() && payload.len().saturating_add(encoded_len) > batch_limit {
+            let connection = connections[next_connection % connections.len()].clone();
+            next_connection = next_connection.saturating_add(1);
+            running.push(upload_cold_batch(
+                connection,
+                std::mem::take(&mut metas),
+                std::mem::take(&mut payload),
+                std::mem::take(&mut pending),
+                options.max_stream_payload,
+            ));
+
+            if running.len() >= connections.len() {
+                let joined = running
+                    .next()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("missing in-flight cold upload result"))??;
+                totals.merge(joined);
+            }
+        }
+
+        payload.extend_from_slice(&encoded);
+        pending.push((
+            file.relative_path.clone(),
+            raw_len as u64,
+            encoded_len as u64,
+        ));
+        metas.push(UploadColdFileMeta {
+            relative_path: file.relative_path,
+            size: file.size,
+            mode: file.mode,
+            mtime_sec: file.mtime_sec,
+            file_hash,
+            total_chunks,
+            compressed,
+            raw_len,
+            data_len: encoded_len,
+        });
+    }
+
+    if !metas.is_empty() {
+        let connection = connections[next_connection % connections.len()].clone();
+        running.push(upload_cold_batch(
+            connection,
+            std::mem::take(&mut metas),
+            std::mem::take(&mut payload),
+            std::mem::take(&mut pending),
+            options.max_stream_payload,
+        ));
+    }
+
+    while let Some(joined) = running.next().await {
+        totals.merge(joined?);
+    }
+
+    Ok(PushSummary {
+        files_transferred: totals.files_transferred,
+        files_skipped: totals.files_skipped,
+        bytes_sent: totals.bytes_sent,
+        bytes_raw: totals.bytes_raw,
+        elapsed: started.elapsed(),
+    })
+}
+
+async fn upload_cold_batch(
+    connection: QuicConnection,
+    metas: Vec<UploadColdFileMeta>,
+    payload: Vec<u8>,
+    pending: Vec<(String, u64, u64)>,
+    max_stream_payload: usize,
+) -> Result<BatchResult> {
+    if metas.is_empty() {
+        return Ok(BatchResult::default());
+    }
+
+    let response = send_frame_roundtrip(
+        &connection,
+        Frame::UploadColdBatchRequest(UploadColdBatchRequest {
+            allow_skip: false,
+            files: metas,
+        }),
+        Some(&payload),
+        max_stream_payload,
+    )
+    .await?;
+
+    let response = match response {
+        Frame::UploadColdBatchResponse(resp) => resp,
+        Frame::Error(err) => bail!("cold batch upload rejected: {}", err.message),
+        other => bail!("unexpected cold batch response: {other:?}"),
+    };
+
+    if response.results.len() != pending.len() {
+        bail!(
+            "cold batch response size mismatch: got {} expected {}",
+            response.results.len(),
+            pending.len()
+        );
+    }
+
+    let mut totals = BatchResult::default();
+    for (result, (path, raw, encoded)) in response.results.into_iter().zip(pending) {
+        if !result.accepted {
+            bail!("cold batch file rejected for {path}: {}", result.message);
+        }
+        if result.skipped {
+            totals.files_skipped = totals.files_skipped.saturating_add(1);
+        } else {
+            totals.files_transferred = totals.files_transferred.saturating_add(1);
+            totals.bytes_raw = totals.bytes_raw.saturating_add(raw);
+            totals.bytes_sent = totals.bytes_sent.saturating_add(encoded);
+        }
+    }
+
+    Ok(totals)
 }
 
 fn partition_small_files(
@@ -379,9 +587,12 @@ async fn transfer_small_batch(
         other => bail!("unexpected small batch init response: {other:?}"),
     };
 
-    let mut init_by_path = HashMap::with_capacity(init.results.len());
-    for result in init.results {
-        init_by_path.insert(result.relative_path.clone(), result);
+    if init.results.len() != files.len() {
+        bail!(
+            "small batch init response size mismatch: got {} expected {}",
+            init.results.len(),
+            files.len()
+        );
     }
 
     let mut totals = BatchResult::default();
@@ -390,11 +601,7 @@ async fn transfer_small_batch(
     let mut upload_paths = Vec::new();
     let mut fallback = Vec::new();
 
-    for file in files {
-        let result = init_by_path
-            .remove(&file.relative_path)
-            .ok_or_else(|| anyhow::anyhow!("missing init response for {}", file.relative_path))?;
-
+    for (file, result) in files.iter().zip(init.results.into_iter()) {
         if matches!(result.action, InitAction::Skip) {
             totals.files_skipped = totals.files_skipped.saturating_add(1);
             continue;
@@ -425,10 +632,11 @@ async fn transfer_small_batch(
             );
         }
 
-        let (encoded, compressed) = compression::maybe_compress(&raw, options.compression_level)
+        let raw_len = raw.len();
+        let (encoded, compressed) = compression::maybe_compress_vec(raw, options.compression_level)
             .with_context(|| format!("compress {}", file.relative_path))?;
 
-        totals.bytes_raw = totals.bytes_raw.saturating_add(raw.len() as u64);
+        totals.bytes_raw = totals.bytes_raw.saturating_add(raw_len as u64);
         totals.bytes_sent = totals.bytes_sent.saturating_add(encoded.len() as u64);
         upload_payload.extend_from_slice(&encoded);
         upload_paths.push(file.relative_path.clone());
@@ -440,7 +648,7 @@ async fn transfer_small_batch(
             file_hash: file.file_hash.clone(),
             total_chunks: file.total_chunks,
             compressed,
-            raw_len: raw.len(),
+            raw_len,
             data_len: encoded.len(),
         });
     }
@@ -464,15 +672,15 @@ async fn transfer_small_batch(
             other => bail!("unexpected small batch upload response: {other:?}"),
         };
 
-        let mut response_by_path = HashMap::with_capacity(upload.results.len());
-        for result in upload.results {
-            response_by_path.insert(result.relative_path.clone(), result);
+        if upload.results.len() != upload_paths.len() {
+            bail!(
+                "small batch upload response size mismatch: got {} expected {}",
+                upload.results.len(),
+                upload_paths.len()
+            );
         }
 
-        for path in upload_paths {
-            let result = response_by_path
-                .remove(&path)
-                .ok_or_else(|| anyhow::anyhow!("missing upload response for {path}"))?;
+        for (path, result) in upload_paths.iter().zip(upload.results.into_iter()) {
             if !result.accepted {
                 bail!("small-file upload rejected for {path}: {}", result.message);
             }
@@ -540,11 +748,12 @@ async fn upload_file_batches(
                 break;
             }
 
+            let raw_len = chunk.len();
             let (encoded_payload, compressed) =
-                compression::maybe_compress(&chunk, options.compression_level)?;
+                compression::maybe_compress_vec(chunk, options.compression_level)?;
             let encoded_len = encoded_payload.len();
             packets.push(crate::protocol::ChunkPacket {
-                raw_len: chunk.len(),
+                raw_len,
                 compressed,
                 data: encoded_payload,
             });
@@ -648,11 +857,14 @@ async fn send_frame_roundtrip(
     payload: Option<&[u8]>,
     max_stream_payload: usize,
 ) -> Result<Frame> {
-    let bytes = crate::protocol::encode(&request, payload).context("encode request frame")?;
-    if bytes.len() > max_stream_payload {
+    let payload_len = payload.map_or(0usize, |p| p.len());
+    let frame_header =
+        crate::protocol::encode_header(&request, payload_len).context("encode request frame")?;
+    let encoded_len = frame_header.len().saturating_add(payload_len);
+    if encoded_len > max_stream_payload {
         bail!(
             "encoded frame too large: {} > max_stream_payload {}",
-            bytes.len(),
+            encoded_len,
             max_stream_payload
         );
     }
@@ -662,9 +874,14 @@ async fn send_frame_roundtrip(
         .await
         .context("open bidirectional stream")?;
 
-    send.write_all(&bytes)
+    send.write_all(&frame_header)
         .await
         .context("write frame request")?;
+    if let Some(payload) = payload {
+        send.write_all(payload)
+            .await
+            .context("write frame request payload")?;
+    }
     send.finish().context("finish request stream")?;
 
     let response = recv
