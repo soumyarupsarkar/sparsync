@@ -13,6 +13,7 @@ use spargio::{RuntimeHandle, fs};
 use spargio_quic::{
     QuicConnection, QuicEndpoint, QuicEndpointOptions, QuicRecvStream, QuicSendStream,
 };
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,6 +27,7 @@ const DEFAULT_SMALL_FILE_MAX_BYTES: u64 = 128 * 1024;
 const DEFAULT_DIRECT_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SMALL_BATCH_MAX_FILES: usize = 4096;
 const INIT_BATCH_MAX_FILES: usize = 4096;
+const DEFAULT_UPLOAD_WINDOW: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct PushOptions {
@@ -244,6 +246,14 @@ fn auto_connections_enabled() -> bool {
     std::env::var("SPARSYNC_AUTO_CONNECTIONS")
         .map(|value| value == "1")
         .unwrap_or(false)
+}
+
+fn upload_window_from_env() -> usize {
+    std::env::var("SPARSYNC_UPLOAD_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_UPLOAD_WINDOW)
 }
 
 pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Result<PushSummary> {
@@ -1124,6 +1134,29 @@ async fn transfer_small_batch(
     Ok(totals)
 }
 
+#[derive(Debug)]
+struct PreparedUploadBatch {
+    frame: Frame,
+    payload: Vec<u8>,
+    start_chunk: usize,
+    end_chunk: usize,
+    sent_chunks: usize,
+    finalize: bool,
+    batch_sent: u64,
+    batch_raw: u64,
+}
+
+#[derive(Debug)]
+struct InflightUploadBatch {
+    start_chunk: usize,
+    end_chunk: usize,
+    sent_chunks: usize,
+    finalize: bool,
+    batch_sent: u64,
+    batch_raw: u64,
+    sent_at: Instant,
+}
+
 async fn upload_file_batches(
     handle: &RuntimeHandle,
     connection: &QuicConnection,
@@ -1142,103 +1175,59 @@ async fn upload_file_batches(
         .max(1024);
     let per_chunk_budget = options.chunk_size.saturating_add(16).max(1);
     let max_chunks_per_batch = (payload_budget / per_chunk_budget).max(1);
+    let upload_window = upload_window_from_env().max(1);
 
-    let mut next_chunk = init.next_chunk.min(file.total_chunks);
+    let mut next_chunk_to_send = init.next_chunk.min(file.total_chunks);
+    let mut finalize_sent = false;
     let mut sent_bytes = 0u64;
     let mut raw_bytes = 0u64;
+    let mut inflight = VecDeque::with_capacity(upload_window);
     let mut session = FrameSession::open(connection, options.max_stream_payload, &options.stats)
         .await
         .with_context(|| format!("open upload stream for {}", file.relative_path))?;
 
     loop {
-        let start_chunk = next_chunk;
-        let mut sent_chunks = 0usize;
-        let mut batch_payload = Vec::with_capacity(payload_budget.min(BATCH_TARGET_BYTES));
-        let mut batch_estimate = 0usize;
-        let mut batch_sent = 0u64;
-        let mut batch_raw = 0u64;
-        for _ in 0..max_chunks_per_batch {
-            if next_chunk >= file.total_chunks {
-                break;
-            }
-            let offset = (next_chunk as u64).saturating_mul(options.chunk_size as u64);
-            let read_started = Instant::now();
-            let chunk = source_file
-                .read_at(offset, options.chunk_size)
+        while inflight.len() < upload_window && !finalize_sent {
+            let prepared = prepare_upload_batch(
+                &source_file,
+                &source_path,
+                options,
+                file,
+                next_chunk_to_send,
+                max_chunks_per_batch,
+                payload_budget,
+            )
+            .await?;
+
+            let sent_at = session
+                .send_request(prepared.frame, Some(&prepared.payload))
                 .await
-                .with_context(|| {
-                    format!(
-                        "read chunk {} from {} at offset {}",
-                        next_chunk,
-                        source_path.display(),
-                        offset
-                    )
-                })?;
-            options
-                .stats
-                .add_disk_read(read_started.elapsed(), chunk.len() as u64);
+                .with_context(|| format!("send upload batch for {}", file.relative_path))?;
 
-            if chunk.is_empty() {
-                break;
-            }
-
-            let raw_len = chunk.len();
-            let encode_started = Instant::now();
-            let (encoded_payload, compressed) =
-                compression::maybe_compress_vec(chunk, options.compression_level)?;
-            options
-                .stats
-                .add_encode(encode_started.elapsed(), encoded_payload.len());
-            let encoded_len = encoded_payload.len();
-            if raw_len > u32::MAX as usize {
-                bail!("chunk raw length too large for framing: {}", raw_len);
-            }
-            if encoded_len > u32::MAX as usize {
-                bail!(
-                    "chunk encoded length too large for framing: {}",
-                    encoded_len
-                );
-            }
-            batch_payload.extend_from_slice(&(raw_len as u32).to_be_bytes());
-            batch_payload.extend_from_slice(&(encoded_len as u32).to_be_bytes());
-            batch_payload.push(if compressed { 1 } else { 0 });
-            batch_payload.extend_from_slice(&encoded_payload);
-            batch_sent = batch_sent.saturating_add(encoded_len as u64);
-            batch_raw = batch_raw.saturating_add(raw_len as u64);
-            sent_chunks = sent_chunks.saturating_add(1);
-            batch_estimate = batch_estimate.saturating_add(9).saturating_add(encoded_len);
-            next_chunk = next_chunk.saturating_add(1);
-
-            if batch_estimate >= BATCH_TARGET_BYTES {
-                break;
-            }
+            next_chunk_to_send = prepared.end_chunk;
+            finalize_sent |= prepared.finalize;
+            inflight.push_back(InflightUploadBatch {
+                start_chunk: prepared.start_chunk,
+                end_chunk: prepared.end_chunk,
+                sent_chunks: prepared.sent_chunks,
+                finalize: prepared.finalize,
+                batch_sent: prepared.batch_sent,
+                batch_raw: prepared.batch_raw,
+                sent_at,
+            });
         }
 
-        let finalize = next_chunk >= file.total_chunks;
-        if sent_chunks == 0 && !finalize {
-            bail!(
-                "batch assembly produced no packets before finalize for {}",
+        let inflight_batch = inflight.pop_front().ok_or_else(|| {
+            anyhow::anyhow!(
+                "upload pipeline stalled without inflight batch for {}",
                 file.relative_path
-            );
-        }
-
-        let frame = Frame::UploadBatchRequest(UploadBatchRequest {
-            relative_path: file.relative_path.clone(),
-            size: file.size,
-            mode: file.mode,
-            mtime_sec: file.mtime_sec,
-            file_hash: file.file_hash.clone(),
-            total_chunks: file.total_chunks,
-            start_chunk,
-            chunk_size: options.chunk_size,
-            sent_chunks,
-            finalize,
-        });
+            )
+        })?;
 
         let response = session
-            .roundtrip(frame, Some(&batch_payload))
+            .read_response(inflight_batch.sent_at)
             .await
-            .with_context(|| format!("roundtrip upload batch for {}", file.relative_path))?;
+            .with_context(|| format!("read upload batch response for {}", file.relative_path))?;
 
         let response = match response {
             Frame::UploadBatchResponse(resp) => resp,
@@ -1259,15 +1248,28 @@ async fn upload_file_batches(
             bail!(
                 "upload batch rejected for {} at chunk {}: {}",
                 file.relative_path,
-                start_chunk,
+                inflight_batch.start_chunk,
                 response.message
             );
         }
 
-        sent_bytes = sent_bytes.saturating_add(batch_sent);
-        raw_bytes = raw_bytes.saturating_add(batch_raw);
+        sent_bytes = sent_bytes.saturating_add(inflight_batch.batch_sent);
+        raw_bytes = raw_bytes.saturating_add(inflight_batch.batch_raw);
 
         if response.completed {
+            if !inflight.is_empty() {
+                bail!(
+                    "upload batch completed for {} but {} pipeline requests are still in-flight",
+                    file.relative_path,
+                    inflight.len()
+                );
+            }
+            if !inflight_batch.finalize {
+                bail!(
+                    "upload batch completed for {} before finalize batch was sent",
+                    file.relative_path
+                );
+            }
             session
                 .finish()
                 .with_context(|| format!("finish upload stream for {}", file.relative_path))?;
@@ -1278,17 +1280,132 @@ async fn upload_file_batches(
             });
         }
 
-        if response.next_chunk <= start_chunk {
+        if response.next_chunk <= inflight_batch.start_chunk {
             bail!(
                 "non-progress batch ack for {}: start={} next={} message={}",
                 file.relative_path,
-                start_chunk,
+                inflight_batch.start_chunk,
                 response.next_chunk,
                 response.message
             );
         }
-        next_chunk = response.next_chunk.min(file.total_chunks);
+
+        if response.next_chunk != inflight_batch.end_chunk {
+            bail!(
+                "unexpected batch ack progression for {}: start={} sent_chunks={} expected_next={} got_next={}",
+                file.relative_path,
+                inflight_batch.start_chunk,
+                inflight_batch.sent_chunks,
+                inflight_batch.end_chunk,
+                response.next_chunk
+            );
+        }
     }
+}
+
+async fn prepare_upload_batch(
+    source_file: &fs::File,
+    source_path: &Path,
+    options: &FileTransferOptions,
+    file: &FileManifest,
+    start_chunk: usize,
+    max_chunks_per_batch: usize,
+    payload_budget: usize,
+) -> Result<PreparedUploadBatch> {
+    let mut next_chunk = start_chunk;
+    let mut sent_chunks = 0usize;
+    let mut batch_payload = Vec::with_capacity(payload_budget.min(BATCH_TARGET_BYTES));
+    let mut batch_estimate = 0usize;
+    let mut batch_sent = 0u64;
+    let mut batch_raw = 0u64;
+    for _ in 0..max_chunks_per_batch {
+        if next_chunk >= file.total_chunks {
+            break;
+        }
+        let offset = (next_chunk as u64).saturating_mul(options.chunk_size as u64);
+        let read_started = Instant::now();
+        let chunk = source_file
+            .read_at(offset, options.chunk_size)
+            .await
+            .with_context(|| {
+                format!(
+                    "read chunk {} from {} at offset {}",
+                    next_chunk,
+                    source_path.display(),
+                    offset
+                )
+            })?;
+        options
+            .stats
+            .add_disk_read(read_started.elapsed(), chunk.len() as u64);
+
+        if chunk.is_empty() {
+            break;
+        }
+
+        let raw_len = chunk.len();
+        let encode_started = Instant::now();
+        let (encoded_payload, compressed) =
+            compression::maybe_compress_vec(chunk, options.compression_level)?;
+        options
+            .stats
+            .add_encode(encode_started.elapsed(), encoded_payload.len());
+        let encoded_len = encoded_payload.len();
+        if raw_len > u32::MAX as usize {
+            bail!("chunk raw length too large for framing: {}", raw_len);
+        }
+        if encoded_len > u32::MAX as usize {
+            bail!(
+                "chunk encoded length too large for framing: {}",
+                encoded_len
+            );
+        }
+        batch_payload.extend_from_slice(&(raw_len as u32).to_be_bytes());
+        batch_payload.extend_from_slice(&(encoded_len as u32).to_be_bytes());
+        batch_payload.push(if compressed { 1 } else { 0 });
+        batch_payload.extend_from_slice(&encoded_payload);
+        batch_sent = batch_sent.saturating_add(encoded_len as u64);
+        batch_raw = batch_raw.saturating_add(raw_len as u64);
+        sent_chunks = sent_chunks.saturating_add(1);
+        batch_estimate = batch_estimate.saturating_add(9).saturating_add(encoded_len);
+        next_chunk = next_chunk.saturating_add(1);
+
+        if batch_estimate >= BATCH_TARGET_BYTES {
+            break;
+        }
+    }
+
+    let finalize = next_chunk >= file.total_chunks;
+    if sent_chunks == 0 && !finalize {
+        bail!(
+            "batch assembly produced no packets before finalize for {}",
+            file.relative_path
+        );
+    }
+
+    let frame = Frame::UploadBatchRequest(UploadBatchRequest {
+        relative_path: file.relative_path.clone(),
+        size: file.size,
+        mode: file.mode,
+        mtime_sec: file.mtime_sec,
+        file_hash: file.file_hash.clone(),
+        total_chunks: file.total_chunks,
+        start_chunk,
+        chunk_size: options.chunk_size,
+        sent_chunks,
+        finalize,
+    });
+
+    Ok(PreparedUploadBatch {
+        frame,
+        payload: batch_payload,
+        start_chunk,
+        end_chunk: next_chunk,
+        sent_chunks,
+        finalize,
+        batch_sent,
+        batch_raw,
+    })
 }
 
 async fn send_frame_roundtrip(
@@ -1335,6 +1452,11 @@ impl<'a> FrameSession<'a> {
     }
 
     async fn roundtrip(&mut self, request: Frame, payload: Option<&[u8]>) -> Result<Frame> {
+        let sent_at = self.send_request(request, payload).await?;
+        self.read_response(sent_at).await
+    }
+
+    async fn send_request(&mut self, request: Frame, payload: Option<&[u8]>) -> Result<Instant> {
         let encode_started = Instant::now();
         let payload_len = payload.map_or(0usize, |p| p.len());
         let frame_header = crate::protocol::encode_header(&request, payload_len)
@@ -1352,7 +1474,7 @@ impl<'a> FrameSession<'a> {
         self.stats.add_control_frame();
         self.stats.add_request_bytes(encoded_len);
 
-        let roundtrip_started = Instant::now();
+        let sent_at = Instant::now();
         self.send
             .write_all(&frame_header)
             .await
@@ -1363,7 +1485,10 @@ impl<'a> FrameSession<'a> {
                 .await
                 .context("write frame request payload")?;
         }
+        Ok(sent_at)
+    }
 
+    async fn read_response(&mut self, request_started: Instant) -> Result<Frame> {
         let response = self.read_response_frame().await?;
         self.stats.add_response_bytes(response.len());
         let (frame, payload) =
@@ -1374,7 +1499,7 @@ impl<'a> FrameSession<'a> {
                 payload.len()
             );
         }
-        self.stats.add_roundtrip_time(roundtrip_started.elapsed());
+        self.stats.add_roundtrip_time(request_started.elapsed());
         Ok(frame)
     }
 
