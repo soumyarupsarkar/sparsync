@@ -60,6 +60,7 @@ pub struct PushOverSshOptions {
     pub source: PathBuf,
     pub remote: RemoteEndpoint,
     pub destination: String,
+    pub remote_shell_prefix: Option<String>,
     pub scan: ScanOptions,
     pub compression_level: i32,
     pub max_stream_payload: usize,
@@ -598,6 +599,7 @@ pub async fn push_directory_over_ssh_stdio(
         handle.clone(),
         &options.remote,
         &options.destination,
+        options.remote_shell_prefix.as_deref(),
         options.max_stream_payload,
         options.preserve_metadata,
         &stats,
@@ -1261,13 +1263,17 @@ impl<'a> SshFrameSession<'a> {
         handle: RuntimeHandle,
         remote: &RemoteEndpoint,
         destination: &str,
+        remote_shell_prefix: Option<&str>,
         max_stream_payload: usize,
         preserve_metadata: bool,
         stats: &'a TransferStats,
         profile: SshProfile,
     ) -> Result<Self> {
+        let remote_shell_prefix =
+            remote_shell_prefix.unwrap_or("PATH=\"$HOME/.local/bin:$PATH\" sparsync");
         let mut remote_cmd = format!(
-            "PATH=\"$HOME/.local/bin:$PATH\" sparsync serve-stdio --destination {} --max-stream-payload {}",
+            "{} serve-stdio --destination {} --max-stream-payload {}",
+            remote_shell_prefix,
             sh_quote(destination),
             max_stream_payload
         );

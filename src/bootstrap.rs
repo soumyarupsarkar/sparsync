@@ -8,14 +8,15 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const DEFAULT_REMOTE_AUTH_DIR: &str = "$HOME/.config/sparsync/auth";
-const DEFAULT_REMOTE_INSTALL_PATH: &str = "$HOME/.local/bin/sparsync";
+const DEFAULT_REMOTE_AUTH_SUBPATH: &str = ".config/sparsync/auth";
+const DEFAULT_REMOTE_INSTALL_SUBPATH: &str = ".local/bin/sparsync";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InstallMode {
     Auto,
     Off,
     UploadLocalBinary,
+    Ephemeral,
 }
 
 impl InstallMode {
@@ -24,8 +25,9 @@ impl InstallMode {
             "auto" => Ok(Self::Auto),
             "off" => Ok(Self::Off),
             "upload-local-binary" => Ok(Self::UploadLocalBinary),
+            "ephemeral" => Ok(Self::Ephemeral),
             other => bail!(
-                "invalid install mode '{}' (expected auto|off|upload-local-binary)",
+                "invalid install mode '{}' (expected auto|off|upload-local-binary|ephemeral)",
                 other
             ),
         }
@@ -50,25 +52,49 @@ pub struct BootstrapSession {
     pub ca: PathBuf,
     pub client_cert: PathBuf,
     pub client_key: PathBuf,
-    child: Child,
+    _binary_lease: RemoteBinaryLease,
+    child: Option<Child>,
+}
+
+pub struct RemoteBinaryLease {
+    remote: RemoteEndpoint,
+    shell_prefix: String,
+    cleanup_path: Option<String>,
+}
+
+impl RemoteBinaryLease {
+    pub fn shell_prefix(&self) -> &str {
+        &self.shell_prefix
+    }
+}
+
+impl Drop for RemoteBinaryLease {
+    fn drop(&mut self) {
+        let Some(path) = self.cleanup_path.take() else {
+            return;
+        };
+        let _ = run_ssh_status(&self.remote, &format!("rm -f {}", sh_quote(&path)));
+    }
 }
 
 impl BootstrapSession {
     pub fn wait(mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
         let mut waited = Duration::ZERO;
         let step = Duration::from_millis(100);
         let timeout = Duration::from_secs(5);
         let status = loop {
-            if let Some(status) = self
-                .child
+            if let Some(status) = child
                 .try_wait()
                 .context("poll remote serve-session ssh process")?
             {
                 break status;
             }
             if waited >= timeout {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                let _ = child.kill();
+                let _ = child.wait();
                 return Ok(());
             }
             thread::sleep(step);
@@ -78,6 +104,21 @@ impl BootstrapSession {
             bail!("remote serve-session exited with status {}", status);
         }
         Ok(())
+    }
+}
+
+impl Drop for BootstrapSession {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }
 
@@ -124,12 +165,44 @@ fn run_ssh_status(remote: &RemoteEndpoint, script: &str) -> Result<bool> {
     Ok(status.success())
 }
 
+fn remote_home(remote: &RemoteEndpoint) -> Result<String> {
+    let bytes = run_ssh(remote, "printf %s \"$HOME\"").context("resolve remote HOME")?;
+    let home = String::from_utf8(bytes).context("decode remote HOME output")?;
+    let home = home.trim();
+    if home.is_empty() {
+        bail!("remote HOME is empty");
+    }
+    Ok(home.to_string())
+}
+
+fn remote_install_path(remote: &RemoteEndpoint) -> Result<String> {
+    let home = remote_home(remote)?;
+    Ok(format!("{home}/{DEFAULT_REMOTE_INSTALL_SUBPATH}"))
+}
+
+fn remote_auth_dir(remote: &RemoteEndpoint) -> Result<String> {
+    let home = remote_home(remote)?;
+    Ok(format!("{home}/{DEFAULT_REMOTE_AUTH_SUBPATH}"))
+}
+
+fn mktemp_remote_binary_path(remote: &RemoteEndpoint) -> Result<String> {
+    let bytes =
+        run_ssh(remote, "mktemp /tmp/sparsync.XXXXXX").context("create remote temp path")?;
+    let path = String::from_utf8(bytes).context("decode remote temp path")?;
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("remote mktemp returned empty path");
+    }
+    Ok(path.to_string())
+}
+
 fn upload_file_via_ssh(remote: &RemoteEndpoint, local: &Path, remote_path: &str) -> Result<()> {
     let data =
         std::fs::read(local).with_context(|| format!("read local file {}", local.display()))?;
+    let remote_path_q = sh_quote(remote_path);
     let script = format!(
-        "mkdir -p $(dirname {remote_path}) && cat > {remote_path} && chmod 0755 {remote_path}",
-        remote_path = remote_path
+        "mkdir -p \"$(dirname {remote_path})\" && cat > {remote_path} && chmod 0755 {remote_path}",
+        remote_path = remote_path_q
     );
     let mut child = ssh_base_command(remote)
         .arg(script)
@@ -168,25 +241,73 @@ fn fetch_file_via_ssh(remote: &RemoteEndpoint, remote_path: &str, local_path: &P
     Ok(())
 }
 
-fn ensure_remote_binary(remote: &RemoteEndpoint, install_mode: InstallMode) -> Result<()> {
-    if run_ssh_status(remote, "command -v sparsync >/dev/null 2>&1")? {
-        return Ok(());
-    }
-
+fn prepare_remote_binary(
+    remote: &RemoteEndpoint,
+    install_mode: InstallMode,
+) -> Result<RemoteBinaryLease> {
+    let has_remote_sparsync = run_ssh_status(remote, "command -v sparsync >/dev/null 2>&1")?;
     match install_mode {
-        InstallMode::Off => bail!("remote sparsync is missing and install mode is off"),
-        InstallMode::Auto | InstallMode::UploadLocalBinary => {
+        InstallMode::Off => {
+            if !has_remote_sparsync {
+                bail!("remote sparsync is missing and install mode is off");
+            }
+            Ok(RemoteBinaryLease {
+                remote: remote.clone(),
+                shell_prefix: "sparsync".to_string(),
+                cleanup_path: None,
+            })
+        }
+        InstallMode::Auto => {
+            if has_remote_sparsync {
+                return Ok(RemoteBinaryLease {
+                    remote: remote.clone(),
+                    shell_prefix: "sparsync".to_string(),
+                    cleanup_path: None,
+                });
+            }
             let local =
                 std::env::current_exe().context("resolve local sparsync executable path")?;
-            upload_file_via_ssh(remote, &local, DEFAULT_REMOTE_INSTALL_PATH)
+            let install_path = remote_install_path(remote)?;
+            upload_file_via_ssh(remote, &local, &install_path)
                 .context("upload sparsync binary to remote")?;
-            if !run_ssh_status(
-                remote,
-                "command -v sparsync >/dev/null 2>&1 || [ -x $HOME/.local/bin/sparsync ]",
-            )? {
+            if !run_ssh_status(remote, &format!("[ -x {} ]", sh_quote(&install_path)))? {
                 bail!("remote sparsync install failed");
             }
-            Ok(())
+            Ok(RemoteBinaryLease {
+                remote: remote.clone(),
+                shell_prefix: sh_quote(&install_path),
+                cleanup_path: None,
+            })
+        }
+        InstallMode::UploadLocalBinary => {
+            let local =
+                std::env::current_exe().context("resolve local sparsync executable path")?;
+            let install_path = remote_install_path(remote)?;
+            upload_file_via_ssh(remote, &local, &install_path)
+                .context("upload sparsync binary to remote")?;
+            if !run_ssh_status(remote, &format!("[ -x {} ]", sh_quote(&install_path)))? {
+                bail!("remote sparsync install failed");
+            }
+            Ok(RemoteBinaryLease {
+                remote: remote.clone(),
+                shell_prefix: sh_quote(&install_path),
+                cleanup_path: None,
+            })
+        }
+        InstallMode::Ephemeral => {
+            let local =
+                std::env::current_exe().context("resolve local sparsync executable path")?;
+            let temp_path = mktemp_remote_binary_path(remote)?;
+            upload_file_via_ssh(remote, &local, &temp_path)
+                .context("upload ephemeral sparsync binary to remote")?;
+            if !run_ssh_status(remote, &format!("[ -x {} ]", sh_quote(&temp_path)))? {
+                bail!("ephemeral remote sparsync upload failed");
+            }
+            Ok(RemoteBinaryLease {
+                remote: remote.clone(),
+                shell_prefix: sh_quote(&temp_path),
+                cleanup_path: Some(temp_path),
+            })
         }
     }
 }
@@ -194,8 +315,8 @@ fn ensure_remote_binary(remote: &RemoteEndpoint, install_mode: InstallMode) -> R
 pub fn ensure_remote_binary_available(
     remote: &RemoteEndpoint,
     install_mode: InstallMode,
-) -> Result<()> {
-    ensure_remote_binary(remote, install_mode)
+) -> Result<RemoteBinaryLease> {
+    prepare_remote_binary(remote, install_mode)
 }
 
 fn resolve_server_addr(remote: &RemoteEndpoint, port: u16) -> Result<SocketAddr> {
@@ -225,13 +346,15 @@ pub fn default_client_id() -> String {
 }
 
 pub fn bootstrap_remote_push(options: &BootstrapOptions) -> Result<BootstrapSession> {
-    ensure_remote_binary(&options.remote, options.install_mode)?;
+    let binary_lease = prepare_remote_binary(&options.remote, options.install_mode)?;
+    let remote_auth_dir = remote_auth_dir(&options.remote)?;
 
     run_ssh(
         &options.remote,
         &format!(
-            "sparsync auth init-server --dir {} --server-name {}",
-            sh_quote(DEFAULT_REMOTE_AUTH_DIR),
+            "{} auth init-server --dir {} --server-name {}",
+            binary_lease.shell_prefix(),
+            sh_quote(&remote_auth_dir),
             sh_quote(&options.server_name)
         ),
     )
@@ -240,8 +363,9 @@ pub fn bootstrap_remote_push(options: &BootstrapOptions) -> Result<BootstrapSess
     run_ssh(
         &options.remote,
         &format!(
-            "sparsync auth issue-client --dir {} --client-id {} --allow-prefix /",
-            sh_quote(DEFAULT_REMOTE_AUTH_DIR),
+            "{} auth issue-client --dir {} --client-id {} --allow-prefix /",
+            binary_lease.shell_prefix(),
+            sh_quote(&remote_auth_dir),
             sh_quote(&options.client_id)
         ),
     )
@@ -259,30 +383,29 @@ pub fn bootstrap_remote_push(options: &BootstrapOptions) -> Result<BootstrapSess
 
     fetch_file_via_ssh(
         &options.remote,
-        "$HOME/.config/sparsync/auth/server.cert.der",
+        &format!("{remote_auth_dir}/server.cert.der"),
         &ca,
     )?;
     fetch_file_via_ssh(
         &options.remote,
-        &format!(
-            "$HOME/.config/sparsync/auth/clients/{}.cert.der",
-            options.client_id
-        ),
+        &format!("{remote_auth_dir}/clients/{}.cert.der", options.client_id),
         &client_cert,
     )?;
     fetch_file_via_ssh(
         &options.remote,
-        &format!(
-            "$HOME/.config/sparsync/auth/clients/{}.key.der",
-            options.client_id
-        ),
+        &format!("{remote_auth_dir}/clients/{}.key.der", options.client_id),
         &client_key,
     )?;
 
     let mut remote_cmd = format!(
-        "sparsync serve --bind 0.0.0.0:{} --destination {} --cert $HOME/.config/sparsync/auth/server.cert.der --key $HOME/.config/sparsync/auth/server.key.der --client-ca $HOME/.config/sparsync/auth/client-ca.cert.der --authz $HOME/.config/sparsync/auth/authz.json --once",
+        "{} serve --bind 0.0.0.0:{} --destination {} --cert {} --key {} --client-ca {} --authz {} --once",
+        binary_lease.shell_prefix(),
         options.server_port,
-        sh_quote(&options.destination)
+        sh_quote(&options.destination),
+        sh_quote(&format!("{remote_auth_dir}/server.cert.der")),
+        sh_quote(&format!("{remote_auth_dir}/server.key.der")),
+        sh_quote(&format!("{remote_auth_dir}/client-ca.cert.der")),
+        sh_quote(&format!("{remote_auth_dir}/authz.json"))
     );
     if options.preserve_metadata {
         remote_cmd.push_str(" --preserve-metadata");
@@ -311,6 +434,52 @@ pub fn bootstrap_remote_push(options: &BootstrapOptions) -> Result<BootstrapSess
         ca,
         client_cert,
         client_key,
-        child,
+        _binary_lease: binary_lease,
+        child: Some(child),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BootstrapSession, RemoteBinaryLease};
+    use crate::endpoint::RemoteEndpoint;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    #[test]
+    fn bootstrap_session_drop_terminates_child_process() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id();
+
+        let session = BootstrapSession {
+            server: "127.0.0.1:1".parse().expect("parse socket addr"),
+            server_name: "test".to_string(),
+            ca: PathBuf::new(),
+            client_cert: PathBuf::new(),
+            client_key: PathBuf::new(),
+            _binary_lease: RemoteBinaryLease {
+                remote: RemoteEndpoint {
+                    user: None,
+                    host: "localhost".to_string(),
+                    port: None,
+                    path: "/tmp".to_string(),
+                },
+                shell_prefix: "sparsync".to_string(),
+                cleanup_path: None,
+            },
+            child: Some(child),
+        };
+
+        drop(session);
+
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid} >/dev/null 2>&1"))
+            .status()
+            .expect("check process liveness");
+        assert!(!status.success(), "child process {pid} is still running");
+    }
 }

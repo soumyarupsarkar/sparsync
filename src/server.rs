@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -33,6 +34,7 @@ pub struct ServeOptions {
     pub max_stream_payload: usize,
     pub preserve_metadata: bool,
     pub once: bool,
+    pub once_idle_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -248,6 +250,7 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
             .map(|v| v.display().to_string())
             .unwrap_or_else(|| "<none>".to_string()),
         once = options.once,
+        once_idle_timeout_ms = options.once_idle_timeout.as_millis(),
         "sparsync server started"
     );
 
@@ -278,10 +281,41 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
         profile: ServerProfile::from_env(),
     };
 
+    let once_deadline = options
+        .once
+        .then(|| Instant::now() + options.once_idle_timeout);
+    let once_activity = options.once.then(|| Arc::new(AtomicBool::new(false)));
+    if let Some(activity) = once_activity.clone() {
+        let timeout = options.once_idle_timeout;
+        thread::spawn(move || {
+            thread::sleep(timeout);
+            if !activity.load(Ordering::Relaxed) {
+                eprintln!(
+                    "sparsync serve --once idle timeout elapsed before first connection; exiting"
+                );
+                std::process::exit(0);
+            }
+        });
+    }
     loop {
-        let accepted = match endpoint.accept().await {
+        let accepted = match if let Some(deadline) = once_deadline {
+            match spargio::timeout_at(deadline, endpoint.accept()).await {
+                Ok(value) => value,
+                Err(_) => {
+                    warn!(
+                        timeout_ms = options.once_idle_timeout.as_millis(),
+                        "serve --once idle timeout elapsed before first connection; exiting"
+                    );
+                    context.state.flush().await.context("flush resume state")?;
+                    return Ok(());
+                }
+            }
+        } else {
+            endpoint.accept().await
+        } {
             Ok(v) => v,
             Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                spargio::sleep(Duration::from_millis(2)).await;
                 continue;
             }
             Err(err) => {
@@ -290,21 +324,42 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
         };
 
         let Some(connection) = accepted else {
+            if let Some(deadline) = once_deadline {
+                if Instant::now() >= deadline {
+                    warn!(
+                        timeout_ms = options.once_idle_timeout.as_millis(),
+                        "serve --once idle timeout elapsed while waiting for connection; exiting"
+                    );
+                    context.state.flush().await.context("flush resume state")?;
+                    return Ok(());
+                }
+            }
+            spargio::sleep(Duration::from_millis(2)).await;
             continue;
         };
+        if let Some(activity) = &once_activity {
+            activity.store(true, Ordering::Relaxed);
+        }
         let context = context.clone();
         let conn_id = connection.stable_id();
         info!(connection_id = conn_id, "accepted QUIC connection");
 
         if options.once {
-            if let Err(err) = handle_connection(context.clone(), connection).await {
-                warn!(connection_id = conn_id, error = %err, "connection closed with error");
+            if let Err(err) =
+                handle_connection(context.clone(), connection, Some(options.once_idle_timeout))
+                    .await
+            {
+                warn!(
+                    connection_id = conn_id,
+                    error = %err,
+                    "connection closed with error"
+                );
             }
             context.state.flush().await.context("flush resume state")?;
             return Ok(());
         } else {
             let spawn = handle.spawn_stealable(async move {
-                if let Err(err) = handle_connection(context, connection).await {
+                if let Err(err) = handle_connection(context, connection, None).await {
                     warn!(connection_id = conn_id, error = %err, "connection closed with error");
                 }
             });
@@ -318,6 +373,7 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
 async fn handle_connection(
     context: ServerContext,
     connection: spargio_quic::QuicConnection,
+    idle_timeout: Option<Duration>,
 ) -> Result<()> {
     let connection_id = connection.stable_id();
     let connection_auth = if let Some(policy) = &context.authz_policy {
@@ -335,9 +391,27 @@ async fn handle_connection(
         ..context
     };
 
+    let mut idle_deadline = idle_timeout.map(|timeout| Instant::now() + timeout);
     let outcome = loop {
-        match connection.accept_bi().await {
+        let accepted_stream = if let Some(deadline) = idle_deadline {
+            match spargio::timeout_at(deadline, connection.accept_bi()).await {
+                Ok(value) => value,
+                Err(_) => {
+                    warn!(
+                        connection_id,
+                        timeout_ms = idle_timeout.unwrap_or_default().as_millis(),
+                        "connection idle timeout elapsed in serve --once; closing"
+                    );
+                    break Ok(());
+                }
+            }
+        } else {
+            connection.accept_bi().await
+        };
+
+        match accepted_stream {
             Ok((send, recv)) => {
+                idle_deadline = idle_timeout.map(|timeout| Instant::now() + timeout);
                 let stream_conn_id = connection.stable_id();
                 let stream_context = context.clone();
                 let spawn = context.handle.spawn_stealable(async move {
@@ -358,6 +432,17 @@ async fn handle_connection(
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                if let Some(deadline) = idle_deadline {
+                    if Instant::now() >= deadline {
+                        warn!(
+                            connection_id,
+                            timeout_ms = idle_timeout.unwrap_or_default().as_millis(),
+                            "connection idle timeout elapsed in serve --once; closing"
+                        );
+                        break Ok(());
+                    }
+                }
+                spargio::sleep(Duration::from_millis(2)).await;
                 continue;
             }
             Err(err) if is_closed_error(&err) => {

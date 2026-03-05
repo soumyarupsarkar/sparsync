@@ -73,6 +73,9 @@ struct ServeArgs {
 
     #[arg(long)]
     once: bool,
+
+    #[arg(long, default_value_t = 60_000)]
+    once_idle_timeout_ms: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -161,7 +164,7 @@ struct SyncArgs {
     #[arg(long, default_value = "quic")]
     transport: String,
 
-    #[arg(long, default_value = "auto")]
+    #[arg(long, default_value = "ephemeral")]
     install: String,
 
     #[arg(long, default_value_t = 7844)]
@@ -354,6 +357,7 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 max_stream_payload: args.max_stream_payload,
                 preserve_metadata: args.preserve_metadata,
                 once: args.once,
+                once_idle_timeout: Duration::from_millis(args.once_idle_timeout_ms),
             };
             server::run_server(handle, options).await
         }
@@ -583,16 +587,21 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                     Ok(())
                 }
                 "ssh" => {
-                    match args.bootstrap.as_str() {
+                    let mut remote_binary_lease = None;
+                    let remote_shell_prefix = match args.bootstrap.as_str() {
                         "ssh" => {
                             let install_mode = bootstrap::InstallMode::parse(&args.install)?;
-                            bootstrap::ensure_remote_binary_available(&remote, install_mode)?;
+                            let lease =
+                                bootstrap::ensure_remote_binary_available(&remote, install_mode)?;
+                            let shell_prefix = lease.shell_prefix().to_string();
+                            remote_binary_lease = Some(lease);
+                            Some(shell_prefix)
                         }
-                        "none" => {}
+                        "none" => None,
                         other => {
                             bail!("invalid bootstrap mode '{}' (expected ssh|none)", other);
                         }
-                    }
+                    };
 
                     let remote_destination = remote.path.clone();
                     let summary = transfer::push_directory_over_ssh_stdio(
@@ -601,6 +610,7 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                             source: source_path,
                             remote,
                             destination: remote_destination,
+                            remote_shell_prefix,
                             scan: scan_options,
                             compression_level: args.compression_level,
                             max_stream_payload: args.max_stream_payload,
@@ -621,6 +631,7 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                         summary.elapsed.as_millis(),
                         summary.megabits_per_sec()
                     );
+                    drop(remote_binary_lease);
                     Ok(())
                 }
                 other => bail!("invalid transport '{}' (expected quic|ssh)", other),

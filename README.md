@@ -125,7 +125,7 @@ For local->remote sync, `sync` defaults to:
 
 - `--bootstrap ssh`
 - `--transport quic`
-- `--install auto`
+- `--install ephemeral` (uploads `sparsync` to a remote temp path for this sync only)
 
 Example:
 

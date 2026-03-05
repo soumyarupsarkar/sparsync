@@ -30,8 +30,9 @@ Implemented in this repo:
 - Profile persistence and reuse for push (`push --profile`).
 - One-command local->remote sync with SSH bootstrap and QUIC transfer:
   - `sync /src user@host:/dest`
-  - defaults: `--bootstrap ssh --transport quic --install auto`
-- Remote auto-install path for missing binaries via SSH upload (`~/.local/bin/sparsync`).
+  - defaults: `--bootstrap ssh --transport quic --install ephemeral`
+- Default remote install mode is ephemeral upload/cleanup per sync.
+- Optional persistent install path for `--install auto` / `--install upload-local-binary` is `~/.local/bin/sparsync`.
 - One-shot remote serve session mode (`serve --once`) used by bootstrap sync.
 
 ## Desired End-State UX
@@ -39,7 +40,7 @@ Implemented in this repo:
 Primary command:
 
 ```bash
-sparsync sync /src/path user@host:/dest/path --transport quic --bootstrap ssh --install auto
+sparsync sync /src/path user@host:/dest/path --transport quic --bootstrap ssh --install ephemeral
 ```
 
 First-run behavior:
@@ -125,7 +126,8 @@ Exit criteria:
   - `[user@]host:/remote/path`
 - Make SSH bootstrap automatic by default when remote endpoint syntax is used.
 - Add `--install` modes:
-  - `auto` (default)
+  - `ephemeral` (default)
+  - `auto`
   - `off`
   - `upload-local-binary`
   - `package-manager`
@@ -199,7 +201,7 @@ Additional implemented items since the initial roadmap draft:
 Transport status clarification:
 
 - `sparsync over ssh` as a data plane transport via stdio is now implemented.
-- `sync --transport ssh` uses SSH stdio with remote `serve-stdio` and can run with `--bootstrap none` (if `sparsync` already exists remotely) or `--bootstrap ssh --install auto`.
+- `sync --transport ssh` uses SSH stdio with remote `serve-stdio` and can run with `--bootstrap none` (if `sparsync` already exists remotely) or `--bootstrap ssh` (default `--install ephemeral`).
 - Current implementation is functional but intentionally conservative (single SSH data session, no stream multiplexing), so performance is expected to trail QUIC mode.
 
 Benchmark snapshot (March 5, 2026, localhost loopback):
