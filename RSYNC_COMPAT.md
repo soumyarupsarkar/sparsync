@@ -331,7 +331,7 @@ Implemented:
 - Directions:
   - local->local (native local copy path)
   - local->remote
-  - remote->local (SSH reverse-tunnel orchestrated push path)
+  - remote->local (native SSH stream pull path; no reverse tunnel)
 - Commands:
   - `enroll`
   - `server start|stop|status`
@@ -341,6 +341,7 @@ Implemented:
 - Supported initial flag behavior:
   - `-a -v -z -h -P --dry-run/-n --exclude --include -u --bwlimit`
   - `--delete` for local->local, local->remote, and remote->local
+  - local->remote delete planning uses typed protocol messages over SSH stdio and QUIC (no out-of-band prune shell command)
 - Unknown flags and invalid flag bundles fail fast.
 
 Benchmark qualification reruns have been executed post-change and documented in `BENCHMARKS.md`.

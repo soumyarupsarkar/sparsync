@@ -21,7 +21,8 @@ use clap::{Args, Parser, Subcommand};
 use spargio::RuntimeHandle;
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::io::Read;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -31,7 +32,8 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "sparsync",
     about = "Spargio-powered rsync-style transfer tool",
-    disable_help_flag = true
+    disable_help_flag = true,
+    version
 )]
 struct Cli {
     #[arg(long, default_value_t = num_cpus::get().max(1))]
@@ -49,6 +51,12 @@ enum Command {
     Serve(ServeArgs),
     #[command(name = "serve-stdio", hide = true)]
     ServeStdio(ServeStdioArgs),
+    #[command(name = "stream-source", hide = true)]
+    StreamSource(StreamSourceArgs),
+    #[command(name = "prune-destination", hide = true)]
+    PruneDestination(PruneDestinationArgs),
+    #[command(name = "service-daemon", hide = true)]
+    ServiceDaemon(ServiceDaemonArgs),
     Push(PushArgs),
     Sync(SyncArgs),
     Enroll(EnrollArgs),
@@ -195,6 +203,12 @@ struct SyncArgs {
 
     #[arg(short = 'P', long = "partial-progress")]
     partial_progress: bool,
+
+    #[arg(long = "partial")]
+    partial: bool,
+
+    #[arg(long = "progress")]
+    progress: bool,
 
     #[arg(short = 'n', long = "dry-run")]
     dry_run: bool,
@@ -464,6 +478,103 @@ struct GenCertArgs {
     names: Vec<String>,
 }
 
+#[derive(Debug, Args, Clone)]
+struct StreamSourceArgs {
+    #[arg(long)]
+    source: PathBuf,
+
+    #[arg(long, default_value_t = 1024 * 1024)]
+    chunk_size: usize,
+
+    #[arg(long, default_value_t = num_cpus::get().max(1))]
+    scan_workers: usize,
+
+    #[arg(long, default_value_t = num_cpus::get().max(1) * 2)]
+    hash_workers: usize,
+
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_stream_payload: usize,
+
+    #[arg(long = "include")]
+    include: Vec<String>,
+
+    #[arg(long = "exclude")]
+    exclude: Vec<String>,
+
+    #[arg(long)]
+    metadata_only: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct PruneDestinationArgs {
+    #[arg(long)]
+    destination: PathBuf,
+
+    #[arg(long)]
+    dry_run: bool,
+
+    #[arg(long = "include")]
+    include: Vec<String>,
+
+    #[arg(long = "exclude")]
+    exclude: Vec<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ServiceDaemonArgs {
+    #[command(subcommand)]
+    command: ServiceDaemonCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+enum ServiceDaemonCommand {
+    Start(ServiceDaemonStartArgs),
+    Stop(ServiceDaemonStopArgs),
+    Status(ServiceDaemonStatusArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct ServiceDaemonStartArgs {
+    #[arg(long)]
+    bind: SocketAddr,
+
+    #[arg(long)]
+    destination: PathBuf,
+
+    #[arg(long)]
+    cert: PathBuf,
+
+    #[arg(long)]
+    key: PathBuf,
+
+    #[arg(long)]
+    client_ca: Option<PathBuf>,
+
+    #[arg(long)]
+    authz: Option<PathBuf>,
+
+    #[arg(long)]
+    preserve_metadata: bool,
+
+    #[arg(long)]
+    pid_file: PathBuf,
+
+    #[arg(long)]
+    log_file: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ServiceDaemonStopArgs {
+    #[arg(long)]
+    pid_file: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ServiceDaemonStatusArgs {
+    #[arg(long)]
+    pid_file: PathBuf,
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -477,8 +588,12 @@ fn should_insert_sync_subcommand(args: &[OsString]) -> bool {
     const SUBCOMMANDS: &[&str] = &[
         "serve",
         "serve-stdio",
+        "stream-source",
+        "prune-destination",
+        "service-daemon",
         "push",
         "sync",
+        "help",
         "enroll",
         "server",
         "auth",
@@ -511,8 +626,7 @@ fn should_insert_sync_subcommand(args: &[OsString]) -> bool {
     false
 }
 
-fn parse_cli() -> Result<Cli> {
-    let mut args: Vec<OsString> = std::env::args_os().collect();
+fn parse_cli_from(mut args: Vec<OsString>) -> Result<Cli> {
     if should_insert_sync_subcommand(&args) {
         args.insert(1, OsString::from("sync"));
     }
@@ -527,9 +641,25 @@ fn parse_cli() -> Result<Cli> {
                 print!("{err}");
                 std::process::exit(0);
             }
+            if matches!(err.kind(), ErrorKind::UnknownArgument) {
+                let rendered = err.to_string();
+                if rendered.contains("'-h'") || rendered.contains(" -h ") {
+                    return Err(anyhow::anyhow!(
+                        "`-h` is reserved for rsync-compatible `sync` human-readable output. Use `--help` for top-level help or `sparsync sync -h` for transfer output formatting."
+                    ));
+                }
+                return Err(anyhow::anyhow!(
+                    "{}\nunknown flag. Run `sparsync --help` for supported options.",
+                    rendered.trim_end()
+                ));
+            }
             Err(anyhow::anyhow!(err.to_string()))
         }
     }
+}
+
+fn parse_cli() -> Result<Cli> {
+    parse_cli_from(std::env::args_os().collect())
 }
 
 fn main() -> Result<()> {
@@ -537,7 +667,7 @@ fn main() -> Result<()> {
     let cli = parse_cli()?;
     let builder = spargio::Runtime::builder().shards(cli.shards.max(1));
 
-    let outcome = futures::executor::block_on(async move {
+    let outcome = spargio::__private::block_on(async move {
         spargio::run_with(builder, move |handle| async move {
             run_command(handle, cli).await
         })
@@ -575,6 +705,51 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
             };
             stdio_server::run_server_stdio(handle, options).await
         }
+        Command::StreamSource(args) => {
+            let path_filter = filter::PathFilter::from_patterns(&args.include, &args.exclude)
+                .context("compile include/exclude patterns")?;
+            transfer::stream_source_to_stdout(
+                handle,
+                transfer::StreamSourceOptions {
+                    source: args.source,
+                    scan: scan::ScanOptions {
+                        chunk_size: args.chunk_size.max(1),
+                        scan_workers: args.scan_workers.max(1),
+                        hash_workers: args.hash_workers.max(1),
+                    },
+                    path_filter: Some(path_filter),
+                    chunk_size: args.chunk_size.max(1),
+                    max_stream_payload: args.max_stream_payload,
+                    metadata_only: args.metadata_only,
+                },
+            )
+            .await
+        }
+        Command::PruneDestination(args) => {
+            let path_filter = filter::PathFilter::from_patterns(&args.include, &args.exclude)
+                .context("compile include/exclude patterns")?;
+            let mut keep_data = String::new();
+            std::io::stdin()
+                .read_to_string(&mut keep_data)
+                .context("read keep-list from stdin")?;
+            let keep: HashSet<String> = keep_data
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            let deleted = local_copy::prune_destination(
+                &handle,
+                &args.destination,
+                &keep,
+                &path_filter,
+                args.dry_run,
+            )
+            .await?;
+            println!("{deleted}");
+            Ok(())
+        }
+        Command::ServiceDaemon(args) => run_service_daemon_command(args),
         Command::Push(args) => {
             let profile = if let Some(name) = args.profile.as_deref() {
                 Some(
@@ -639,6 +814,7 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 manifest_out: args.manifest_out,
                 path_filter: Some(path_filter),
                 bwlimit_kbps,
+                progress: false,
             };
             let summary = transfer::push_directory(handle, options).await?;
             println!(
@@ -653,8 +829,12 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Sync(args) => run_sync_command(handle, args).await,
-        Command::Enroll(args) => run_enroll_command(args),
-        Command::Server(args) => run_server_command(args),
+        Command::Enroll(args) => {
+            run_blocking_task("enroll", move || run_enroll_command(args)).await
+        }
+        Command::Server(args) => {
+            run_blocking_task("server", move || run_server_command(args)).await
+        }
         Command::Auth(args) => {
             let resolve_dir = |input: Option<PathBuf>| -> Result<PathBuf> {
                 if let Some(dir) = input {
@@ -798,15 +978,27 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
     }
 }
 
+async fn run_blocking_task<T, F>(label: &'static str, job: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let (tx, rx) = futures::channel::oneshot::channel::<Result<T>>();
+    std::thread::Builder::new()
+        .name(format!("sparsync-{label}"))
+        .spawn(move || {
+            let _ = tx.send(job());
+        })
+        .with_context(|| format!("spawn blocking task '{label}'"))?;
+    rx.await
+        .map_err(|_| anyhow::anyhow!("blocking task '{label}' cancelled"))?
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectiveTransport {
     Local,
     Ssh,
     Quic,
-}
-
-fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn parse_socket_address(raw: &str) -> Result<SocketAddr> {
@@ -922,90 +1114,12 @@ fn upsert_profile_from_bootstrap(
     })
 }
 
-fn reserve_local_port() -> Result<u16> {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").context("bind ephemeral local port for sync helper")?;
-    let port = listener
-        .local_addr()
-        .context("read local listener address")?
-        .port();
-    drop(listener);
-    Ok(port)
-}
-
-fn start_local_once_server(
-    destination: &PathBuf,
-    port: u16,
-    cert: &PathBuf,
-    key: &PathBuf,
-    preserve_metadata: bool,
-) -> Result<std::process::Child> {
-    let exe = std::env::current_exe().context("resolve sparsync executable for local helper")?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("serve")
-        .arg("--bind")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--destination")
-        .arg(destination)
-        .arg("--cert")
-        .arg(cert)
-        .arg("--key")
-        .arg(key)
-        .arg("--once")
-        .arg("--once-idle-timeout-ms")
-        .arg("120000")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    if preserve_metadata {
-        command.arg("--preserve-metadata");
-    }
-    command.spawn().context("start local one-shot receiver")
-}
-
-fn run_remote_push_over_reverse_ssh(
-    remote: &endpoint::RemoteEndpoint,
-    remote_forward_port: u16,
-    local_port: u16,
-    remote_command: &str,
-) -> Result<()> {
-    let mut command = std::process::Command::new("ssh");
-    command.arg("-o").arg("BatchMode=yes");
-    command.arg("-o").arg("StrictHostKeyChecking=accept-new");
-    if let Ok(identity) = std::env::var("SPARSYNC_SSH_IDENTITY") {
-        if !identity.trim().is_empty() {
-            command.arg("-i").arg(identity);
-        }
-    }
-    if let Some(port) = remote.port {
-        command.arg("-p").arg(port.to_string());
-    }
-    command
-        .arg("-R")
-        .arg(format!("{remote_forward_port}:127.0.0.1:{local_port}"))
-        .arg(remote.ssh_target())
-        .arg(remote_command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let status = command
-        .status()
-        .with_context(|| format!("run reverse ssh push command on {}", remote.ssh_target()))?;
-    if !status.success() {
-        bail!("remote reverse push command failed with status {}", status);
-    }
-    Ok(())
-}
-
-async fn apply_remote_delete_over_ssh(
+async fn build_delete_keep_paths(
     handle: RuntimeHandle,
-    remote: &endpoint::RemoteEndpoint,
-    destination: &str,
     source_root: &PathBuf,
     scan_options: scan::ScanOptions,
     filter: &filter::PathFilter,
-) -> Result<u64> {
+) -> Result<Vec<String>> {
     let (_, files, _, _) = scan::build_file_list(
         handle,
         source_root,
@@ -1020,124 +1134,7 @@ async fn apply_remote_delete_over_ssh(
             keep.push(file.relative_path);
         }
     }
-
-    let mut local_temp = profile::ensure_data_root()?;
-    local_temp.push("transient");
-    std::fs::create_dir_all(&local_temp)
-        .with_context(|| format!("create {}", local_temp.display()))?;
-    let keep_file = local_temp.join(format!(
-        "delete-keep-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
-    ));
-    let keep_data = if keep.is_empty() {
-        Vec::new()
-    } else {
-        let mut data = keep.join("\n").into_bytes();
-        data.push(b'\n');
-        data
-    };
-    std::fs::write(&keep_file, keep_data)
-        .with_context(|| format!("write keep-list {}", keep_file.display()))?;
-
-    let remote_keep_file = bootstrap::upload_temp_file_via_ssh(remote, &keep_file, "sparsync-keep")
-        .context("upload keep-list to remote")?;
-    let script = format!(
-        "python3 - <<'PY' {dest} {keep}\n\
-import os, sys\n\
-dest = sys.argv[1]\n\
-keep_path = sys.argv[2]\n\
-keep = set()\n\
-with open(keep_path, 'r', encoding='utf-8') as fh:\n\
-    for line in fh:\n\
-        line = line.strip()\n\
-        if line:\n\
-            keep.add(line)\n\
-deleted = 0\n\
-for root, dirs, files in os.walk(dest, topdown=False):\n\
-    rel_root = os.path.relpath(root, dest)\n\
-    for name in files:\n\
-        rel = os.path.normpath(os.path.join(rel_root, name)) if rel_root != '.' else name\n\
-        rel = rel.replace(os.sep, '/')\n\
-        if rel.startswith('.sparsync/'):\n\
-            continue\n\
-        if rel not in keep:\n\
-            try:\n\
-                os.remove(os.path.join(root, name))\n\
-                deleted += 1\n\
-            except FileNotFoundError:\n\
-                pass\n\
-    for name in dirs:\n\
-        if name == '.sparsync':\n\
-            continue\n\
-        path = os.path.join(root, name)\n\
-        try:\n\
-            os.rmdir(path)\n\
-        except OSError:\n\
-            pass\n\
-print(deleted)\n\
-PY",
-        dest = sh_quote(destination),
-        keep = sh_quote(&remote_keep_file),
-    );
-    let output =
-        bootstrap::run_remote_shell(remote, &script).context("apply remote delete plan")?;
-    let _ = bootstrap::remove_remote_file(remote, &remote_keep_file);
-    let _ = std::fs::remove_file(&keep_file);
-
-    let deleted_text = String::from_utf8(output).context("decode remote delete output")?;
-    let deleted = deleted_text
-        .lines()
-        .last()
-        .unwrap_or("0")
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
-    Ok(deleted)
-}
-
-fn fetch_remote_file_list(
-    remote: &endpoint::RemoteEndpoint,
-    source_root: &str,
-    filter: &filter::PathFilter,
-) -> Result<Vec<(String, u64)>> {
-    let script = format!(
-        "python3 - <<'PY' {source}\n\
-import os, sys\n\
-root = sys.argv[1]\n\
-for base, _, files in os.walk(root):\n\
-    for name in files:\n\
-        path = os.path.join(base, name)\n\
-        rel = os.path.relpath(path, root).replace(os.sep, '/')\n\
-        try:\n\
-            size = os.path.getsize(path)\n\
-        except OSError:\n\
-            continue\n\
-        print(f\"{{rel}}\\t{{size}}\")\n\
-PY",
-        source = sh_quote(source_root)
-    );
-    let output = bootstrap::run_remote_shell(remote, &script)
-        .with_context(|| format!("enumerate remote files under {}", source_root))?;
-    let text = String::from_utf8(output).context("decode remote file list")?;
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let Some((path, size_raw)) = line.split_once('\t') else {
-            continue;
-        };
-        if !filter.allows(path) {
-            continue;
-        }
-        let size = size_raw
-            .trim()
-            .parse::<u64>()
-            .with_context(|| format!("parse remote file size '{}'", size_raw.trim()))?;
-        out.push((path.to_string(), size));
-    }
-    Ok(out)
+    Ok(keep)
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -1302,6 +1299,49 @@ fn resolve_server_target(
     }
 }
 
+fn resolve_server_management_target(
+    target: &str,
+    profile_name: Option<&str>,
+) -> Result<(endpoint::RemoteEndpoint, String)> {
+    if let Some(name) = profile_name {
+        let profile = profile::get_profile(name)
+            .with_context(|| format!("load profile '{}' for server command", name))?;
+        let ssh_target = profile
+            .ssh_target
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("profile '{}' has no ssh_target", name))?;
+        let remote = endpoint::parse_ssh_target(&ssh_target)
+            .with_context(|| format!("parse profile ssh_target '{}'", ssh_target))?;
+        return Ok((remote, name.to_string()));
+    }
+
+    if let Ok(remote) = endpoint::parse_ssh_target(target) {
+        let profile_name = default_profile_name(&remote, 7844);
+        return Ok((remote, profile_name));
+    }
+
+    let parsed = endpoint::parse_endpoint(target)
+        .with_context(|| format!("parse server management target '{}'", target))?;
+    let remote = match parsed {
+        endpoint::Endpoint::Remote(remote) if remote.is_ssh() => endpoint::RemoteEndpoint {
+            path: String::new(),
+            ..remote
+        },
+        endpoint::Endpoint::Remote(remote) => {
+            let profile_name = default_profile_name(&remote, 7844);
+            endpoint::RemoteEndpoint {
+                path: String::new(),
+                ..resolve_bootstrap_remote(&remote, &profile_name, None)?
+            }
+        }
+        endpoint::Endpoint::Local(_) => {
+            bail!("server management target must be an ssh host or remote endpoint")
+        }
+    };
+    let profile_name = default_profile_name(&remote, 7844);
+    Ok((remote, profile_name))
+}
+
 fn run_server_command(args: ServerArgs) -> Result<()> {
     match args.command {
         ServerCommand::Start(cmd) => {
@@ -1336,8 +1376,8 @@ fn run_server_command(args: ServerArgs) -> Result<()> {
             Ok(())
         }
         ServerCommand::Stop(cmd) => {
-            let (remote, _, profile_name) =
-                resolve_server_target(&cmd.target, cmd.profile.as_deref(), Some("/tmp"))?;
+            let (remote, profile_name) =
+                resolve_server_management_target(&cmd.target, cmd.profile.as_deref())?;
             let stopped_running =
                 bootstrap::stop_remote_server(&remote).context("stop remote server")?;
             println!(
@@ -1349,8 +1389,8 @@ fn run_server_command(args: ServerArgs) -> Result<()> {
             Ok(())
         }
         ServerCommand::Status(cmd) => {
-            let (remote, _, profile_name) =
-                resolve_server_target(&cmd.target, cmd.profile.as_deref(), Some("/tmp"))?;
+            let (remote, profile_name) =
+                resolve_server_management_target(&cmd.target, cmd.profile.as_deref())?;
             let status = bootstrap::remote_server_status(&remote).context("query server status")?;
             println!(
                 "server status profile={} ssh_target={} running={} pid={}",
@@ -1363,6 +1403,178 @@ fn run_server_command(args: ServerArgs) -> Result<()> {
                     .unwrap_or_else(|| "<none>".to_string())
             );
             Ok(())
+        }
+    }
+}
+
+fn run_service_daemon_command(args: ServiceDaemonArgs) -> Result<()> {
+    match args.command {
+        ServiceDaemonCommand::Start(cmd) => {
+            if let Some(parent) = cmd.pid_file.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            if let Some(parent) = cmd.log_file.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            if let Some(existing_pid) = read_pid_file(&cmd.pid_file)? {
+                if process_is_running(existing_pid) {
+                    println!("running {existing_pid}");
+                    return Ok(());
+                }
+            }
+
+            let exe = std::env::current_exe().context("resolve current executable")?;
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&cmd.log_file)
+                .with_context(|| format!("open log file {}", cmd.log_file.display()))?;
+            let err_log = log
+                .try_clone()
+                .with_context(|| format!("clone log fd {}", cmd.log_file.display()))?;
+            let mut child_cmd = std::process::Command::new(exe);
+            child_cmd
+                .arg("serve")
+                .arg("--bind")
+                .arg(cmd.bind.to_string())
+                .arg("--destination")
+                .arg(&cmd.destination)
+                .arg("--cert")
+                .arg(&cmd.cert)
+                .arg("--key")
+                .arg(&cmd.key);
+            if let Some(client_ca) = cmd.client_ca.as_ref() {
+                child_cmd.arg("--client-ca").arg(client_ca);
+            }
+            if let Some(authz) = cmd.authz.as_ref() {
+                child_cmd.arg("--authz").arg(authz);
+            }
+            if cmd.preserve_metadata {
+                child_cmd.arg("--preserve-metadata");
+            }
+            child_cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(err_log));
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    child_cmd.pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+
+            let mut child = child_cmd
+                .spawn()
+                .context("spawn background serve process")?;
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(status) = child
+                .try_wait()
+                .context("poll background serve process after spawn")?
+            {
+                bail!(
+                    "background serve process exited early with status {}",
+                    status
+                );
+            }
+            let pid = child.id();
+            std::fs::write(&cmd.pid_file, format!("{pid}\n"))
+                .with_context(|| format!("write pid file {}", cmd.pid_file.display()))?;
+            println!("started {pid}");
+            Ok(())
+        }
+        ServiceDaemonCommand::Stop(cmd) => {
+            let Some(pid) = read_pid_file(&cmd.pid_file)? else {
+                let _ = std::fs::remove_file(&cmd.pid_file);
+                println!("stopped_not_running");
+                return Ok(());
+            };
+            if !process_is_running(pid) {
+                let _ = std::fs::remove_file(&cmd.pid_file);
+                println!("stopped_not_running");
+                return Ok(());
+            }
+
+            send_signal(pid, libc::SIGTERM);
+            let mut stopped = false;
+            for _ in 0..40 {
+                if !process_is_running(pid) {
+                    stopped = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !stopped && process_is_running(pid) {
+                send_signal(pid, libc::SIGKILL);
+                for _ in 0..20 {
+                    if !process_is_running(pid) {
+                        stopped = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            let _ = std::fs::remove_file(&cmd.pid_file);
+            if stopped || !process_is_running(pid) {
+                println!("stopped_running");
+            } else {
+                println!("stopped_not_running");
+            }
+            Ok(())
+        }
+        ServiceDaemonCommand::Status(cmd) => {
+            if let Some(pid) = read_pid_file(&cmd.pid_file)? {
+                if process_is_running(pid) {
+                    println!("running {pid}");
+                    return Ok(());
+                }
+            }
+            println!("stopped");
+            Ok(())
+        }
+    }
+}
+
+fn read_pid_file(path: &PathBuf) -> Result<Option<i32>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let pid = trimmed
+        .parse::<i32>()
+        .with_context(|| format!("parse pid from {}", path.display()))?;
+    Ok(Some(pid))
+}
+
+fn process_is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn send_signal(pid: i32, signal: i32) {
+    if pid > 0 {
+        unsafe {
+            let _ = libc::kill(pid, signal);
         }
     }
 }
@@ -1380,6 +1592,8 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
         0
     };
     let bwlimit_kbps = parse_bwlimit_kbps(args.bwlimit.as_deref())?;
+    let partial_enabled = args.partial_progress || args.partial;
+    let progress_enabled = args.partial_progress || args.progress;
     if args.verbose {
         println!(
             "sync options transport={} bootstrap={} archive={} compress={} update_only={} delete={} include_patterns={} exclude_patterns={} bwlimit_kbps={}",
@@ -1399,16 +1613,21 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
 
     match (source, destination) {
         (endpoint::Endpoint::Local(source), endpoint::Endpoint::Local(destination)) => {
-            let summary = local_copy::copy_tree(local_copy::LocalCopyOptions {
-                source,
-                destination,
-                preserve_metadata,
-                dry_run: args.dry_run,
-                delete: args.delete,
-                update_only: args.update_only,
-                filter: filter.clone(),
-                bwlimit_kbps,
-            })?;
+            let summary = local_copy::copy_tree(
+                handle.clone(),
+                local_copy::LocalCopyOptions {
+                    source,
+                    destination,
+                    preserve_metadata,
+                    dry_run: args.dry_run,
+                    delete: args.delete,
+                    update_only: args.update_only,
+                    filter: filter.clone(),
+                    bwlimit_kbps,
+                    progress: args.partial_progress || args.progress,
+                },
+            )
+            .await?;
             if args.human_readable {
                 println!(
                     "synced-local copied={} skipped={} deleted={} bytes={} ({})",
@@ -1430,36 +1649,6 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
             Ok(())
         }
         (endpoint::Endpoint::Local(source), endpoint::Endpoint::Remote(remote)) => {
-            if args.dry_run {
-                let (mut manifest, stats) = scan::build_manifest(
-                    handle.clone(),
-                    &source,
-                    scan::ScanOptions {
-                        chunk_size: args.chunk_size,
-                        scan_workers: args.scan_workers.max(1),
-                        hash_workers: args.hash_workers.max(1),
-                    },
-                )
-                .await
-                .with_context(|| format!("scan source {}", source.display()))?;
-                let before = manifest.files.len();
-                manifest
-                    .files
-                    .retain(|file| filter.allows(&file.relative_path));
-                let kept_bytes = manifest.files.iter().map(|v| v.size).sum::<u64>();
-                println!(
-                    "dry-run source={} files_kept={} files_dropped={} bytes_kept={} enumerate_ms={} hash_ms={} total_ms={}",
-                    source.display(),
-                    manifest.files.len(),
-                    before.saturating_sub(manifest.files.len()),
-                    kept_bytes,
-                    stats.enumeration_elapsed.as_millis(),
-                    stats.hash_elapsed.as_millis(),
-                    stats.total_elapsed.as_millis()
-                );
-                return Ok(());
-            }
-
             let profile_name = args
                 .profile
                 .clone()
@@ -1469,16 +1658,186 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                 scan_workers: args.scan_workers.max(1),
                 hash_workers: args.hash_workers.max(1),
             };
-            let delete_remote_target = if args.delete {
-                Some(resolve_bootstrap_remote(
-                    &remote,
-                    &profile_name,
-                    args.ssh_target.as_deref(),
-                )?)
-            } else {
-                None
-            };
-            match parse_transport(&args.transport, Some(&remote))? {
+            let effective_transport = parse_transport(&args.transport, Some(&remote))?;
+            if args.dry_run {
+                let (mut manifest, stats) =
+                    scan::build_manifest(handle.clone(), &source, scan_options)
+                        .await
+                        .with_context(|| format!("scan source {}", source.display()))?;
+                let before = manifest.files.len();
+                manifest
+                    .files
+                    .retain(|file| filter.allows(&file.relative_path));
+                let kept_bytes = manifest.files.iter().map(|v| v.size).sum::<u64>();
+                let keep_paths: Vec<String> = manifest
+                    .files
+                    .iter()
+                    .map(|file| file.relative_path.clone())
+                    .collect();
+                let mut would_delete = 0u64;
+                if args.delete {
+                    match effective_transport {
+                        EffectiveTransport::Ssh => {
+                            let bootstrap_remote = resolve_bootstrap_remote(
+                                &remote,
+                                &profile_name,
+                                args.ssh_target.as_deref(),
+                            )?;
+                            let mut remote_binary_lease = None;
+                            let remote_shell_prefix = match args.bootstrap.as_str() {
+                                "ssh" => {
+                                    let install_mode =
+                                        bootstrap::InstallMode::parse(&args.install)?;
+                                    let lease = run_blocking_task("ensure-remote-binary", {
+                                        let bootstrap_remote = bootstrap_remote.clone();
+                                        move || {
+                                            bootstrap::ensure_remote_binary_available(
+                                                &bootstrap_remote,
+                                                install_mode,
+                                            )
+                                        }
+                                    })
+                                    .await?;
+                                    let shell_prefix = lease.shell_prefix().to_string();
+                                    remote_binary_lease = Some(lease);
+                                    Some(shell_prefix)
+                                }
+                                "none" => None,
+                                other => {
+                                    bail!("invalid bootstrap mode '{}' (expected ssh|none)", other);
+                                }
+                            };
+                            would_delete = transfer::apply_delete_plan_over_ssh_stdio(
+                                handle.clone(),
+                                transfer::DeletePlanOverSshOptions {
+                                    remote: bootstrap_remote,
+                                    destination: remote.path.clone(),
+                                    remote_shell_prefix,
+                                    max_stream_payload: args.max_stream_payload,
+                                    include_patterns: args.include.clone(),
+                                    exclude_patterns: args.exclude.clone(),
+                                    keep_paths: keep_paths.clone(),
+                                    dry_run: true,
+                                },
+                            )
+                            .await?;
+                            drop(remote_binary_lease);
+                        }
+                        EffectiveTransport::Quic => {
+                            if args.bootstrap == "ssh" {
+                                let bootstrap_remote = resolve_bootstrap_remote(
+                                    &remote,
+                                    &profile_name,
+                                    args.ssh_target.as_deref(),
+                                )?;
+                                let install_mode = bootstrap::InstallMode::parse(&args.install)?;
+                                let client_id = bootstrap::default_client_id();
+                                let session = run_blocking_task("bootstrap-remote-push", {
+                                    let options = bootstrap::BootstrapOptions {
+                                        remote: bootstrap_remote.clone(),
+                                        destination: remote.path.clone(),
+                                        server_port: remote.port.unwrap_or(args.server_port),
+                                        server_name: remote.host.clone(),
+                                        client_id,
+                                        profile_name: profile_name.clone(),
+                                        install_mode,
+                                        preserve_metadata,
+                                    };
+                                    move || bootstrap::bootstrap_remote_push(&options)
+                                })
+                                .await?;
+                                upsert_profile_from_bootstrap(
+                                    &profile_name,
+                                    &bootstrap_remote,
+                                    &bootstrap::Enrollment {
+                                        server: session.server,
+                                        server_name: session.server_name.clone(),
+                                        ca: session.ca.clone(),
+                                        client_cert: session.client_cert.clone(),
+                                        client_key: session.client_key.clone(),
+                                    },
+                                    &remote.path,
+                                )?;
+                                would_delete = transfer::apply_delete_plan_over_quic(
+                                    handle.clone(),
+                                    transfer::DeletePlanOverQuicOptions {
+                                        server: session.server,
+                                        server_name: session.server_name.clone(),
+                                        ca: session.ca.clone(),
+                                        client_cert: Some(session.client_cert.clone()),
+                                        client_key: Some(session.client_key.clone()),
+                                        max_stream_payload: args.max_stream_payload,
+                                        connect_timeout: Duration::from_millis(
+                                            args.connect_timeout_ms,
+                                        ),
+                                        operation_timeout: Duration::from_millis(
+                                            args.op_timeout_ms,
+                                        ),
+                                        include_patterns: args.include.clone(),
+                                        exclude_patterns: args.exclude.clone(),
+                                        keep_paths: keep_paths.clone(),
+                                        dry_run: true,
+                                    },
+                                )
+                                .await?;
+                                run_blocking_task("bootstrap-session-wait", move || session.wait())
+                                    .await?;
+                            } else if args.bootstrap == "none" {
+                                let profile =
+                                    profile::get_profile(&profile_name).with_context(|| {
+                                        format!(
+                                            "load profile '{}' for --bootstrap none",
+                                            profile_name
+                                        )
+                                    })?;
+                                would_delete = transfer::apply_delete_plan_over_quic(
+                                    handle.clone(),
+                                    transfer::DeletePlanOverQuicOptions {
+                                        server: parse_socket_address(&profile.server)?,
+                                        server_name: profile.server_name,
+                                        ca: profile.ca,
+                                        client_cert: profile.client_cert,
+                                        client_key: profile.client_key,
+                                        max_stream_payload: args.max_stream_payload,
+                                        connect_timeout: Duration::from_millis(
+                                            args.connect_timeout_ms,
+                                        ),
+                                        operation_timeout: Duration::from_millis(
+                                            args.op_timeout_ms,
+                                        ),
+                                        include_patterns: args.include.clone(),
+                                        exclude_patterns: args.exclude.clone(),
+                                        keep_paths: keep_paths.clone(),
+                                        dry_run: true,
+                                    },
+                                )
+                                .await?;
+                            } else {
+                                bail!(
+                                    "invalid bootstrap mode '{}' (expected ssh|none)",
+                                    args.bootstrap
+                                );
+                            }
+                        }
+                        EffectiveTransport::Local => {
+                            bail!("invalid transport local for local->remote endpoint");
+                        }
+                    }
+                }
+                println!(
+                    "dry-run source={} files_kept={} files_dropped={} bytes_kept={} would_delete={} enumerate_ms={} hash_ms={} total_ms={}",
+                    source.display(),
+                    manifest.files.len(),
+                    before.saturating_sub(manifest.files.len()),
+                    kept_bytes,
+                    would_delete,
+                    stats.enumeration_elapsed.as_millis(),
+                    stats.hash_elapsed.as_millis(),
+                    stats.total_elapsed.as_millis()
+                );
+                return Ok(());
+            }
+            match effective_transport {
                 EffectiveTransport::Ssh => {
                     let bootstrap_remote = resolve_bootstrap_remote(
                         &remote,
@@ -1489,10 +1848,16 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                     let remote_shell_prefix = match args.bootstrap.as_str() {
                         "ssh" => {
                             let install_mode = bootstrap::InstallMode::parse(&args.install)?;
-                            let lease = bootstrap::ensure_remote_binary_available(
-                                &bootstrap_remote,
-                                install_mode,
-                            )?;
+                            let lease = run_blocking_task("ensure-remote-binary", {
+                                let bootstrap_remote = bootstrap_remote.clone();
+                                move || {
+                                    bootstrap::ensure_remote_binary_available(
+                                        &bootstrap_remote,
+                                        install_mode,
+                                    )
+                                }
+                            })
+                            .await?;
                             let shell_prefix = lease.shell_prefix().to_string();
                             remote_binary_lease = Some(lease);
                             Some(shell_prefix)
@@ -1508,34 +1873,43 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                             source: source.clone(),
                             remote: bootstrap_remote.clone(),
                             destination: remote.path.clone(),
-                            remote_shell_prefix,
+                            remote_shell_prefix: remote_shell_prefix.clone(),
                             scan: scan_options,
                             compression_level,
                             max_stream_payload: args.max_stream_payload,
-                            resume: !args.no_resume || args.partial_progress,
+                            resume: !args.no_resume || partial_enabled,
                             update_only: args.update_only,
                             cold_start: args.cold_start,
                             manifest_out: args.manifest_out,
                             preserve_metadata,
                             path_filter: Some(filter.clone()),
                             bwlimit_kbps,
+                            progress: progress_enabled,
                         },
                     )
                     .await?;
-                    drop(remote_binary_lease);
                     print_push_summary("synced", &summary, args.human_readable);
                     if args.delete {
-                        let deleted = apply_remote_delete_over_ssh(
+                        let keep_paths =
+                            build_delete_keep_paths(handle.clone(), &source, scan_options, &filter)
+                                .await?;
+                        let deleted = transfer::apply_delete_plan_over_ssh_stdio(
                             handle.clone(),
-                            &bootstrap_remote,
-                            &remote.path,
-                            &source,
-                            scan_options,
-                            &filter,
+                            transfer::DeletePlanOverSshOptions {
+                                remote: bootstrap_remote.clone(),
+                                destination: remote.path.clone(),
+                                remote_shell_prefix: remote_shell_prefix.clone(),
+                                max_stream_payload: args.max_stream_payload,
+                                include_patterns: args.include.clone(),
+                                exclude_patterns: args.exclude.clone(),
+                                keep_paths,
+                                dry_run: false,
+                            },
                         )
                         .await?;
                         println!("delete complete removed_files={deleted}");
                     }
+                    drop(remote_binary_lease);
                     Ok(())
                 }
                 EffectiveTransport::Quic => {
@@ -1548,8 +1922,8 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                             )?;
                             let install_mode = bootstrap::InstallMode::parse(&args.install)?;
                             let client_id = bootstrap::default_client_id();
-                            let session =
-                                bootstrap::bootstrap_remote_push(&bootstrap::BootstrapOptions {
+                            let session = run_blocking_task("bootstrap-remote-push", {
+                                let options = bootstrap::BootstrapOptions {
                                     remote: bootstrap_remote.clone(),
                                     destination: remote.path.clone(),
                                     server_port: remote.port.unwrap_or(args.server_port),
@@ -1558,7 +1932,10 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                                     profile_name: profile_name.clone(),
                                     install_mode,
                                     preserve_metadata,
-                                })?;
+                                };
+                                move || bootstrap::bootstrap_remote_push(&options)
+                            })
+                            .await?;
                             upsert_profile_from_bootstrap(
                                 &profile_name,
                                 &bootstrap_remote,
@@ -1598,6 +1975,10 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                                 args.bootstrap
                             );
                         };
+                    let delete_ca = ca.clone();
+                    let delete_client_cert = client_cert.clone();
+                    let delete_client_key = client_key.clone();
+                    let delete_server_name = server_name.clone();
 
                     let summary = transfer::push_directory(
                         handle.clone(),
@@ -1615,30 +1996,43 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                             connect_timeout: Duration::from_millis(args.connect_timeout_ms),
                             operation_timeout: Duration::from_millis(args.op_timeout_ms),
                             max_stream_payload: args.max_stream_payload,
-                            resume: !args.no_resume || args.partial_progress,
+                            resume: !args.no_resume || partial_enabled,
                             update_only: args.update_only,
                             cold_start: args.cold_start,
                             manifest_out: args.manifest_out,
                             path_filter: Some(filter.clone()),
                             bwlimit_kbps,
+                            progress: progress_enabled,
                         },
                     )
                     .await?;
                     print_push_summary("synced", &summary, args.human_readable);
-                    if let Some(session) = bootstrap_session {
-                        session.wait()?;
-                    }
-                    if let Some(delete_remote) = delete_remote_target.as_ref() {
-                        let deleted = apply_remote_delete_over_ssh(
+                    if args.delete {
+                        let keep_paths =
+                            build_delete_keep_paths(handle.clone(), &source, scan_options, &filter)
+                                .await?;
+                        let deleted = transfer::apply_delete_plan_over_quic(
                             handle.clone(),
-                            delete_remote,
-                            &remote.path,
-                            &source,
-                            scan_options,
-                            &filter,
+                            transfer::DeletePlanOverQuicOptions {
+                                server,
+                                server_name: delete_server_name,
+                                ca: delete_ca,
+                                client_cert: delete_client_cert,
+                                client_key: delete_client_key,
+                                max_stream_payload: args.max_stream_payload,
+                                connect_timeout: Duration::from_millis(args.connect_timeout_ms),
+                                operation_timeout: Duration::from_millis(args.op_timeout_ms),
+                                include_patterns: args.include.clone(),
+                                exclude_patterns: args.exclude.clone(),
+                                keep_paths,
+                                dry_run: false,
+                            },
                         )
                         .await?;
                         println!("delete complete removed_files={deleted}");
+                    }
+                    if let Some(session) = bootstrap_session {
+                        run_blocking_task("bootstrap-session-wait", move || session.wait()).await?;
                     }
                     Ok(())
                 }
@@ -1648,156 +2042,176 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
             }
         }
         (endpoint::Endpoint::Remote(remote), endpoint::Endpoint::Local(destination)) => {
+            if matches!(
+                parse_transport(&args.transport, Some(&remote))?,
+                EffectiveTransport::Local
+            ) {
+                bail!("invalid transport local for remote->local endpoint");
+            }
             let profile_name = args
                 .profile
                 .clone()
                 .unwrap_or_else(|| default_profile_name(&remote, args.server_port));
             let bootstrap_remote =
                 resolve_bootstrap_remote(&remote, &profile_name, args.ssh_target.as_deref())?;
-            let remote_file_list =
-                fetch_remote_file_list(&bootstrap_remote, &remote.path, &filter)?;
-            let remote_total_bytes = remote_file_list
-                .iter()
-                .fold(0u64, |acc, (_, size)| acc.saturating_add(*size));
-            let remote_keep: HashSet<String> = remote_file_list
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect();
+
+            let install_mode = bootstrap::InstallMode::parse(&args.install)?;
+            let mut remote_binary_lease = None;
+            let remote_shell_prefix = match args.bootstrap.as_str() {
+                "ssh" => {
+                    let lease = run_blocking_task("ensure-remote-binary", {
+                        let bootstrap_remote = bootstrap_remote.clone();
+                        move || {
+                            bootstrap::ensure_remote_binary_available(
+                                &bootstrap_remote,
+                                install_mode,
+                            )
+                        }
+                    })
+                    .await?;
+                    let shell = lease.shell_prefix().to_string();
+                    remote_binary_lease = Some(lease);
+                    Some(shell)
+                }
+                "none" => None,
+                other => bail!("invalid bootstrap mode '{}' (expected ssh|none)", other),
+            };
+
+            let pull = transfer::pull_directory_over_ssh_stream(
+                handle.clone(),
+                transfer::PullOverSshStreamOptions {
+                    remote: bootstrap_remote.clone(),
+                    source: remote.path.clone(),
+                    destination: destination.clone(),
+                    remote_shell_prefix: remote_shell_prefix.clone(),
+                    scan: scan::ScanOptions {
+                        chunk_size: args.chunk_size.max(1),
+                        scan_workers: args.scan_workers.max(1),
+                        hash_workers: args.hash_workers.max(1),
+                    },
+                    path_filter: filter.clone(),
+                    update_only: args.update_only,
+                    preserve_metadata,
+                    delete: args.delete,
+                    dry_run: args.dry_run,
+                    progress: progress_enabled,
+                    chunk_size: args.chunk_size.max(1),
+                    max_stream_payload: args.max_stream_payload,
+                    metadata_only: args.dry_run,
+                    bwlimit_kbps,
+                    include_patterns: args.include.clone(),
+                    exclude_patterns: args.exclude.clone(),
+                },
+            )
+            .await?;
+            drop(remote_binary_lease);
 
             if args.dry_run {
-                let would_delete = if args.delete {
-                    local_copy::prune_destination(&destination, &remote_keep, &filter, true)?
-                } else {
-                    0usize
-                };
                 println!(
-                    "dry-run remote->local source={} destination={} files_kept={} bytes_kept={} would_delete={}",
+                    "dry-run remote->local source={} destination={} files_copy={} files_skip={} bytes_copy={} would_delete={}",
                     remote.path,
                     destination.display(),
-                    remote_keep.len(),
-                    remote_total_bytes,
-                    would_delete
+                    pull.files_copied,
+                    pull.files_skipped,
+                    pull.bytes_received,
+                    pull.files_deleted
                 );
                 return Ok(());
             }
 
-            let install_mode = bootstrap::InstallMode::parse(&args.install)?;
-            let mut remote_binary_lease = None;
-            let shell_prefix = match args.bootstrap.as_str() {
-                "ssh" => {
-                    let lease =
-                        bootstrap::ensure_remote_binary_available(&bootstrap_remote, install_mode)?;
-                    let shell = lease.shell_prefix().to_string();
-                    remote_binary_lease = Some(lease);
-                    shell
-                }
-                "none" => "sparsync".to_string(),
-                other => bail!("invalid bootstrap mode '{}' (expected ssh|none)", other),
-            };
-
-            let local_port = reserve_local_port()?;
-            let remote_forward_port = reserve_local_port()?;
-
-            let mut temp_root = profile::ensure_data_root()?;
-            temp_root.push("transient");
-            std::fs::create_dir_all(&temp_root)
-                .with_context(|| format!("create {}", temp_root.display()))?;
-            let unique = format!(
-                "pull-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or_default()
-            );
-            temp_root.push(unique);
-            std::fs::create_dir_all(&temp_root)
-                .with_context(|| format!("create {}", temp_root.display()))?;
-            let cert_path = temp_root.join("server.cert.der");
-            let key_path = temp_root.join("server.key.der");
-            certs::generate_self_signed(
-                &cert_path,
-                &key_path,
-                &["localhost".to_string(), "127.0.0.1".to_string()],
-            )
-            .context("generate local reverse-sync certificate")?;
-
-            let mut local_server = start_local_once_server(
-                &destination,
-                local_port,
-                &cert_path,
-                &key_path,
-                preserve_metadata,
-            )?;
-            let remote_ca_path =
-                bootstrap::upload_temp_file_via_ssh(&bootstrap_remote, &cert_path, "sparsync-ca")?;
-
-            let mut remote_push_cmd = format!(
-                "{shell_prefix} push --source {source} --server 127.0.0.1:{remote_port} --server-name localhost --ca {ca} --chunk-size {chunk_size} --parallel-files {parallel} --connections {connections} --scan-workers {scan_workers} --hash-workers {hash_workers} --compression-level {compression}",
-                shell_prefix = shell_prefix,
-                source = sh_quote(&remote.path),
-                remote_port = remote_forward_port,
-                ca = sh_quote(&remote_ca_path),
-                chunk_size = args.chunk_size,
-                parallel = args.parallel_files.max(1),
-                connections = args.connections.max(1),
-                scan_workers = args.scan_workers.max(1),
-                hash_workers = args.hash_workers.max(1),
-                compression = compression_level,
-            );
-            if args.no_resume && !args.partial_progress {
-                remote_push_cmd.push_str(" --no-resume");
-            }
-            if args.update_only {
-                remote_push_cmd.push_str(" -u");
-            }
-            if let Some(limit) = bwlimit_kbps {
-                remote_push_cmd.push_str(" --bwlimit ");
-                remote_push_cmd.push_str(&limit.to_string());
-            }
-            for pattern in &args.include {
-                remote_push_cmd.push_str(" --include ");
-                remote_push_cmd.push_str(&sh_quote(pattern));
-            }
-            for pattern in &args.exclude {
-                remote_push_cmd.push_str(" --exclude ");
-                remote_push_cmd.push_str(&sh_quote(pattern));
-            }
-            if args.cold_start {
-                remote_push_cmd.push_str(" --cold-start");
-            }
-
-            let push_result = run_remote_push_over_reverse_ssh(
-                &bootstrap_remote,
-                remote_forward_port,
-                local_port,
-                &remote_push_cmd,
-            );
-            let _ = bootstrap::remove_remote_file(&bootstrap_remote, &remote_ca_path);
-
-            match local_server.try_wait() {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => {
-                    let _ = local_server.kill();
-                    let _ = local_server.wait();
-                }
-            }
-            drop(remote_binary_lease);
-            push_result?;
-            if args.delete {
-                let deleted =
-                    local_copy::prune_destination(&destination, &remote_keep, &filter, false)?;
-                println!("delete complete removed_files={deleted}");
-            }
             println!(
-                "synced remote->local source={} destination={}",
+                "synced remote->local source={} destination={} copied={} skipped={} deleted={} bytes={} elapsed_ms={}",
                 remote.path,
-                destination.display()
+                destination.display(),
+                pull.files_copied,
+                pull.files_skipped,
+                pull.files_deleted,
+                pull.bytes_received,
+                pull.elapsed.as_millis()
             );
             Ok(())
         }
         (endpoint::Endpoint::Remote(_), endpoint::Endpoint::Remote(_)) => {
             bail!("remote->remote sync is not supported yet")
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{
+        EffectiveTransport, endpoint, parse_cli_from, parse_transport,
+        should_insert_sync_subcommand,
+    };
+    use std::ffi::OsString;
+
+    fn args(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(|item| OsString::from(*item)).collect()
+    }
+
+    #[test]
+    fn help_subcommand_is_not_rewritten() {
+        assert!(!should_insert_sync_subcommand(&args(&[
+            "sparsync", "help", "sync",
+        ])));
+    }
+
+    #[test]
+    fn top_level_help_flag_is_not_rewritten() {
+        assert!(!should_insert_sync_subcommand(&args(&[
+            "sparsync", "--help"
+        ])));
+    }
+
+    #[test]
+    fn rsync_style_invocation_is_rewritten() {
+        assert!(should_insert_sync_subcommand(&args(&[
+            "sparsync",
+            "-av",
+            "/src",
+            "user@host:/dst",
+        ])));
+    }
+
+    #[test]
+    fn unknown_flag_error_includes_help_hint() {
+        let err = parse_cli_from(args(&["sparsync", "--unknown-flag"])).expect_err("must fail");
+        let text = err.to_string();
+        assert!(text.contains("unknown flag"));
+        assert!(text.contains("sparsync --help"));
+    }
+
+    #[test]
+    fn top_level_short_help_has_compat_hint() {
+        let err = parse_cli_from(args(&["sparsync", "-h"])).expect_err("must fail");
+        assert!(err.to_string().contains("`-h` is reserved"));
+    }
+
+    #[test]
+    fn auto_transport_chooses_from_endpoint_kind() {
+        let ssh = endpoint::RemoteEndpoint {
+            user: None,
+            host: "example.com".to_string(),
+            port: None,
+            path: "/tmp".to_string(),
+            kind: endpoint::RemoteKind::Ssh,
+        };
+        let quic = endpoint::RemoteEndpoint {
+            kind: endpoint::RemoteKind::Quic,
+            ..ssh.clone()
+        };
+
+        assert_eq!(
+            parse_transport("auto", Some(&ssh)).expect("ssh transport"),
+            EffectiveTransport::Ssh
+        );
+        assert_eq!(
+            parse_transport("auto", Some(&quic)).expect("quic transport"),
+            EffectiveTransport::Quic
+        );
+        assert_eq!(
+            parse_transport("auto", None).expect("local transport"),
+            EffectiveTransport::Local
+        );
     }
 }

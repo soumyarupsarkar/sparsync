@@ -23,6 +23,12 @@ pub enum Frame {
     UploadSmallBatchResponse(UploadSmallBatchResponse),
     UploadColdBatchRequest(UploadColdBatchRequest),
     UploadColdBatchResponse(UploadColdBatchResponse),
+    SourceStreamFileStart(SourceStreamFileStart),
+    SourceStreamChunk(SourceStreamChunk),
+    SourceStreamFileEnd(SourceStreamFileEnd),
+    SourceStreamDone(SourceStreamDone),
+    DeletePlanRequest(DeletePlanRequest),
+    DeletePlanResponse(DeletePlanResponse),
     Error(ErrorFrame),
 }
 
@@ -224,6 +230,48 @@ pub struct UploadColdFileResult {
     pub skipped: bool,
     pub message: String,
     pub bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SourceStreamFileStart {
+    pub relative_path: String,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_sec: i64,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SourceStreamChunk {
+    pub chunk_len: u32,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SourceStreamFileEnd {
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SourceStreamDone {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct DeletePlanRequest {
+    pub dry_run: bool,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct DeletePlanResponse {
+    pub deleted: u64,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]

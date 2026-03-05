@@ -4,9 +4,10 @@ use crate::endpoint::RemoteEndpoint;
 use crate::filter::PathFilter;
 use crate::model::FileManifest;
 use crate::protocol::{
-    Frame, HelloRequest, HelloResponse, InitAction, InitBatchRequest, InitFileRequest,
-    InitFileResponse, PROTOCOL_VERSION, UploadBatchRequest, UploadColdBatchRequest,
-    UploadColdFileMeta, UploadSmallBatchRequest, UploadSmallFileMeta,
+    DeletePlanRequest, DeletePlanResponse, Frame, HelloRequest, HelloResponse, InitAction,
+    InitBatchRequest, InitFileRequest, InitFileResponse, PROTOCOL_VERSION, SourceStreamChunk,
+    SourceStreamDone, SourceStreamFileEnd, SourceStreamFileStart, UploadBatchRequest,
+    UploadColdBatchRequest, UploadColdFileMeta, UploadSmallBatchRequest, UploadSmallFileMeta,
 };
 use crate::scan::{self, ScanOptions};
 use crate::util::{join_error, runtime_error};
@@ -16,10 +17,12 @@ use spargio::{RuntimeHandle, fs};
 use spargio_quic::{
     QuicConnection, QuicEndpoint, QuicEndpointOptions, QuicRecvStream, QuicSendStream,
 };
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -58,6 +61,7 @@ pub struct PushOptions {
     pub manifest_out: Option<PathBuf>,
     pub path_filter: Option<PathFilter>,
     pub bwlimit_kbps: Option<u64>,
+    pub progress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,66 @@ pub struct PushOverSshOptions {
     pub preserve_metadata: bool,
     pub path_filter: Option<PathFilter>,
     pub bwlimit_kbps: Option<u64>,
+    pub progress: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamSourceOptions {
+    pub source: PathBuf,
+    pub scan: ScanOptions,
+    pub path_filter: Option<PathFilter>,
+    pub chunk_size: usize,
+    pub max_stream_payload: usize,
+    pub metadata_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullOverSshStreamOptions {
+    pub remote: RemoteEndpoint,
+    pub source: String,
+    pub destination: PathBuf,
+    pub remote_shell_prefix: Option<String>,
+    pub scan: ScanOptions,
+    pub path_filter: PathFilter,
+    pub update_only: bool,
+    pub preserve_metadata: bool,
+    pub delete: bool,
+    pub dry_run: bool,
+    pub progress: bool,
+    pub chunk_size: usize,
+    pub max_stream_payload: usize,
+    pub metadata_only: bool,
+    pub bwlimit_kbps: Option<u64>,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeletePlanOverSshOptions {
+    pub remote: RemoteEndpoint,
+    pub destination: String,
+    pub remote_shell_prefix: Option<String>,
+    pub max_stream_payload: usize,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub keep_paths: Vec<String>,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeletePlanOverQuicOptions {
+    pub server: SocketAddr,
+    pub server_name: String,
+    pub ca: PathBuf,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+    pub max_stream_payload: usize,
+    pub connect_timeout: Duration,
+    pub operation_timeout: Duration,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub keep_paths: Vec<String>,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +151,15 @@ pub struct PushSummary {
     pub elapsed: Duration,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PullSummary {
+    pub files_copied: usize,
+    pub files_skipped: usize,
+    pub files_deleted: usize,
+    pub bytes_received: u64,
+    pub elapsed: Duration,
+}
+
 impl PushSummary {
     pub fn megabits_per_sec(&self) -> f64 {
         let secs = self.elapsed.as_secs_f64();
@@ -94,6 +167,126 @@ impl PushSummary {
             return 0.0;
         }
         ((self.bytes_sent as f64) * 8.0) / secs / 1_000_000.0
+    }
+}
+
+fn encode_keep_paths_payload(keep_paths: &[String]) -> Vec<u8> {
+    if keep_paths.is_empty() {
+        return Vec::new();
+    }
+    let mut out = keep_paths.join("\n").into_bytes();
+    out.push(b'\n');
+    out
+}
+
+pub async fn apply_delete_plan_over_ssh_stdio(
+    handle: RuntimeHandle,
+    options: DeletePlanOverSshOptions,
+) -> Result<u64> {
+    let stats = TransferStats::from_env();
+    let profile = SshProfile::from_env();
+    let mut session = SshFrameSession::connect(
+        handle,
+        &options.remote,
+        &options.destination,
+        options.remote_shell_prefix.as_deref(),
+        options.max_stream_payload,
+        false,
+        &stats,
+        profile,
+        None,
+    )
+    .await
+    .context("open SSH stdio delete session")?;
+    verify_protocol_over_ssh(&mut session)
+        .await
+        .context("validate protocol compatibility over ssh")?;
+    let payload = encode_keep_paths_payload(&options.keep_paths);
+    let response = session
+        .roundtrip(
+            Frame::DeletePlanRequest(DeletePlanRequest {
+                dry_run: options.dry_run,
+                include: options.include_patterns,
+                exclude: options.exclude_patterns,
+            }),
+            Some(&payload),
+        )
+        .await
+        .context("send delete plan request over ssh")?;
+    session.finish().context("finish SSH delete session")?;
+    match response {
+        Frame::DeletePlanResponse(DeletePlanResponse { deleted }) => Ok(deleted),
+        Frame::Error(err) => bail!("delete plan rejected over ssh: {}", err.message),
+        other => bail!("unexpected delete plan response over ssh: {other:?}"),
+    }
+}
+
+pub async fn apply_delete_plan_over_quic(
+    _handle: RuntimeHandle,
+    options: DeletePlanOverQuicOptions,
+) -> Result<u64> {
+    let stats = TransferStats::from_env();
+    let client_config = certs::load_client_config(
+        &options.ca,
+        options.client_cert.as_deref(),
+        options.client_key.as_deref(),
+    )
+    .with_context(|| {
+        format!(
+            "load client TLS config ca={} client_cert={} client_key={}",
+            options.ca.display(),
+            options
+                .client_cert
+                .as_ref()
+                .map(|v| v.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            options
+                .client_key
+                .as_ref()
+                .map(|v| v.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        )
+    })?;
+
+    let endpoint_options = QuicEndpointOptions::default()
+        .with_connect_timeout(options.connect_timeout)
+        .with_operation_timeout(options.operation_timeout)
+        .with_max_inflight_ops(65_536);
+    let mut endpoint =
+        QuicEndpoint::client_with_options("0.0.0.0:0".parse().unwrap(), endpoint_options)
+            .context("create quic client endpoint for delete plan")?;
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(options.server, &options.server_name)
+        .await
+        .with_context(|| {
+            format!(
+                "connect for delete plan to {} ({})",
+                options.server, options.server_name
+            )
+        })?;
+    verify_protocol(&connection, options.max_stream_payload, &stats)
+        .await
+        .context("validate protocol compatibility for delete plan")?;
+
+    let payload = encode_keep_paths_payload(&options.keep_paths);
+    let response = send_frame_roundtrip(
+        &connection,
+        Frame::DeletePlanRequest(DeletePlanRequest {
+            dry_run: options.dry_run,
+            include: options.include_patterns,
+            exclude: options.exclude_patterns,
+        }),
+        Some(&payload),
+        options.max_stream_payload,
+        &stats,
+    )
+    .await
+    .context("send delete plan request over quic")?;
+    match response {
+        Frame::DeletePlanResponse(DeletePlanResponse { deleted }) => Ok(deleted),
+        Frame::Error(err) => bail!("delete plan rejected over quic: {}", err.message),
+        other => bail!("unexpected delete plan response over quic: {other:?}"),
     }
 }
 
@@ -130,6 +323,27 @@ impl BatchResult {
         self.files_skipped = self.files_skipped.saturating_add(other.files_skipped);
         self.bytes_sent = self.bytes_sent.saturating_add(other.bytes_sent);
         self.bytes_raw = self.bytes_raw.saturating_add(other.bytes_raw);
+    }
+}
+
+fn maybe_print_transfer_progress(
+    enabled: bool,
+    files_transferred: usize,
+    files_skipped: usize,
+    total_files: usize,
+    bytes_sent: u64,
+) {
+    if !enabled {
+        return;
+    }
+    let done = files_transferred.saturating_add(files_skipped);
+    println!("progress files={done}/{total_files} bytes_sent={bytes_sent}");
+}
+
+fn maybe_print_pull_progress(enabled: bool, files_copied: usize, files_skipped: usize, bytes: u64) {
+    if enabled {
+        let done = files_copied.saturating_add(files_skipped);
+        println!("progress files={done} bytes={bytes}");
     }
 }
 
@@ -347,23 +561,27 @@ impl SshProfile {
 #[derive(Clone)]
 struct BwLimiter {
     bytes_per_sec: u64,
+    burst_bytes: u64,
     state: Arc<Mutex<BwLimiterState>>,
 }
 
 #[derive(Debug)]
 struct BwLimiterState {
-    started: Option<Instant>,
-    sent_bytes: u64,
+    last_refill: Instant,
+    tokens: f64,
 }
 
 impl BwLimiter {
     fn from_kbps(kbps: Option<u64>) -> Option<Self> {
         let kbps = kbps.filter(|value| *value > 0)?;
+        let bytes_per_sec = kbps.saturating_mul(1024);
+        let burst_bytes = bytes_per_sec.max(64 * 1024);
         Some(Self {
-            bytes_per_sec: kbps.saturating_mul(1024),
+            bytes_per_sec,
+            burst_bytes,
             state: Arc::new(Mutex::new(BwLimiterState {
-                started: None,
-                sent_bytes: 0,
+                last_refill: Instant::now(),
+                tokens: burst_bytes as f64,
             })),
         })
     }
@@ -372,20 +590,34 @@ impl BwLimiter {
         if bytes == 0 || self.bytes_per_sec == 0 {
             return;
         }
-        let sleep_for = {
-            let mut guard = match self.state.lock() {
-                Ok(guard) => guard,
-                Err(_) => return,
+        let bytes = bytes as f64;
+        loop {
+            let sleep_for = {
+                let now = Instant::now();
+                let mut guard = match self.state.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                let elapsed = now
+                    .saturating_duration_since(guard.last_refill)
+                    .as_secs_f64();
+                if elapsed > 0.0 {
+                    let refill = elapsed * self.bytes_per_sec as f64;
+                    guard.tokens = (guard.tokens + refill).min(self.burst_bytes as f64);
+                    guard.last_refill = now;
+                }
+                if guard.tokens >= bytes {
+                    guard.tokens -= bytes;
+                    Duration::ZERO
+                } else {
+                    let deficit = (bytes - guard.tokens).max(0.0);
+                    guard.tokens = 0.0;
+                    Duration::from_secs_f64(deficit / self.bytes_per_sec as f64)
+                }
             };
-            let now = Instant::now();
-            let started = *guard.started.get_or_insert(now);
-            guard.sent_bytes = guard.sent_bytes.saturating_add(bytes as u64);
-            let expected =
-                Duration::from_secs_f64(guard.sent_bytes as f64 / self.bytes_per_sec as f64);
-            let elapsed = started.elapsed();
-            expected.saturating_sub(elapsed)
-        };
-        if !sleep_for.is_zero() {
+            if sleep_for.is_zero() {
+                break;
+            }
             spargio::sleep(sleep_for).await;
         }
     }
@@ -423,8 +655,8 @@ fn upload_window_from_env() -> usize {
 
 fn stdio_nonblocking_enabled() -> bool {
     std::env::var("SPARSYNC_STDIO_NONBLOCK")
-        .map(|value| value == "1")
-        .unwrap_or(false)
+        .map(|value| value != "0")
+        .unwrap_or(true)
 }
 
 fn stdio_pipe_size_bytes_from_env() -> usize {
@@ -524,6 +756,7 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         scan_stats.enumeration_elapsed.as_millis(),
         scan_stats.hash_elapsed.as_millis(),
     );
+    let total_files = manifest.files.len();
 
     let transfer_options = FileTransferOptions {
         source_root: PathBuf::from(&manifest.root),
@@ -575,6 +808,13 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
     let (init_totals, uploads) =
         initialize_large_files(&connections[0], &transfer_options, large_files).await?;
     totals.merge(init_totals);
+    maybe_print_transfer_progress(
+        options.progress,
+        totals.files_transferred,
+        totals.files_skipped,
+        total_files,
+        totals.bytes_sent,
+    );
 
     if auto_connections_enabled() && options.connections == 1 {
         let upload_bytes = uploads.iter().map(|(file, _)| file.size).sum::<u64>();
@@ -605,6 +845,13 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
     )
     .await?;
     totals.merge(direct_totals);
+    maybe_print_transfer_progress(
+        options.progress,
+        totals.files_transferred,
+        totals.files_skipped,
+        total_files,
+        totals.bytes_sent,
+    );
 
     let mut files = streamed_files.into_iter();
     let mut running = FuturesUnordered::new();
@@ -626,6 +873,13 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
     while let Some(joined) = running.next().await {
         let result = joined.map_err(|err| join_error("file transfer task canceled", err))??;
         totals.add_file_result(result);
+        maybe_print_transfer_progress(
+            options.progress,
+            totals.files_transferred,
+            totals.files_skipped,
+            total_files,
+            totals.bytes_sent,
+        );
 
         if let Some((file, init)) = files.next() {
             let connection = connections[next_connection % connections.len()].clone();
@@ -645,6 +899,13 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
             .await
             .map_err(|err| join_error("small-batch transfer task canceled", err))??;
         totals.merge(small_totals);
+        maybe_print_transfer_progress(
+            options.progress,
+            totals.files_transferred,
+            totals.files_skipped,
+            total_files,
+            totals.bytes_sent,
+        );
     }
 
     let elapsed = started.elapsed();
@@ -737,6 +998,7 @@ pub async fn push_directory_over_ssh_stdio(
         scan_stats.enumeration_elapsed.as_millis(),
         scan_stats.hash_elapsed.as_millis(),
     );
+    let total_files = manifest.files.len();
 
     let transfer_options = FileTransferOptions {
         source_root: PathBuf::from(&manifest.root),
@@ -764,6 +1026,13 @@ pub async fn push_directory_over_ssh_stdio(
         let result =
             transfer_small_batch_over_ssh(&handle, &mut session, &transfer_options, &batch).await?;
         totals.merge(result);
+        maybe_print_transfer_progress(
+            options.progress,
+            totals.files_transferred,
+            totals.files_skipped,
+            total_files,
+            totals.bytes_sent,
+        );
     }
     ssh_profile.add_init_time(small_started.elapsed());
 
@@ -771,6 +1040,13 @@ pub async fn push_directory_over_ssh_stdio(
     let (init_totals, uploads) =
         initialize_large_files_over_ssh(&mut session, &transfer_options, large_files).await?;
     totals.merge(init_totals);
+    maybe_print_transfer_progress(
+        options.progress,
+        totals.files_transferred,
+        totals.files_skipped,
+        total_files,
+        totals.bytes_sent,
+    );
     ssh_profile.add_init_time(init_started.elapsed());
 
     let (direct_files, streamed_files) =
@@ -784,6 +1060,13 @@ pub async fn push_directory_over_ssh_stdio(
     )
     .await?;
     totals.merge(direct_totals);
+    maybe_print_transfer_progress(
+        options.progress,
+        totals.files_transferred,
+        totals.files_skipped,
+        total_files,
+        totals.bytes_sent,
+    );
 
     for (file, init) in streamed_files {
         let result =
@@ -791,6 +1074,13 @@ pub async fn push_directory_over_ssh_stdio(
                 .await
                 .with_context(|| format!("upload file {}", file.relative_path))?;
         totals.add_file_result(result);
+        maybe_print_transfer_progress(
+            options.progress,
+            totals.files_transferred,
+            totals.files_skipped,
+            total_files,
+            totals.bytes_sent,
+        );
     }
     ssh_profile.add_upload_time(upload_started.elapsed());
 
@@ -1334,7 +1624,10 @@ fn sh_quote(value: &str) -> String {
 fn ssh_base_command(remote: &RemoteEndpoint) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-o").arg(format!(
+        "StrictHostKeyChecking={}",
+        ssh_strict_host_key_checking()
+    ));
     if let Ok(identity) = std::env::var("SPARSYNC_SSH_IDENTITY") {
         if !identity.trim().is_empty() {
             cmd.arg("-i").arg(identity);
@@ -1345,6 +1638,23 @@ fn ssh_base_command(remote: &RemoteEndpoint) -> Command {
     }
     cmd.arg(remote.ssh_target());
     cmd
+}
+
+fn ssh_strict_host_key_checking() -> String {
+    if let Ok(value) = std::env::var("SPARSYNC_SSH_STRICT_HOST_KEY_CHECKING") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if std::env::var("SPARSYNC_SSH_TOFU")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        "accept-new".to_string()
+    } else {
+        "yes".to_string()
+    }
 }
 
 const STREAM_FD_OFFSET: u64 = u64::MAX;
@@ -3149,4 +3459,514 @@ fn try_extract_frame(
     let tail = buffered.split_off(frame_len);
     let frame = std::mem::replace(buffered, tail);
     Ok(Some(frame))
+}
+
+struct PullActiveFile {
+    meta: SourceStreamFileStart,
+    destination_path: PathBuf,
+    writer: Option<fs::File>,
+    offset: u64,
+    copy: bool,
+}
+
+pub async fn stream_source_to_stdout(
+    handle: RuntimeHandle,
+    options: StreamSourceOptions,
+) -> Result<()> {
+    let (source_root, mut files, _, _) = scan::build_file_list(
+        handle.clone(),
+        &options.source,
+        options.scan.scan_workers.max(1),
+        options.scan.hash_workers.max(1),
+    )
+    .await
+    .with_context(|| format!("enumerate source {}", options.source.display()))?;
+
+    if let Some(path_filter) = options.path_filter.as_ref() {
+        files.retain(|file| path_filter.allows(&file.relative_path));
+    }
+
+    let native = handle
+        .uring_native_unbound()
+        .map_err(runtime_error_to_io)?
+        .clear_preferred_shard();
+    let stdout_fd = std::io::stdout().as_raw_fd();
+    if stdio_nonblocking_enabled() {
+        set_nonblocking(stdout_fd, true).context("set stdout nonblocking for stream-source")?;
+    }
+
+    let chunk_size = options.chunk_size.max(1);
+    let mut files_streamed = 0u64;
+    let mut bytes_streamed = 0u64;
+
+    for file in files {
+        let start = Frame::SourceStreamFileStart(SourceStreamFileStart {
+            relative_path: file.relative_path.clone(),
+            size: file.size,
+            mode: file.mode,
+            mtime_sec: file.mtime_sec,
+        });
+        write_frame_to_fd(&native, stdout_fd, options.max_stream_payload, &start, None)
+            .await
+            .with_context(|| format!("write source stream start {}", file.relative_path))?;
+
+        if !options.metadata_only {
+            let source_path = source_root.join(Path::new(&file.relative_path));
+            let source_file = fs::File::open(handle.clone(), &source_path)
+                .await
+                .with_context(|| format!("open source file {}", source_path.display()))?;
+            let mut offset = 0u64;
+            loop {
+                let chunk = source_file
+                    .read_at(offset, chunk_size)
+                    .await
+                    .with_context(|| format!("read source file {}", source_path.display()))?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let chunk_len_u32 = u32::try_from(chunk.len()).with_context(|| {
+                    format!(
+                        "source chunk too large ({} bytes) for {}",
+                        chunk.len(),
+                        file.relative_path
+                    )
+                })?;
+                let frame = Frame::SourceStreamChunk(SourceStreamChunk {
+                    chunk_len: chunk_len_u32,
+                });
+                write_frame_to_fd(
+                    &native,
+                    stdout_fd,
+                    options.max_stream_payload,
+                    &frame,
+                    Some(chunk.as_ref()),
+                )
+                .await
+                .with_context(|| format!("write source chunk {}", file.relative_path))?;
+                offset = offset.saturating_add(chunk.len() as u64);
+                bytes_streamed = bytes_streamed.saturating_add(chunk.len() as u64);
+                if chunk.len() < chunk_size {
+                    break;
+                }
+            }
+        }
+
+        let end = Frame::SourceStreamFileEnd(SourceStreamFileEnd {
+            relative_path: file.relative_path,
+        });
+        write_frame_to_fd(&native, stdout_fd, options.max_stream_payload, &end, None)
+            .await
+            .context("write source stream end frame")?;
+        files_streamed = files_streamed.saturating_add(1);
+    }
+
+    let done = Frame::SourceStreamDone(SourceStreamDone {
+        files: files_streamed,
+        bytes: bytes_streamed,
+    });
+    write_frame_to_fd(&native, stdout_fd, options.max_stream_payload, &done, None)
+        .await
+        .context("write source stream done frame")?;
+    Ok(())
+}
+
+pub async fn pull_directory_over_ssh_stream(
+    handle: RuntimeHandle,
+    options: PullOverSshStreamOptions,
+) -> Result<PullSummary> {
+    let started = Instant::now();
+    let mut remote_cmd = format!(
+        "{} stream-source --source {} --scan-workers {} --hash-workers {} --chunk-size {} --max-stream-payload {}",
+        options
+            .remote_shell_prefix
+            .as_deref()
+            .unwrap_or("PATH=\"$HOME/.local/bin:$PATH\" sparsync"),
+        sh_quote(&options.source),
+        options.scan.scan_workers.max(1),
+        options.scan.hash_workers.max(1),
+        options.chunk_size.max(1),
+        options.max_stream_payload,
+    );
+    if options.metadata_only {
+        remote_cmd.push_str(" --metadata-only");
+    }
+    for pattern in &options.include_patterns {
+        remote_cmd.push_str(" --include ");
+        remote_cmd.push_str(&sh_quote(pattern));
+    }
+    for pattern in &options.exclude_patterns {
+        remote_cmd.push_str(" --exclude ");
+        remote_cmd.push_str(&sh_quote(pattern));
+    }
+
+    let mut child = ssh_base_command(&options.remote)
+        .arg(remote_cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawn source stream on {}", options.remote.ssh_target()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing SSH stdout pipe for source stream"))?;
+    let stdout_fd = unsafe { OwnedFd::from_raw_fd(stdout.into_raw_fd()) };
+    if stdio_nonblocking_enabled() {
+        set_nonblocking(stdout_fd.as_raw_fd(), true)
+            .context("set source stream stdout nonblocking")?;
+    }
+    configure_pipe_size(stdout_fd.as_raw_fd(), stdio_pipe_size_bytes_from_env());
+
+    let native = handle
+        .uring_native_unbound()
+        .map_err(runtime_error_to_io)?
+        .clear_preferred_shard();
+    let bw_limiter = BwLimiter::from_kbps(options.bwlimit_kbps);
+    let mut read_buffer = Vec::with_capacity(64 * 1024);
+    let mut read_frame_len = None;
+    let mut keep = HashSet::new();
+    let mut summary = PullSummary::default();
+    let mut done_summary = None;
+    let mut active: Option<PullActiveFile> = None;
+
+    loop {
+        let maybe_frame = read_next_frame_from_fd(
+            &native,
+            stdout_fd.as_raw_fd(),
+            &mut read_buffer,
+            &mut read_frame_len,
+            options.max_stream_payload,
+        )
+        .await
+        .context("read source stream frame")?;
+        let Some(frame_bytes) = maybe_frame else {
+            break;
+        };
+        let (frame, payload) =
+            crate::protocol::decode(&frame_bytes).context("decode source frame")?;
+        match frame {
+            Frame::SourceStreamFileStart(meta) => {
+                if active.is_some() {
+                    bail!(
+                        "received nested source stream file start for {}",
+                        meta.relative_path
+                    );
+                }
+                if !options.path_filter.allows(&meta.relative_path) {
+                    active = Some(PullActiveFile {
+                        destination_path: options.destination.join(Path::new(&meta.relative_path)),
+                        writer: None,
+                        offset: 0,
+                        copy: false,
+                        meta,
+                    });
+                    continue;
+                }
+                keep.insert(meta.relative_path.clone());
+                let destination_path = options.destination.join(Path::new(&meta.relative_path));
+                let mut copy = true;
+                if let Ok(existing) = fs::metadata_lite(&handle, &destination_path).await {
+                    if options.update_only {
+                        if existing.mtime_sec >= meta.mtime_sec {
+                            copy = false;
+                        }
+                    } else if existing.size == meta.size && existing.mtime_sec == meta.mtime_sec {
+                        copy = false;
+                    }
+                }
+
+                if options.dry_run {
+                    if copy {
+                        summary.files_copied = summary.files_copied.saturating_add(1);
+                        summary.bytes_received = summary.bytes_received.saturating_add(meta.size);
+                    } else {
+                        summary.files_skipped = summary.files_skipped.saturating_add(1);
+                    }
+                    maybe_print_pull_progress(
+                        options.progress,
+                        summary.files_copied,
+                        summary.files_skipped,
+                        summary.bytes_received,
+                    );
+                    copy = false;
+                } else if copy {
+                    if let Some(parent) = destination_path.parent() {
+                        fs::create_dir_all(&handle, parent).await.with_context(|| {
+                            format!("create destination parent {}", parent.display())
+                        })?;
+                    }
+                } else {
+                    summary.files_skipped = summary.files_skipped.saturating_add(1);
+                    maybe_print_pull_progress(
+                        options.progress,
+                        summary.files_copied,
+                        summary.files_skipped,
+                        summary.bytes_received,
+                    );
+                }
+
+                let writer = if copy {
+                    Some(
+                        fs::File::create(handle.clone(), &destination_path)
+                            .await
+                            .with_context(|| {
+                                format!("create destination file {}", destination_path.display())
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                active = Some(PullActiveFile {
+                    meta,
+                    destination_path,
+                    writer,
+                    offset: 0,
+                    copy,
+                });
+            }
+            Frame::SourceStreamChunk(chunk) => {
+                let Some(state) = active.as_mut() else {
+                    bail!("received source chunk without active file");
+                };
+                if payload.len() != chunk.chunk_len as usize {
+                    bail!(
+                        "source chunk payload mismatch for {}: header={} payload={}",
+                        state.meta.relative_path,
+                        chunk.chunk_len,
+                        payload.len()
+                    );
+                }
+                if state.copy && !options.dry_run {
+                    if let Some(limiter) = &bw_limiter {
+                        limiter.throttle(payload.len()).await;
+                    }
+                    let writer = state.writer.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing destination writer for {}",
+                            state.meta.relative_path
+                        )
+                    })?;
+                    writer
+                        .write_all_at(state.offset, payload)
+                        .await
+                        .with_context(|| {
+                            format!("write destination {}", state.destination_path.display())
+                        })?;
+                    summary.bytes_received =
+                        summary.bytes_received.saturating_add(payload.len() as u64);
+                }
+                state.offset = state.offset.saturating_add(payload.len() as u64);
+            }
+            Frame::SourceStreamFileEnd(end) => {
+                let Some(mut state) = active.take() else {
+                    bail!("received source file end without active file");
+                };
+                if end.relative_path != state.meta.relative_path {
+                    bail!(
+                        "source stream file mismatch: start={} end={}",
+                        state.meta.relative_path,
+                        end.relative_path
+                    );
+                }
+                if !options.metadata_only && state.offset != state.meta.size {
+                    bail!(
+                        "source stream size mismatch for {}: expected {} got {}",
+                        state.meta.relative_path,
+                        state.meta.size,
+                        state.offset
+                    );
+                }
+                if state.copy && !options.dry_run {
+                    if let Some(writer) = state.writer.take() {
+                        writer.fsync().await.with_context(|| {
+                            format!("fsync {}", state.destination_path.display())
+                        })?;
+                    }
+                    apply_pulled_metadata(
+                        &handle,
+                        &state.destination_path,
+                        state.meta.mode,
+                        state.meta.mtime_sec,
+                        options.preserve_metadata,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "apply metadata to pulled file {}",
+                            state.destination_path.display()
+                        )
+                    })?;
+                    summary.files_copied = summary.files_copied.saturating_add(1);
+                    maybe_print_pull_progress(
+                        options.progress,
+                        summary.files_copied,
+                        summary.files_skipped,
+                        summary.bytes_received,
+                    );
+                }
+            }
+            Frame::SourceStreamDone(done) => {
+                done_summary = Some(done);
+            }
+            Frame::Error(err) => bail!("remote source stream error: {}", err.message),
+            other => bail!("unexpected frame in source stream: {other:?}"),
+        }
+    }
+
+    if let Some(active) = active {
+        bail!(
+            "source stream ended mid-file for {} at offset {}",
+            active.meta.relative_path,
+            active.offset
+        );
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for source stream on {}", options.remote.ssh_target()))?;
+    if !status.success() {
+        bail!("source stream command exited with status {}", status);
+    }
+
+    if let Some(done) = done_summary {
+        if done.files != keep.len() as u64 {
+            bail!(
+                "source stream file count mismatch: remote={} local={}",
+                done.files,
+                keep.len()
+            );
+        }
+    }
+
+    if options.delete {
+        summary.files_deleted = crate::local_copy::prune_destination(
+            &handle,
+            &options.destination,
+            &keep,
+            &options.path_filter,
+            options.dry_run,
+        )
+        .await?;
+    }
+    summary.elapsed = started.elapsed();
+    Ok(summary)
+}
+
+async fn read_next_frame_from_fd(
+    native: &spargio::UringNativeAny,
+    fd: RawFd,
+    buffer: &mut Vec<u8>,
+    expected_len: &mut Option<usize>,
+    max_stream_payload: usize,
+) -> Result<Option<Vec<u8>>> {
+    loop {
+        if let Some(frame) = try_extract_frame(buffer, expected_len, max_stream_payload)? {
+            return Ok(Some(frame));
+        }
+
+        let remaining = max_stream_payload
+            .saturating_sub(buffer.len())
+            .min(256 * 1024)
+            .max(1);
+        match native.read_at(fd, STREAM_FD_OFFSET, remaining).await {
+            Ok(bytes) => {
+                if bytes.is_empty() {
+                    if buffer.is_empty() && expected_len.is_none() {
+                        return Ok(None);
+                    }
+                    if let Some(expected) = *expected_len {
+                        bail!(
+                            "stream closed with partial frame: have {} expected {}",
+                            buffer.len(),
+                            expected
+                        );
+                    }
+                    bail!("stream closed with {} buffered bytes", buffer.len());
+                }
+                buffer.extend_from_slice(bytes.as_ref());
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                wait_fd_ready(native, fd, libc::POLLIN as u32)
+                    .await
+                    .context("wait for stream fd readable")?;
+            }
+            Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
+            Err(err) => return Err(err).context("read stream frame bytes"),
+        }
+    }
+}
+
+async fn write_frame_to_fd(
+    native: &spargio::UringNativeAny,
+    fd: RawFd,
+    max_stream_payload: usize,
+    frame: &Frame,
+    payload: Option<&[u8]>,
+) -> Result<()> {
+    let payload_len = payload.map_or(0usize, |bytes| bytes.len());
+    let frame_header =
+        crate::protocol::encode_header(frame, payload_len).context("encode stream frame header")?;
+    let encoded_len = frame_header.len().saturating_add(payload_len);
+    if encoded_len > max_stream_payload {
+        bail!(
+            "stream frame too large: {} > max_stream_payload {}",
+            encoded_len,
+            max_stream_payload
+        );
+    }
+    write_all_to_fd(native, fd, frame_header.as_ref())
+        .await
+        .context("write stream frame header")?;
+    if let Some(payload) = payload {
+        write_all_to_fd(native, fd, payload)
+            .await
+            .context("write stream frame payload")?;
+    }
+    Ok(())
+}
+
+async fn write_all_to_fd(native: &spargio::UringNativeAny, fd: RawFd, bytes: &[u8]) -> Result<()> {
+    let payload: Arc<[u8]> = Arc::from(bytes);
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        match write_arc_to_fd_once(native, fd, payload.clone(), offset).await {
+            Ok(0) => return Err(anyhow::anyhow!("write returned zero bytes").into()),
+            Ok(wrote) => {
+                let remain = payload.len().saturating_sub(offset);
+                let wrote = wrote.min(remain);
+                offset = offset.saturating_add(wrote);
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                wait_fd_ready(native, fd, libc::POLLOUT as u32)
+                    .await
+                    .context("wait for stream fd writable")?;
+            }
+            Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
+            Err(err) => return Err(err).context("write stream bytes"),
+        }
+    }
+    Ok(())
+}
+
+async fn apply_pulled_metadata(
+    handle: &RuntimeHandle,
+    path: &Path,
+    mode: u32,
+    mtime_sec: i64,
+    preserve: bool,
+) -> Result<()> {
+    if !preserve {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let perms = std::fs::Permissions::from_mode(mode & 0o7777);
+        fs::set_permissions(handle, path, perms)
+            .await
+            .with_context(|| format!("set permissions {}", path.display()))?;
+    }
+    let file_time = filetime::FileTime::from_unix_time(mtime_sec, 0);
+    filetime::set_file_mtime(path, file_time)
+        .with_context(|| format!("set mtime {}", path.display()))?;
+    Ok(())
 }

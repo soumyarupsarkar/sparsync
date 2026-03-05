@@ -1,12 +1,13 @@
 use crate::auth::{AuthzPolicy, load_authz_policy};
 use crate::certs;
 use crate::compression;
+use crate::filter::PathFilter;
 use crate::protocol::{
-    ErrorFrame, Frame, HelloRequest, HelloResponse, InitAction, InitBatchRequest,
-    InitBatchResponse, InitBatchResult, InitFileRequest, InitFileResponse, PROTOCOL_VERSION,
-    UploadBatchRequest, UploadBatchResponse, UploadColdBatchRequest, UploadColdBatchResponse,
-    UploadColdFileMeta, UploadColdFileResult, UploadSmallBatchRequest, UploadSmallBatchResponse,
-    UploadSmallFileMeta, UploadSmallFileResult,
+    DeletePlanRequest, DeletePlanResponse, ErrorFrame, Frame, HelloRequest, HelloResponse,
+    InitAction, InitBatchRequest, InitBatchResponse, InitBatchResult, InitFileRequest,
+    InitFileResponse, PROTOCOL_VERSION, UploadBatchRequest, UploadBatchResponse,
+    UploadColdBatchRequest, UploadColdBatchResponse, UploadColdFileMeta, UploadColdFileResult,
+    UploadSmallBatchRequest, UploadSmallBatchResponse, UploadSmallFileMeta, UploadSmallFileResult,
 };
 use crate::state::{CompleteFileInput, StateStore};
 use crate::util::{partial_path, sanitize_relative};
@@ -19,7 +20,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -284,19 +284,6 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
     let once_deadline = options
         .once
         .then(|| Instant::now() + options.once_idle_timeout);
-    let once_activity = options.once.then(|| Arc::new(AtomicBool::new(false)));
-    if let Some(activity) = once_activity.clone() {
-        let timeout = options.once_idle_timeout;
-        thread::spawn(move || {
-            thread::sleep(timeout);
-            if !activity.load(Ordering::Relaxed) {
-                eprintln!(
-                    "sparsync serve --once idle timeout elapsed before first connection; exiting"
-                );
-                std::process::exit(0);
-            }
-        });
-    }
     loop {
         let accepted = match if let Some(deadline) = once_deadline {
             match spargio::timeout_at(deadline, endpoint.accept()).await {
@@ -337,9 +324,6 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
             spargio::sleep(Duration::from_millis(2)).await;
             continue;
         };
-        if let Some(activity) = &once_activity {
-            activity.store(true, Ordering::Relaxed);
-        }
         let context = context.clone();
         let conn_id = connection.stable_id();
         info!(connection_id = conn_id, "accepted QUIC connection");
@@ -638,6 +622,7 @@ async fn handle_stream(
             Frame::UploadColdBatchRequest(req) => {
                 process_upload_cold_batch(&context, req, payload).await
             }
+            Frame::DeletePlanRequest(req) => process_delete_plan(&context, req, payload).await,
             Frame::HelloResponse(_) => Ok(Frame::Error(ErrorFrame {
                 message: "unexpected hello response on server".to_string(),
             })),
@@ -889,6 +874,106 @@ async fn process_init_batch(context: &ServerContext, req: InitBatchRequest) -> R
     }
 
     Ok(Frame::InitBatchResponse(InitBatchResponse { results }))
+}
+
+fn parse_keep_payload(payload: &[u8]) -> Result<HashSet<String>> {
+    let text = std::str::from_utf8(payload).context("decode delete keep-list payload as utf-8")?;
+    let mut keep = HashSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = sanitize_relative(trimmed)
+            .with_context(|| format!("normalize keep path '{}'", trimmed))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        keep.insert(normalized);
+    }
+    Ok(keep)
+}
+
+fn is_delete_path_allowed(context: &ServerContext, relative_path: &str) -> bool {
+    let Some(auth) = &context.connection_auth else {
+        return true;
+    };
+    is_path_allowed(&auth.allowed_prefixes, relative_path)
+}
+
+async fn enumerate_relative_files(handle: &RuntimeHandle, root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    match fs::metadata_lite(handle, root).await {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(out),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(err) => return Err(err).with_context(|| format!("stat {}", root.display())),
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(handle, &dir)
+            .await
+            .with_context(|| format!("read directory {}", dir.display()))?;
+        for entry in entries {
+            match entry.entry_type {
+                fs::DirEntryType::Directory => stack.push(entry.path),
+                fs::DirEntryType::File => {
+                    let rel = entry.path.strip_prefix(root).with_context(|| {
+                        format!(
+                            "path {} escaped root {}",
+                            entry.path.display(),
+                            root.display()
+                        )
+                    })?;
+                    out.push(rel.to_path_buf());
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+async fn process_delete_plan(
+    context: &ServerContext,
+    req: DeletePlanRequest,
+    payload: &[u8],
+) -> Result<Frame> {
+    let keep = parse_keep_payload(payload)?;
+    let filter =
+        PathFilter::from_patterns(&req.include, &req.exclude).context("compile delete filter")?;
+    let mut deleted = 0u64;
+
+    let destination_files = enumerate_relative_files(&context.handle, context.destination.as_ref())
+        .await
+        .context("enumerate destination files for delete planning")?;
+    for rel in destination_files {
+        let rel_text = rel.to_string_lossy().replace('\\', "/");
+        if !filter.allows(&rel_text) {
+            continue;
+        }
+        if !is_delete_path_allowed(context, &rel_text) {
+            continue;
+        }
+        if keep.contains(&rel_text) {
+            continue;
+        }
+        let path = context.destination.join(&rel);
+        if req.dry_run {
+            deleted = deleted.saturating_add(1);
+            continue;
+        }
+        match fs::remove_file(&context.handle, &path).await {
+            Ok(()) => {
+                deleted = deleted.saturating_add(1);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("delete {}", path.display())),
+        }
+    }
+
+    Ok(Frame::DeletePlanResponse(DeletePlanResponse { deleted }))
 }
 
 async fn initialize_one_file(

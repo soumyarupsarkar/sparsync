@@ -143,7 +143,10 @@ fn sh_quote(value: &str) -> String {
 fn ssh_base_command(remote: &RemoteEndpoint) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-o").arg(format!(
+        "StrictHostKeyChecking={}",
+        ssh_strict_host_key_checking()
+    ));
     if let Ok(identity) = std::env::var("SPARSYNC_SSH_IDENTITY") {
         if !identity.trim().is_empty() {
             cmd.arg("-i").arg(identity);
@@ -154,6 +157,23 @@ fn ssh_base_command(remote: &RemoteEndpoint) -> Command {
     }
     cmd.arg(remote.ssh_target());
     cmd
+}
+
+fn ssh_strict_host_key_checking() -> String {
+    if let Ok(value) = std::env::var("SPARSYNC_SSH_STRICT_HOST_KEY_CHECKING") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if std::env::var("SPARSYNC_SSH_TOFU")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        "accept-new".to_string()
+    } else {
+        "yes".to_string()
+    }
 }
 
 fn run_ssh(remote: &RemoteEndpoint, script: &str) -> Result<Vec<u8>> {
@@ -204,6 +224,26 @@ fn remote_service_dir(remote: &RemoteEndpoint) -> Result<String> {
     Ok(format!("{home}/{DEFAULT_REMOTE_SERVICE_SUBPATH}"))
 }
 
+fn resolve_remote_service_shell_prefix(remote: &RemoteEndpoint) -> Result<String> {
+    let output = run_ssh(remote, "command -v sparsync 2>/dev/null || true")
+        .context("resolve remote sparsync binary for service management")?;
+    let discovered = String::from_utf8(output).context("decode remote sparsync path")?;
+    let discovered = discovered.trim();
+    if !discovered.is_empty() {
+        return Ok(sh_quote(discovered));
+    }
+
+    let install_path = remote_install_path(remote)?;
+    if run_ssh_status(remote, &format!("[ -x {} ]", sh_quote(&install_path)))? {
+        return Ok(sh_quote(&install_path));
+    }
+
+    bail!(
+        "remote sparsync binary is unavailable (expected in PATH or at {})",
+        install_path
+    );
+}
+
 fn mktemp_remote_binary_path(remote: &RemoteEndpoint) -> Result<String> {
     let bytes =
         run_ssh(remote, "mktemp /tmp/sparsync.XXXXXX").context("create remote temp path")?;
@@ -215,37 +255,19 @@ fn mktemp_remote_binary_path(remote: &RemoteEndpoint) -> Result<String> {
     Ok(path.to_string())
 }
 
-fn mktemp_remote_file_path(remote: &RemoteEndpoint, prefix: &str) -> Result<String> {
-    let safe_prefix: String = prefix
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let bytes = run_ssh(remote, &format!("mktemp /tmp/{safe_prefix}.XXXXXX"))
-        .context("create remote temp file path")?;
-    let path = String::from_utf8(bytes).context("decode remote temp file path")?;
-    let path = path.trim();
-    if path.is_empty() {
-        bail!("remote mktemp returned empty temp file path");
-    }
-    Ok(path.to_string())
-}
-
 fn upload_file_via_ssh(remote: &RemoteEndpoint, local: &Path, remote_path: &str) -> Result<()> {
     let data =
         std::fs::read(local).with_context(|| format!("read local file {}", local.display()))?;
+    let parent = std::path::Path::new(remote_path)
+        .parent()
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    run_ssh(remote, &format!("mkdir -p {}", sh_quote(&parent)))
+        .with_context(|| format!("ensure remote upload parent {}", parent))?;
     let remote_path_q = sh_quote(remote_path);
-    let script = format!(
-        "mkdir -p \"$(dirname {remote_path})\" && cat > {remote_path} && chmod 0755 {remote_path}",
-        remote_path = remote_path_q
-    );
     let mut child = ssh_base_command(remote)
-        .arg(script)
+        .arg(format!("cat > {remote_path}", remote_path = remote_path_q))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -266,6 +288,8 @@ fn upload_file_via_ssh(remote: &RemoteEndpoint, local: &Path, remote_path: &str)
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    run_ssh_status(remote, &format!("chmod 0755 {}", remote_path_q))
+        .with_context(|| format!("mark {} executable on remote", remote_path))?;
     Ok(())
 }
 
@@ -356,31 +380,6 @@ pub fn ensure_remote_binary_available(
     prepare_remote_binary(remote, install_mode)
 }
 
-pub fn run_remote_shell(remote: &RemoteEndpoint, script: &str) -> Result<Vec<u8>> {
-    run_ssh(remote, script)
-}
-
-pub fn upload_temp_file_via_ssh(
-    remote: &RemoteEndpoint,
-    local_path: &Path,
-    prefix: &str,
-) -> Result<String> {
-    let remote_path = mktemp_remote_file_path(remote, prefix)?;
-    upload_file_via_ssh(remote, local_path, &remote_path).with_context(|| {
-        format!(
-            "upload {} to remote temp file {}",
-            local_path.display(),
-            remote_path
-        )
-    })?;
-    Ok(remote_path)
-}
-
-pub fn remove_remote_file(remote: &RemoteEndpoint, path: &str) -> Result<()> {
-    let _ = run_ssh_status(remote, &format!("rm -f {}", sh_quote(path)))?;
-    Ok(())
-}
-
 fn resolve_server_addr(remote: &RemoteEndpoint, port: u16) -> Result<SocketAddr> {
     let addr = format!("{}:{port}", remote.host);
     addr.to_socket_addrs()
@@ -441,10 +440,11 @@ fn enroll_remote_with_lease(
     run_ssh(
         &options.remote,
         &format!(
-            "{} auth issue-client --dir {} --client-id {} --allow-prefix /",
+            "{} auth issue-client --dir {} --client-id {} --allow-prefix {}",
             binary_lease.shell_prefix(),
             sh_quote(&remote_auth_dir),
-            sh_quote(&options.client_id)
+            sh_quote(&options.client_id),
+            sh_quote(&options.destination)
         ),
     )
     .context("issue remote client certificate")?;
@@ -534,6 +534,9 @@ pub fn bootstrap_remote_push(options: &BootstrapOptions) -> Result<BootstrapSess
 }
 
 pub fn start_remote_server(options: &BootstrapOptions) -> Result<Enrollment> {
+    if matches!(options.install_mode, InstallMode::Ephemeral) {
+        bail!("install mode 'ephemeral' is not supported for persistent remote server start");
+    }
     let binary_lease = prepare_remote_binary(&options.remote, options.install_mode)?;
     let enrollment = enroll_remote_with_lease(options, &binary_lease)?;
     let remote_auth_dir = remote_auth_dir(&options.remote)?;
@@ -541,35 +544,22 @@ pub fn start_remote_server(options: &BootstrapOptions) -> Result<Enrollment> {
     let pid_file = format!("{service_dir}/server.pid");
     let log_file = format!("{service_dir}/server.log");
 
-    let mut serve_cmd = format!(
-        "{} serve --bind 0.0.0.0:{} --destination {} --cert {} --key {} --client-ca {} --authz {}",
+    let mut remote_cmd = format!(
+        "{} service-daemon start --bind 0.0.0.0:{} --destination {} --cert {} --key {} --client-ca {} --authz {} --pid-file {} --log-file {}",
         binary_lease.shell_prefix(),
         options.server_port,
         sh_quote(&options.destination),
         sh_quote(&format!("{remote_auth_dir}/server.cert.der")),
         sh_quote(&format!("{remote_auth_dir}/server.key.der")),
         sh_quote(&format!("{remote_auth_dir}/client-ca.cert.der")),
-        sh_quote(&format!("{remote_auth_dir}/authz.json"))
+        sh_quote(&format!("{remote_auth_dir}/authz.json")),
+        sh_quote(&pid_file),
+        sh_quote(&log_file),
     );
     if options.preserve_metadata {
-        serve_cmd.push_str(" --preserve-metadata");
+        remote_cmd.push_str(" --preserve-metadata");
     }
-
-    let script = format!(
-        "mkdir -p {service_dir_q}; \
-         if [ -f {pid_file_q} ]; then \
-           pid=$(cat {pid_file_q} 2>/dev/null || true); \
-           if [ -n \"$pid\" ] && kill -0 \"$pid\" >/dev/null 2>&1; then exit 0; fi; \
-         fi; \
-         nohup {serve_cmd} > {log_file_q} 2>&1 < /dev/null & \
-         echo $! > {pid_file_q}",
-        service_dir_q = sh_quote(&service_dir),
-        pid_file_q = sh_quote(&pid_file),
-        log_file_q = sh_quote(&log_file),
-        serve_cmd = serve_cmd,
-    );
-
-    run_ssh(&options.remote, &script).context("start remote sparsync server")?;
+    run_ssh(&options.remote, &remote_cmd).context("start remote sparsync server")?;
     wait_for_server_ready(enrollment.server, Duration::from_secs(10))
         .context("wait for remote persistent server readiness")?;
     Ok(enrollment)
@@ -578,23 +568,12 @@ pub fn start_remote_server(options: &BootstrapOptions) -> Result<Enrollment> {
 pub fn stop_remote_server(remote: &RemoteEndpoint) -> Result<bool> {
     let service_dir = remote_service_dir(remote)?;
     let pid_file = format!("{service_dir}/server.pid");
-    let script = format!(
-        "if [ -f {pid_file_q} ]; then \
-           pid=$(cat {pid_file_q} 2>/dev/null || true); \
-           if [ -n \"$pid\" ] && kill -0 \"$pid\" >/dev/null 2>&1; then \
-             kill \"$pid\" >/dev/null 2>&1 || true; \
-             sleep 0.2; \
-             if kill -0 \"$pid\" >/dev/null 2>&1; then kill -9 \"$pid\" >/dev/null 2>&1 || true; fi; \
-             rm -f {pid_file_q}; \
-             echo stopped_running; \
-             exit 0; \
-           fi; \
-           rm -f {pid_file_q}; \
-         fi; \
-         echo stopped_not_running",
-        pid_file_q = sh_quote(&pid_file),
+    let shell_prefix = resolve_remote_service_shell_prefix(remote)?;
+    let command = format!(
+        "{shell_prefix} service-daemon stop --pid-file {}",
+        sh_quote(&pid_file)
     );
-    let output = run_ssh(remote, &script).context("stop remote sparsync server")?;
+    let output = run_ssh(remote, &command).context("stop remote sparsync server")?;
     let text = String::from_utf8(output).context("decode remote stop output")?;
     Ok(text.trim() == "stopped_running")
 }
@@ -602,18 +581,12 @@ pub fn stop_remote_server(remote: &RemoteEndpoint) -> Result<bool> {
 pub fn remote_server_status(remote: &RemoteEndpoint) -> Result<RemoteServerStatus> {
     let service_dir = remote_service_dir(remote)?;
     let pid_file = format!("{service_dir}/server.pid");
-    let script = format!(
-        "if [ -f {pid_file_q} ]; then \
-           pid=$(cat {pid_file_q} 2>/dev/null || true); \
-           if [ -n \"$pid\" ] && kill -0 \"$pid\" >/dev/null 2>&1; then \
-             printf 'running %s\\n' \"$pid\"; \
-             exit 0; \
-           fi; \
-         fi; \
-         echo stopped",
-        pid_file_q = sh_quote(&pid_file),
+    let shell_prefix = resolve_remote_service_shell_prefix(remote)?;
+    let command = format!(
+        "{shell_prefix} service-daemon status --pid-file {}",
+        sh_quote(&pid_file)
     );
-    let output = run_ssh(remote, &script).context("query remote sparsync server status")?;
+    let output = run_ssh(remote, &command).context("query remote sparsync server status")?;
     let text = String::from_utf8(output).context("decode remote status output")?;
     let trimmed = text.trim();
     if let Some(pid) = trimmed.strip_prefix("running ") {

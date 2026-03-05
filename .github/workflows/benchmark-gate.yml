@@ -1,0 +1,52 @@
+name: benchmark-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Number of benchmark repetitions"
+        required: false
+        default: "3"
+      transports:
+        description: "Transport set to benchmark (daemon ssh)"
+        required: false
+        default: "ssh"
+  pull_request:
+    paths:
+      - "src/**"
+      - "scripts/bench_*"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/benchmark-gate.yml"
+
+jobs:
+  bench-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-server
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run benchmark gate
+        env:
+          RUNS: ${{ github.event.inputs.runs }}
+          TRANSPORTS: ${{ github.event.inputs.transports }}
+          OUT_DIR: bench-artifacts
+        run: ./scripts/bench_ci_gate.sh
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-artifacts
+          path: bench-artifacts/
+          retention-days: 14

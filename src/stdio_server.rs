@@ -1,10 +1,12 @@
 use crate::compression;
+use crate::filter::PathFilter;
+use crate::local_copy;
 use crate::protocol::{
-    ErrorFrame, Frame, HelloRequest, HelloResponse, InitAction, InitBatchRequest,
-    InitBatchResponse, InitBatchResult, InitFileRequest, InitFileResponse, PROTOCOL_VERSION,
-    UploadBatchRequest, UploadBatchResponse, UploadColdBatchRequest, UploadColdBatchResponse,
-    UploadColdFileMeta, UploadColdFileResult, UploadSmallBatchRequest, UploadSmallBatchResponse,
-    UploadSmallFileMeta, UploadSmallFileResult,
+    DeletePlanRequest, DeletePlanResponse, ErrorFrame, Frame, HelloRequest, HelloResponse,
+    InitAction, InitBatchRequest, InitBatchResponse, InitBatchResult, InitFileRequest,
+    InitFileResponse, PROTOCOL_VERSION, UploadBatchRequest, UploadBatchResponse,
+    UploadColdBatchRequest, UploadColdBatchResponse, UploadColdFileMeta, UploadColdFileResult,
+    UploadSmallBatchRequest, UploadSmallBatchResponse, UploadSmallFileMeta, UploadSmallFileResult,
 };
 use crate::state::{CompleteFileInput, StateStore};
 use crate::util::{partial_path, sanitize_relative};
@@ -86,8 +88,8 @@ const STDIO_WRITE_CHUNK_BYTES: usize = 128 * 1024;
 
 fn stdio_nonblocking_enabled() -> bool {
     std::env::var("SPARSYNC_STDIO_NONBLOCK")
-        .map(|value| value == "1")
-        .unwrap_or(false)
+        .map(|value| value != "0")
+        .unwrap_or(true)
 }
 
 struct StdioFrameIo {
@@ -315,6 +317,7 @@ async fn process_one_frame(
         Frame::UploadColdBatchRequest(req) => {
             process_upload_cold_batch(context, req, payload).await
         }
+        Frame::DeletePlanRequest(req) => process_delete_plan(context, req, payload).await,
         Frame::HelloResponse(_) => Ok(Frame::Error(ErrorFrame {
             message: "unexpected hello response on server".to_string(),
         })),
@@ -766,6 +769,45 @@ async fn process_upload_batch(
         next_chunk,
         completed: true,
         bytes_written,
+    }))
+}
+
+fn parse_keep_payload(payload: &[u8]) -> Result<HashSet<String>> {
+    let text = std::str::from_utf8(payload).context("decode delete keep-list payload as utf-8")?;
+    let mut keep = HashSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = sanitize_relative(trimmed)
+            .with_context(|| format!("normalize keep path '{}'", trimmed))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        keep.insert(normalized);
+    }
+    Ok(keep)
+}
+
+async fn process_delete_plan(
+    context: &mut StdioServerContext,
+    req: DeletePlanRequest,
+    payload: &[u8],
+) -> Result<Frame> {
+    let keep = parse_keep_payload(payload)?;
+    let filter =
+        PathFilter::from_patterns(&req.include, &req.exclude).context("compile delete filter")?;
+    let deleted = local_copy::prune_destination(
+        &context.handle,
+        &context.destination,
+        &keep,
+        &filter,
+        req.dry_run,
+    )
+    .await
+    .context("apply delete plan on stdio destination")?;
+    Ok(Frame::DeletePlanResponse(DeletePlanResponse {
+        deleted: deleted as u64,
     }))
 }
 

@@ -237,6 +237,12 @@ Median report helper (defaults to `RUNS=5`, both transports):
 ./scripts/bench_remote_rsync_vs_sparsync_median.sh
 ```
 
+CI gate helper (ratio thresholds + artifacts under `bench-artifacts/`):
+
+```bash
+RUNS=3 TRANSPORTS="ssh" ./scripts/bench_ci_gate.sh
+```
+
 ## Architecture
 
 - `src/scan.rs`: parallel scan + file hashing

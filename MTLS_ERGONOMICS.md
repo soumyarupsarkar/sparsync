@@ -196,7 +196,7 @@ Additional implemented items since the initial roadmap draft:
   - Connection allow/deny decisions include client identity + fingerprint.
   - Path authorization denials are logged with attempted path and allowed prefixes.
   - Per-connection transferred bytes are logged on connection close.
-- SSH bootstrap flow now issues client certs with explicit prefix argument (`--allow-prefix /`).
+- SSH bootstrap flow now issues client certs scoped to the requested destination path (least-privilege default).
 
 Transport status clarification:
 

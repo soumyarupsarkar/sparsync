@@ -126,9 +126,24 @@ pub fn parse_endpoint(value: &str) -> Result<Endpoint> {
     Ok(Endpoint::Local(PathBuf::from(value)))
 }
 
+pub fn parse_ssh_target(value: &str) -> Result<RemoteEndpoint> {
+    let raw = value.strip_prefix("ssh://").unwrap_or(value);
+    if raw.contains('/') {
+        bail!("ssh target must not include a path: {}", value);
+    }
+    let (user, host, port) = parse_user_host_port(raw)?;
+    Ok(RemoteEndpoint {
+        user,
+        host,
+        port,
+        path: String::new(),
+        kind: RemoteKind::Ssh,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Endpoint, RemoteKind, parse_endpoint};
+    use super::{Endpoint, RemoteKind, parse_endpoint, parse_ssh_target};
 
     #[test]
     fn parses_scp_style_remote() {
@@ -182,5 +197,15 @@ mod tests {
             Endpoint::Local(path) => assert_eq!(path.to_string_lossy(), "/tmp/source"),
             other => panic!("expected local endpoint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_ssh_target_without_path() {
+        let remote = parse_ssh_target("alice@example.com:2222").expect("parse ssh target");
+        assert_eq!(remote.user.as_deref(), Some("alice"));
+        assert_eq!(remote.host, "example.com");
+        assert_eq!(remote.port, Some(2222));
+        assert!(remote.path.is_empty());
+        assert_eq!(remote.kind, RemoteKind::Ssh);
     }
 }
