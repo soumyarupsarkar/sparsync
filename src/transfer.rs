@@ -1,9 +1,11 @@
 use crate::certs;
 use crate::compression;
+use crate::endpoint::RemoteEndpoint;
 use crate::model::FileManifest;
 use crate::protocol::{
-    Frame, InitAction, InitBatchRequest, InitFileRequest, InitFileResponse, UploadBatchRequest,
-    UploadColdBatchRequest, UploadColdFileMeta, UploadSmallBatchRequest, UploadSmallFileMeta,
+    Frame, HelloRequest, HelloResponse, InitAction, InitBatchRequest, InitFileRequest,
+    InitFileResponse, PROTOCOL_VERSION, UploadBatchRequest, UploadColdBatchRequest,
+    UploadColdFileMeta, UploadSmallBatchRequest, UploadSmallFileMeta,
 };
 use crate::scan::{self, ScanOptions};
 use crate::util::{join_error, runtime_error};
@@ -14,8 +16,11 @@ use spargio_quic::{
     QuicConnection, QuicEndpoint, QuicEndpointOptions, QuicRecvStream, QuicSendStream,
 };
 use std::collections::VecDeque;
+use std::io;
 use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -28,6 +33,7 @@ const DEFAULT_DIRECT_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SMALL_BATCH_MAX_FILES: usize = 4096;
 const INIT_BATCH_MAX_FILES: usize = 4096;
 const DEFAULT_UPLOAD_WINDOW: usize = 4;
+const STDIO_PIPE_TARGET_BYTES: usize = 1 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PushOptions {
@@ -35,6 +41,8 @@ pub struct PushOptions {
     pub server: SocketAddr,
     pub server_name: String,
     pub ca: PathBuf,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
     pub scan: ScanOptions,
     pub parallel_files: usize,
     pub connections: usize,
@@ -45,6 +53,20 @@ pub struct PushOptions {
     pub resume: bool,
     pub cold_start: bool,
     pub manifest_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PushOverSshOptions {
+    pub source: PathBuf,
+    pub remote: RemoteEndpoint,
+    pub destination: String,
+    pub scan: ScanOptions,
+    pub compression_level: i32,
+    pub max_stream_payload: usize,
+    pub resume: bool,
+    pub cold_start: bool,
+    pub manifest_out: Option<PathBuf>,
+    pub preserve_metadata: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +155,24 @@ struct TransferStatsInner {
 struct TransferStats {
     enabled: bool,
     inner: Arc<TransferStatsInner>,
+}
+
+#[derive(Default)]
+struct SshProfileInner {
+    frames_sent: AtomicU64,
+    frames_received: AtomicU64,
+    write_calls: AtomicU64,
+    read_calls: AtomicU64,
+    flush_calls: AtomicU64,
+    scan_ns: AtomicU64,
+    init_ns: AtomicU64,
+    upload_ns: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+struct SshProfile {
+    enabled: bool,
+    inner: Arc<SshProfileInner>,
 }
 
 impl TransferStats {
@@ -226,6 +266,73 @@ impl TransferStats {
     }
 }
 
+impl SshProfile {
+    fn from_env() -> Self {
+        let enabled = std::env::var("SPARSYNC_PROFILE")
+            .map(|value| value != "0")
+            .unwrap_or(false);
+        Self {
+            enabled,
+            inner: Arc::new(SshProfileInner::default()),
+        }
+    }
+
+    fn add_frame_sent(&self) {
+        self.inner.frames_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_frame_received(&self) {
+        self.inner.frames_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_write_call(&self) {
+        self.inner.write_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_read_call(&self) {
+        self.inner.read_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_flush_call(&self) {
+        self.inner.flush_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_init_time(&self, elapsed: Duration) {
+        self.inner
+            .init_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_scan_time(&self, elapsed: Duration) {
+        self.inner
+            .scan_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_upload_time(&self, elapsed: Duration) {
+        self.inner
+            .upload_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn print_if_enabled(&self) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "profile transport=ssh frames_sent={} frames_received={} write_calls={} read_calls={} flush_calls={} scan_ms={} init_ms={} upload_ms={}",
+            self.inner.frames_sent.load(Ordering::Relaxed),
+            self.inner.frames_received.load(Ordering::Relaxed),
+            self.inner.write_calls.load(Ordering::Relaxed),
+            self.inner.read_calls.load(Ordering::Relaxed),
+            self.inner.flush_calls.load(Ordering::Relaxed),
+            Duration::from_nanos(self.inner.scan_ns.load(Ordering::Relaxed)).as_millis(),
+            Duration::from_nanos(self.inner.init_ns.load(Ordering::Relaxed)).as_millis(),
+            Duration::from_nanos(self.inner.upload_ns.load(Ordering::Relaxed)).as_millis(),
+        );
+    }
+}
+
 fn small_file_max_bytes_from_env() -> u64 {
     std::env::var("SPARSYNC_SMALL_FILE_MAX_BYTES")
         .ok()
@@ -256,11 +363,44 @@ fn upload_window_from_env() -> usize {
         .unwrap_or(DEFAULT_UPLOAD_WINDOW)
 }
 
+fn stdio_nonblocking_enabled() -> bool {
+    std::env::var("SPARSYNC_STDIO_NONBLOCK")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn stdio_pipe_size_bytes_from_env() -> usize {
+    std::env::var("SPARSYNC_STDIO_PIPE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 64 * 1024)
+        .unwrap_or(STDIO_PIPE_TARGET_BYTES)
+}
+
 pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Result<PushSummary> {
     let started = Instant::now();
     let stats = TransferStats::from_env();
-    let client_config = certs::load_client_config(&options.ca)
-        .with_context(|| format!("load CA {}", options.ca.display()))?;
+    let client_config = certs::load_client_config(
+        &options.ca,
+        options.client_cert.as_deref(),
+        options.client_key.as_deref(),
+    )
+    .with_context(|| {
+        format!(
+            "load client TLS config ca={} client_cert={} client_key={}",
+            options.ca.display(),
+            options
+                .client_cert
+                .as_ref()
+                .map(|v| v.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            options
+                .client_key
+                .as_ref()
+                .map(|v| v.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        )
+    })?;
 
     let endpoint_options = QuicEndpointOptions::default()
         .with_connect_timeout(options.connect_timeout)
@@ -279,6 +419,9 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
             .connect(options.server, &options.server_name)
             .await
             .with_context(|| format!("connect to {} ({})", options.server, options.server_name))?;
+        verify_protocol(&connection, options.max_stream_payload, &stats)
+            .await
+            .context("validate protocol compatibility")?;
         connections.push(connection);
     }
     stats.add_connect_time(connect_started.elapsed());
@@ -440,6 +583,1222 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         bytes_raw: totals.bytes_raw,
         elapsed,
     })
+}
+
+pub async fn push_directory_over_ssh_stdio(
+    handle: RuntimeHandle,
+    options: PushOverSshOptions,
+) -> Result<PushSummary> {
+    let started = Instant::now();
+    let stats = TransferStats::from_env();
+    let ssh_profile = SshProfile::from_env();
+
+    let connect_started = Instant::now();
+    let mut session = SshFrameSession::connect(
+        handle.clone(),
+        &options.remote,
+        &options.destination,
+        options.max_stream_payload,
+        options.preserve_metadata,
+        &stats,
+        ssh_profile.clone(),
+    )
+    .await
+    .context("open SSH stdio data session")?;
+    stats.add_connect_time(connect_started.elapsed());
+    stats.add_connections(1);
+
+    verify_protocol_over_ssh(&mut session)
+        .await
+        .context("validate protocol compatibility over ssh")?;
+
+    if options.cold_start {
+        let summary = push_directory_over_ssh_cold(
+            handle.clone(),
+            &options,
+            &mut session,
+            &stats,
+            &ssh_profile,
+            started,
+        )
+        .await?;
+        session.finish().context("finish SSH stdio session")?;
+        return Ok(summary);
+    }
+
+    let (manifest, scan_stats) =
+        scan::build_manifest(handle.clone(), &options.source, options.scan)
+            .await
+            .with_context(|| format!("build source manifest {}", options.source.display()))?;
+    ssh_profile.add_scan_time(scan_stats.total_elapsed);
+
+    if let Some(path) = &options.manifest_out {
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        fs::write(&handle, path, bytes)
+            .await
+            .with_context(|| format!("write manifest {}", path.display()))?;
+    }
+
+    println!(
+        "scan complete files={} bytes={} enumerate_ms={} hash_ms={}",
+        manifest.files.len(),
+        manifest.total_bytes,
+        scan_stats.enumeration_elapsed.as_millis(),
+        scan_stats.hash_elapsed.as_millis(),
+    );
+
+    let transfer_options = FileTransferOptions {
+        source_root: PathBuf::from(&manifest.root),
+        chunk_size: manifest.chunk_size,
+        compression_level: options.compression_level,
+        max_stream_payload: options.max_stream_payload,
+        resume: options.resume,
+        stats: stats.clone(),
+        small_file_max_bytes: small_file_max_bytes_from_env(),
+        direct_file_max_bytes: direct_file_max_bytes_from_env(),
+    };
+
+    let (small_files, large_files) = partition_small_files(
+        manifest.files,
+        transfer_options.chunk_size,
+        transfer_options.small_file_max_bytes,
+    );
+    let small_batches = build_small_batches(small_files, transfer_options.max_stream_payload);
+
+    let mut totals = BatchResult::default();
+    let small_started = Instant::now();
+    for batch in small_batches {
+        let result =
+            transfer_small_batch_over_ssh(&handle, &mut session, &transfer_options, &batch).await?;
+        totals.merge(result);
+    }
+    ssh_profile.add_init_time(small_started.elapsed());
+
+    let init_started = Instant::now();
+    let (init_totals, uploads) =
+        initialize_large_files_over_ssh(&mut session, &transfer_options, large_files).await?;
+    totals.merge(init_totals);
+    ssh_profile.add_init_time(init_started.elapsed());
+
+    let (direct_files, streamed_files) =
+        split_direct_uploads(uploads, transfer_options.direct_file_max_bytes);
+    let upload_started = Instant::now();
+    let direct_totals = transfer_initialized_direct_batches_over_ssh(
+        &handle,
+        &mut session,
+        &transfer_options,
+        direct_files,
+    )
+    .await?;
+    totals.merge(direct_totals);
+
+    for (file, init) in streamed_files {
+        let result =
+            upload_file_batches_over_ssh(&handle, &mut session, &transfer_options, &file, &init)
+                .await
+                .with_context(|| format!("upload file {}", file.relative_path))?;
+        totals.add_file_result(result);
+    }
+    ssh_profile.add_upload_time(upload_started.elapsed());
+
+    session.finish().context("finish SSH stdio session")?;
+
+    let elapsed = started.elapsed();
+    stats.print_if_enabled(elapsed, false);
+    ssh_profile.print_if_enabled();
+
+    Ok(PushSummary {
+        files_transferred: totals.files_transferred,
+        files_skipped: totals.files_skipped,
+        bytes_sent: totals.bytes_sent,
+        bytes_raw: totals.bytes_raw,
+        elapsed,
+    })
+}
+
+async fn push_directory_over_ssh_cold(
+    handle: RuntimeHandle,
+    options: &PushOverSshOptions,
+    session: &mut SshFrameSession<'_>,
+    stats: &TransferStats,
+    ssh_profile: &SshProfile,
+    started: Instant,
+) -> Result<PushSummary> {
+    let chunk_size = options.scan.chunk_size.max(1);
+    let (source_root, files, enumeration_elapsed, metadata_elapsed) = scan::build_file_list(
+        handle.clone(),
+        &options.source,
+        options.scan.scan_workers.max(1),
+        options.scan.hash_workers.max(1),
+    )
+    .await
+    .with_context(|| format!("build cold file list {}", options.source.display()))?;
+    ssh_profile.add_scan_time(enumeration_elapsed.saturating_add(metadata_elapsed));
+
+    let total_bytes = files.iter().map(|item| item.size).sum::<u64>();
+    println!(
+        "scan complete files={} bytes={} enumerate_ms={} hash_ms={}",
+        files.len(),
+        total_bytes,
+        enumeration_elapsed.as_millis(),
+        metadata_elapsed.as_millis(),
+    );
+
+    if let Some(path) = &options.manifest_out {
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "root": source_root,
+            "chunk_size": chunk_size,
+            "files": files.iter().map(|item| serde_json::json!({
+                "relative_path": item.relative_path,
+                "size": item.size,
+                "mode": item.mode,
+                "mtime_sec": item.mtime_sec,
+            })).collect::<Vec<_>>(),
+            "total_bytes": total_bytes,
+            "cold_start": true,
+        }))?;
+        fs::write(&handle, path, bytes)
+            .await
+            .with_context(|| format!("write manifest {}", path.display()))?;
+    }
+
+    let batch_limit = options
+        .max_stream_payload
+        .saturating_sub(512 * 1024)
+        .clamp(512 * 1024, COLD_BATCH_TARGET_BYTES);
+    let mut totals = BatchResult::default();
+    let mut payload = Vec::new();
+    let mut metas = Vec::new();
+    let mut pending = Vec::new();
+
+    let upload_started = Instant::now();
+    for file in files {
+        let source_path = source_root.join(Path::new(&file.relative_path));
+        let read_started = Instant::now();
+        let raw = fs::read(&handle, &source_path)
+            .await
+            .with_context(|| format!("read source {}", source_path.display()))?;
+        stats.add_disk_read(read_started.elapsed(), raw.len() as u64);
+        if raw.len() as u64 != file.size {
+            bail!(
+                "file size changed during cold read for {}: expected {} got {}",
+                file.relative_path,
+                file.size,
+                raw.len()
+            );
+        }
+
+        let raw_len = raw.len();
+        let file_hash = blake3::hash(&raw).to_hex().to_string();
+        let total_chunks = if file.size == 0 {
+            0
+        } else {
+            ((file.size + (chunk_size as u64).saturating_sub(1)) / chunk_size as u64) as usize
+        };
+        let encode_started = Instant::now();
+        let (encoded, compressed) = compression::maybe_compress_vec(raw, options.compression_level)
+            .with_context(|| format!("compress {}", file.relative_path))?;
+        stats.add_encode(encode_started.elapsed(), encoded.len());
+        let encoded_len = encoded.len();
+
+        if !metas.is_empty() && payload.len().saturating_add(encoded_len) > batch_limit {
+            let batch = upload_cold_batch_over_ssh(
+                session,
+                std::mem::take(&mut metas),
+                std::mem::take(&mut payload),
+                std::mem::take(&mut pending),
+            )
+            .await?;
+            totals.merge(batch);
+        }
+
+        payload.extend_from_slice(&encoded);
+        pending.push((
+            file.relative_path.clone(),
+            raw_len as u64,
+            encoded_len as u64,
+        ));
+        metas.push(UploadColdFileMeta {
+            relative_path: file.relative_path,
+            size: file.size,
+            mode: file.mode,
+            mtime_sec: file.mtime_sec,
+            file_hash,
+            total_chunks,
+            compressed,
+            raw_len,
+            data_len: encoded_len,
+        });
+    }
+
+    if !metas.is_empty() {
+        let batch = upload_cold_batch_over_ssh(
+            session,
+            std::mem::take(&mut metas),
+            std::mem::take(&mut payload),
+            std::mem::take(&mut pending),
+        )
+        .await?;
+        totals.merge(batch);
+    }
+    ssh_profile.add_upload_time(upload_started.elapsed());
+
+    let elapsed = started.elapsed();
+    stats.print_if_enabled(elapsed, true);
+    ssh_profile.print_if_enabled();
+
+    Ok(PushSummary {
+        files_transferred: totals.files_transferred,
+        files_skipped: totals.files_skipped,
+        bytes_sent: totals.bytes_sent,
+        bytes_raw: totals.bytes_raw,
+        elapsed,
+    })
+}
+
+async fn initialize_large_files_over_ssh(
+    session: &mut SshFrameSession<'_>,
+    options: &FileTransferOptions,
+    files: Vec<FileManifest>,
+) -> Result<(BatchResult, Vec<(FileManifest, InitFileResponse)>)> {
+    let init_batches = build_init_batches(files, options.max_stream_payload);
+    let mut totals = BatchResult::default();
+    let mut uploads = Vec::new();
+    if init_batches.is_empty() {
+        return Ok((totals, uploads));
+    }
+
+    for batch in init_batches {
+        let init_request = Frame::InitBatchRequest(InitBatchRequest {
+            files: batch
+                .iter()
+                .map(|file| InitFileRequest {
+                    relative_path: file.relative_path.clone(),
+                    size: file.size,
+                    mode: file.mode,
+                    mtime_sec: file.mtime_sec,
+                    file_hash: file.file_hash.clone(),
+                    chunk_size: options.chunk_size,
+                    total_chunks: file.total_chunks,
+                    resume: options.resume,
+                })
+                .collect(),
+        });
+
+        let init_response = session
+            .roundtrip(init_request, None)
+            .await
+            .context("roundtrip large-file init batch over ssh")?;
+        let init = match init_response {
+            Frame::InitBatchResponse(resp) => resp,
+            Frame::Error(err) => bail!("large batch init rejected: {}", err.message),
+            other => bail!("unexpected large batch init response: {other:?}"),
+        };
+
+        if init.results.len() != batch.len() {
+            bail!(
+                "large batch init response size mismatch: got {} expected {}",
+                init.results.len(),
+                batch.len()
+            );
+        }
+
+        for (file, result) in batch.into_iter().zip(init.results.into_iter()) {
+            if matches!(result.action, InitAction::Skip) {
+                totals.files_skipped = totals.files_skipped.saturating_add(1);
+                continue;
+            }
+            uploads.push((
+                file,
+                InitFileResponse {
+                    action: InitAction::Upload,
+                    next_chunk: result.next_chunk,
+                    message: result.message,
+                },
+            ));
+        }
+    }
+
+    Ok((totals, uploads))
+}
+
+async fn transfer_small_batch_over_ssh(
+    handle: &RuntimeHandle,
+    session: &mut SshFrameSession<'_>,
+    options: &FileTransferOptions,
+    files: &[FileManifest],
+) -> Result<BatchResult> {
+    if files.is_empty() {
+        return Ok(BatchResult::default());
+    }
+
+    let init_request = Frame::InitBatchRequest(InitBatchRequest {
+        files: files
+            .iter()
+            .map(|file| InitFileRequest {
+                relative_path: file.relative_path.clone(),
+                size: file.size,
+                mode: file.mode,
+                mtime_sec: file.mtime_sec,
+                file_hash: file.file_hash.clone(),
+                chunk_size: options.chunk_size,
+                total_chunks: file.total_chunks,
+                resume: options.resume,
+            })
+            .collect(),
+    });
+
+    let init_response = session
+        .roundtrip(init_request, None)
+        .await
+        .context("roundtrip small-batch init over ssh")?;
+    let init = match init_response {
+        Frame::InitBatchResponse(resp) => resp,
+        Frame::Error(err) => bail!("small batch init rejected: {}", err.message),
+        other => bail!("unexpected small batch init response: {other:?}"),
+    };
+
+    if init.results.len() != files.len() {
+        bail!(
+            "small batch init response size mismatch: got {} expected {}",
+            init.results.len(),
+            files.len()
+        );
+    }
+
+    let mut totals = BatchResult::default();
+    let mut upload_metas = Vec::new();
+    let mut upload_payload = Vec::new();
+    let mut upload_paths = Vec::new();
+    let mut fallback = Vec::new();
+
+    for (file, result) in files.iter().zip(init.results.into_iter()) {
+        if matches!(result.action, InitAction::Skip) {
+            totals.files_skipped = totals.files_skipped.saturating_add(1);
+            continue;
+        }
+
+        if result.next_chunk > 0 {
+            fallback.push((
+                file.clone(),
+                InitFileResponse {
+                    action: InitAction::Upload,
+                    next_chunk: result.next_chunk,
+                    message: result.message,
+                },
+            ));
+            continue;
+        }
+
+        let source_path = options.source_root.join(Path::new(&file.relative_path));
+        let read_started = Instant::now();
+        let raw = fs::read(handle, &source_path)
+            .await
+            .with_context(|| format!("read source {}", source_path.display()))?;
+        options
+            .stats
+            .add_disk_read(read_started.elapsed(), raw.len() as u64);
+        if raw.len() as u64 != file.size {
+            bail!(
+                "small file size changed while reading {}: expected {} got {}",
+                file.relative_path,
+                file.size,
+                raw.len()
+            );
+        }
+
+        let raw_len = raw.len();
+        let encode_started = Instant::now();
+        let (encoded, compressed) = compression::maybe_compress_vec(raw, options.compression_level)
+            .with_context(|| format!("compress {}", file.relative_path))?;
+        options
+            .stats
+            .add_encode(encode_started.elapsed(), encoded.len());
+
+        totals.bytes_raw = totals.bytes_raw.saturating_add(raw_len as u64);
+        totals.bytes_sent = totals.bytes_sent.saturating_add(encoded.len() as u64);
+        upload_payload.extend_from_slice(&encoded);
+        upload_paths.push(file.relative_path.clone());
+        upload_metas.push(UploadSmallFileMeta {
+            relative_path: file.relative_path.clone(),
+            size: file.size,
+            mode: file.mode,
+            mtime_sec: file.mtime_sec,
+            file_hash: file.file_hash.clone(),
+            total_chunks: file.total_chunks,
+            compressed,
+            raw_len,
+            data_len: encoded.len(),
+        });
+    }
+
+    if !upload_metas.is_empty() {
+        let upload_request = Frame::UploadSmallBatchRequest(UploadSmallBatchRequest {
+            files: upload_metas,
+        });
+        let upload_response = session
+            .roundtrip(upload_request, Some(&upload_payload))
+            .await
+            .context("roundtrip small-batch upload over ssh")?;
+
+        let upload = match upload_response {
+            Frame::UploadSmallBatchResponse(resp) => resp,
+            Frame::Error(err) => bail!("small batch upload rejected: {}", err.message),
+            other => bail!("unexpected small batch upload response: {other:?}"),
+        };
+
+        if upload.results.len() != upload_paths.len() {
+            bail!(
+                "small batch upload response size mismatch: got {} expected {}",
+                upload.results.len(),
+                upload_paths.len()
+            );
+        }
+
+        for (path, result) in upload_paths.iter().zip(upload.results.into_iter()) {
+            if !result.accepted {
+                bail!("small-file upload rejected for {path}: {}", result.message);
+            }
+            if result.skipped {
+                totals.files_skipped = totals.files_skipped.saturating_add(1);
+            } else {
+                totals.files_transferred = totals.files_transferred.saturating_add(1);
+            }
+        }
+    }
+
+    for (file, init) in fallback {
+        let result = upload_file_batches_over_ssh(handle, session, options, &file, &init).await?;
+        totals.add_file_result(result);
+    }
+
+    Ok(totals)
+}
+
+async fn transfer_initialized_direct_batches_over_ssh(
+    handle: &RuntimeHandle,
+    session: &mut SshFrameSession<'_>,
+    options: &FileTransferOptions,
+    files: Vec<FileManifest>,
+) -> Result<BatchResult> {
+    if files.is_empty() {
+        return Ok(BatchResult::default());
+    }
+
+    let total_bytes = files.iter().map(|file| file.size).sum::<u64>();
+    let mut batch_limit = options
+        .max_stream_payload
+        .saturating_sub(512 * 1024)
+        .clamp(512 * 1024, DIRECT_BATCH_TARGET_BYTES);
+    let split_target = total_bytes as usize;
+    if split_target > 4 * 1024 * 1024 {
+        batch_limit = batch_limit.min(split_target);
+    }
+
+    let mut totals = BatchResult::default();
+    let mut payload = Vec::new();
+    let mut metas = Vec::new();
+    let mut pending = Vec::new();
+
+    for file in files {
+        let source_path = options.source_root.join(Path::new(&file.relative_path));
+        let read_started = Instant::now();
+        let raw = fs::read(handle, &source_path)
+            .await
+            .with_context(|| format!("read source {}", source_path.display()))?;
+        options
+            .stats
+            .add_disk_read(read_started.elapsed(), raw.len() as u64);
+        if raw.len() as u64 != file.size {
+            bail!(
+                "file size changed during direct read for {}: expected {} got {}",
+                file.relative_path,
+                file.size,
+                raw.len()
+            );
+        }
+
+        let raw_len = raw.len();
+        let encode_started = Instant::now();
+        let (encoded, compressed) = compression::maybe_compress_vec(raw, options.compression_level)
+            .with_context(|| format!("compress {}", file.relative_path))?;
+        options
+            .stats
+            .add_encode(encode_started.elapsed(), encoded.len());
+        let encoded_len = encoded.len();
+
+        if !metas.is_empty() && payload.len().saturating_add(encoded_len) > batch_limit {
+            let batch = upload_cold_batch_over_ssh(
+                session,
+                std::mem::take(&mut metas),
+                std::mem::take(&mut payload),
+                std::mem::take(&mut pending),
+            )
+            .await?;
+            totals.merge(batch);
+        }
+
+        payload.extend_from_slice(&encoded);
+        pending.push((
+            file.relative_path.clone(),
+            raw_len as u64,
+            encoded_len as u64,
+        ));
+        metas.push(UploadColdFileMeta {
+            relative_path: file.relative_path,
+            size: file.size,
+            mode: file.mode,
+            mtime_sec: file.mtime_sec,
+            file_hash: file.file_hash,
+            total_chunks: file.total_chunks,
+            compressed,
+            raw_len,
+            data_len: encoded_len,
+        });
+    }
+
+    if !metas.is_empty() {
+        let batch = upload_cold_batch_over_ssh(
+            session,
+            std::mem::take(&mut metas),
+            std::mem::take(&mut payload),
+            std::mem::take(&mut pending),
+        )
+        .await?;
+        totals.merge(batch);
+    }
+
+    Ok(totals)
+}
+
+async fn upload_cold_batch_over_ssh(
+    session: &mut SshFrameSession<'_>,
+    metas: Vec<UploadColdFileMeta>,
+    payload: Vec<u8>,
+    pending: Vec<(String, u64, u64)>,
+) -> Result<BatchResult> {
+    if metas.is_empty() {
+        return Ok(BatchResult::default());
+    }
+
+    let response = session
+        .roundtrip(
+            Frame::UploadColdBatchRequest(UploadColdBatchRequest {
+                allow_skip: false,
+                files: metas,
+            }),
+            Some(&payload),
+        )
+        .await?;
+
+    let response = match response {
+        Frame::UploadColdBatchResponse(resp) => resp,
+        Frame::Error(err) => bail!("cold batch upload rejected: {}", err.message),
+        other => bail!("unexpected cold batch response: {other:?}"),
+    };
+
+    if response.results.len() != pending.len() {
+        bail!(
+            "cold batch response size mismatch: got {} expected {}",
+            response.results.len(),
+            pending.len()
+        );
+    }
+
+    let mut totals = BatchResult::default();
+    for (result, (path, raw, encoded)) in response.results.into_iter().zip(pending) {
+        if !result.accepted {
+            bail!("cold batch file rejected for {path}: {}", result.message);
+        }
+        if result.skipped {
+            totals.files_skipped = totals.files_skipped.saturating_add(1);
+        } else {
+            totals.files_transferred = totals.files_transferred.saturating_add(1);
+            totals.bytes_raw = totals.bytes_raw.saturating_add(raw);
+            totals.bytes_sent = totals.bytes_sent.saturating_add(encoded);
+        }
+    }
+    Ok(totals)
+}
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn ssh_base_command(remote: &RemoteEndpoint) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    if let Ok(identity) = std::env::var("SPARSYNC_SSH_IDENTITY") {
+        if !identity.trim().is_empty() {
+            cmd.arg("-i").arg(identity);
+        }
+    }
+    if let Some(port) = remote.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    cmd.arg(remote.ssh_target());
+    cmd
+}
+
+const STREAM_FD_OFFSET: u64 = u64::MAX;
+
+struct SshFrameSession<'a> {
+    child: Child,
+    stdin_fd: Option<OwnedFd>,
+    stdout_fd: OwnedFd,
+    native: spargio::UringNativeAny,
+    max_stream_payload: usize,
+    stats: &'a TransferStats,
+    profile: SshProfile,
+    response_buffer: Vec<u8>,
+    response_frame_len: Option<usize>,
+    finished: bool,
+}
+
+impl<'a> SshFrameSession<'a> {
+    async fn connect(
+        handle: RuntimeHandle,
+        remote: &RemoteEndpoint,
+        destination: &str,
+        max_stream_payload: usize,
+        preserve_metadata: bool,
+        stats: &'a TransferStats,
+        profile: SshProfile,
+    ) -> Result<Self> {
+        let mut remote_cmd = format!(
+            "PATH=\"$HOME/.local/bin:$PATH\" sparsync serve-stdio --destination {} --max-stream-payload {}",
+            sh_quote(destination),
+            max_stream_payload
+        );
+        if preserve_metadata {
+            remote_cmd.push_str(" --preserve-metadata");
+        }
+
+        let mut child = ssh_base_command(remote)
+            .arg(remote_cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("spawn SSH session to {}", remote.ssh_target()))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing SSH stdin pipe"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing SSH stdout pipe"))?;
+
+        let stdin_fd = unsafe { OwnedFd::from_raw_fd(stdin.into_raw_fd()) };
+        let stdout_fd = unsafe { OwnedFd::from_raw_fd(stdout.into_raw_fd()) };
+        if stdio_nonblocking_enabled() {
+            set_nonblocking(stdin_fd.as_raw_fd(), true).context("set SSH stdin nonblocking")?;
+            set_nonblocking(stdout_fd.as_raw_fd(), true).context("set SSH stdout nonblocking")?;
+        }
+        let pipe_target = stdio_pipe_size_bytes_from_env();
+        configure_pipe_size(stdin_fd.as_raw_fd(), pipe_target);
+        configure_pipe_size(stdout_fd.as_raw_fd(), pipe_target);
+
+        let native = handle
+            .uring_native_unbound()
+            .map_err(runtime_error_to_io)?
+            .clear_preferred_shard();
+        stats.add_stream_opened();
+
+        Ok(Self {
+            child,
+            stdin_fd: Some(stdin_fd),
+            stdout_fd,
+            native,
+            max_stream_payload,
+            stats,
+            profile,
+            response_buffer: Vec::with_capacity(64 * 1024),
+            response_frame_len: None,
+            finished: false,
+        })
+    }
+
+    async fn roundtrip(&mut self, request: Frame, payload: Option<&[u8]>) -> Result<Frame> {
+        let sent_at = self.send_request(request, payload).await?;
+        self.read_response(sent_at).await
+    }
+
+    async fn send_request(&mut self, request: Frame, payload: Option<&[u8]>) -> Result<Instant> {
+        let encode_started = Instant::now();
+        let payload_len = payload.map_or(0usize, |bytes| bytes.len());
+        let frame_header = crate::protocol::encode_header(&request, payload_len)
+            .context("encode request frame")?;
+        let encoded_len = frame_header.len().saturating_add(payload_len);
+        self.stats
+            .add_encode(encode_started.elapsed(), frame_header.len());
+        if encoded_len > self.max_stream_payload {
+            bail!(
+                "encoded frame too large: {} > max_stream_payload {}",
+                encoded_len,
+                self.max_stream_payload
+            );
+        }
+
+        self.stats.add_control_frame();
+        self.stats.add_request_bytes(encoded_len);
+        self.profile.add_frame_sent();
+        let sent_at = Instant::now();
+
+        self.write_all(frame_header.as_ref())
+            .await
+            .context("write request frame to SSH stdin")?;
+        if let Some(payload) = payload {
+            self.write_all(payload)
+                .await
+                .context("write request payload to SSH stdin")?;
+        }
+        self.profile.add_flush_call();
+
+        Ok(sent_at)
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        let fd = self
+            .stdin_fd
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SSH session stdin already closed"))?
+            .as_raw_fd();
+
+        let payload: Arc<[u8]> = Arc::from(bytes);
+        let mut offset = 0usize;
+        while offset < payload.len() {
+            match write_arc_to_fd_once(&self.native, fd, payload.clone(), offset).await {
+                Ok(0) => {
+                    return Err(anyhow::anyhow!("write returned zero bytes to SSH stdin"));
+                }
+                Ok(wrote) => {
+                    self.profile.add_write_call();
+                    let remain = payload.len().saturating_sub(offset);
+                    let wrote = wrote.min(remain);
+                    offset = offset.saturating_add(wrote);
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    wait_fd_ready(&self.native, fd, libc::POLLOUT as u32)
+                        .await
+                        .context("wait for SSH stdin writable")?;
+                }
+                Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
+                Err(err) => return Err(err).context("write request bytes to SSH stdin"),
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_response(&mut self, request_started: Instant) -> Result<Frame> {
+        let response = self.read_response_frame().await?;
+        self.stats.add_response_bytes(response.len());
+        self.profile.add_frame_received();
+        self.stats.add_roundtrip_time(request_started.elapsed());
+        let (frame, payload) =
+            crate::protocol::decode(&response).context("decode response frame")?;
+        if !payload.is_empty() {
+            bail!(
+                "unexpected payload in response frame ({} bytes)",
+                payload.len()
+            );
+        }
+        Ok(frame)
+    }
+
+    async fn read_response_frame(&mut self) -> Result<Vec<u8>> {
+        loop {
+            if let Some(frame) = try_extract_frame(
+                &mut self.response_buffer,
+                &mut self.response_frame_len,
+                self.max_stream_payload,
+            )? {
+                return Ok(frame);
+            }
+
+            let remaining = self
+                .max_stream_payload
+                .saturating_sub(self.response_buffer.len());
+            if remaining == 0 {
+                bail!(
+                    "response frame exceeded max_stream_payload {}",
+                    self.max_stream_payload
+                );
+            }
+
+            let chunk = self
+                .read_chunk(remaining)
+                .await
+                .context("read SSH response frame chunk")?;
+            let Some(chunk) = chunk else {
+                if let Some(expected) = self.response_frame_len {
+                    bail!(
+                        "response stream closed with partial frame: have {} expected {}",
+                        self.response_buffer.len(),
+                        expected
+                    );
+                }
+                bail!("response stream closed before response frame");
+            };
+            self.response_buffer.extend_from_slice(chunk.as_ref());
+        }
+    }
+
+    async fn read_chunk(&mut self, max_len: usize) -> Result<Option<Vec<u8>>> {
+        let read_len = max_len.min(256 * 1024).max(1);
+        let fd = self.stdout_fd.as_raw_fd();
+        loop {
+            match self.native.read_at(fd, STREAM_FD_OFFSET, read_len).await {
+                Ok(bytes) => {
+                    self.profile.add_read_call();
+                    if bytes.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(bytes));
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    wait_fd_ready(&self.native, fd, libc::POLLIN as u32)
+                        .await
+                        .context("wait for SSH stdout readable")?;
+                }
+                Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
+                Err(err) => return Err(err).context("read response bytes from SSH stdout"),
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.stdin_fd.take();
+        let status = self
+            .child
+            .wait()
+            .context("wait for SSH stdio server process")?;
+        self.finished = true;
+        if !status.success() {
+            bail!("SSH stdio server exited with status {}", status);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SshFrameSession<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.stdin_fd.take();
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            _ => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+}
+
+fn set_nonblocking(fd: RawFd, enabled: bool) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut next = flags;
+    if enabled {
+        next |= libc::O_NONBLOCK;
+    } else {
+        next &= !libc::O_NONBLOCK;
+    }
+    if next != flags {
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, next) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn runtime_error_to_io(err: spargio::RuntimeError) -> io::Error {
+    match err {
+        spargio::RuntimeError::InvalidConfig(msg) => {
+            io::Error::new(io::ErrorKind::InvalidInput, msg)
+        }
+        spargio::RuntimeError::ThreadSpawn(io_err) => io_err,
+        spargio::RuntimeError::InvalidShard(shard) => {
+            io::Error::new(io::ErrorKind::NotFound, format!("invalid shard {shard}"))
+        }
+        spargio::RuntimeError::Closed => {
+            io::Error::new(io::ErrorKind::BrokenPipe, "runtime closed")
+        }
+        spargio::RuntimeError::Overloaded => {
+            io::Error::new(io::ErrorKind::WouldBlock, "runtime overloaded")
+        }
+        spargio::RuntimeError::UnsupportedBackend(msg) => {
+            io::Error::new(io::ErrorKind::Unsupported, msg)
+        }
+        spargio::RuntimeError::IoUringInit(io_err) => io_err,
+    }
+}
+
+fn configure_pipe_size(fd: RawFd, target_bytes: usize) {
+    let Ok(target) = i32::try_from(target_bytes) else {
+        return;
+    };
+    unsafe {
+        let _ = libc::fcntl(fd, libc::F_SETPIPE_SZ, target);
+    }
+}
+
+async fn wait_fd_ready(native: &spargio::UringNativeAny, fd: RawFd, mask: u32) -> io::Result<()> {
+    unsafe {
+        native
+            .submit_unsafe(
+                (fd, mask),
+                |state| {
+                    let (fd, mask) = *state;
+                    Ok(io_uring::opcode::PollAdd::new(io_uring::types::Fd(fd), mask).build())
+                },
+                |_, cqe| {
+                    if cqe.result < 0 {
+                        return Err(io::Error::from_raw_os_error(-cqe.result));
+                    }
+                    Ok(())
+                },
+            )
+            .await
+    }
+}
+
+async fn write_arc_to_fd_once(
+    native: &spargio::UringNativeAny,
+    fd: RawFd,
+    payload: Arc<[u8]>,
+    offset: usize,
+) -> io::Result<usize> {
+    if offset >= payload.len() {
+        return Ok(0);
+    }
+    unsafe {
+        native
+            .submit_unsafe(
+                (fd, payload, offset),
+                |state| {
+                    let (fd, payload, offset) = state;
+                    let remain = payload.len().saturating_sub(*offset);
+                    let len = u32::try_from(remain).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "write length exceeds u32::MAX")
+                    })?;
+                    let ptr = payload.as_ptr().wrapping_add(*offset);
+                    Ok(
+                        io_uring::opcode::Write::new(io_uring::types::Fd(*fd), ptr, len)
+                            .offset(STREAM_FD_OFFSET)
+                            .build(),
+                    )
+                },
+                |_, cqe| {
+                    if cqe.result < 0 {
+                        return Err(io::Error::from_raw_os_error(-cqe.result));
+                    }
+                    Ok(cqe.result as usize)
+                },
+            )
+            .await
+    }
+}
+
+async fn verify_protocol_over_ssh(session: &mut SshFrameSession<'_>) -> Result<()> {
+    let response = session
+        .roundtrip(
+            Frame::HelloRequest(HelloRequest {
+                protocol_version: PROTOCOL_VERSION,
+                codec: crate::protocol::local_wire_codec(),
+                endianness: crate::protocol::local_wire_endianness(),
+                binary_version: crate::protocol::BINARY_VERSION.to_string(),
+            }),
+            None,
+        )
+        .await
+        .context("send hello request")?;
+
+    match response {
+        Frame::HelloResponse(HelloResponse {
+            accepted: true,
+            protocol_version,
+            codec,
+            endianness,
+            binary_version,
+            ..
+        }) if protocol_version == PROTOCOL_VERSION
+            && codec == crate::protocol::local_wire_codec()
+            && endianness == crate::protocol::local_wire_endianness()
+            && binary_version == crate::protocol::BINARY_VERSION =>
+        {
+            Ok(())
+        }
+        Frame::HelloResponse(resp) => bail!(
+            "server rejected protocol: {} (client={} server={} codec={:?}/{:?} endianness={:?}/{:?} binary={}/{})",
+            resp.message,
+            PROTOCOL_VERSION,
+            resp.protocol_version,
+            crate::protocol::local_wire_codec(),
+            resp.codec,
+            crate::protocol::local_wire_endianness(),
+            resp.endianness,
+            crate::protocol::BINARY_VERSION,
+            resp.binary_version
+        ),
+        Frame::Error(err) => bail!("server hello failed: {}", err.message),
+        other => bail!("unexpected hello response frame: {other:?}"),
+    }
+}
+
+async fn upload_file_batches_over_ssh(
+    handle: &RuntimeHandle,
+    session: &mut SshFrameSession<'_>,
+    options: &FileTransferOptions,
+    file: &FileManifest,
+    init: &InitFileResponse,
+) -> Result<FileResult> {
+    let source_path = options.source_root.join(Path::new(&file.relative_path));
+    let source_file = fs::File::open(handle.clone(), &source_path)
+        .await
+        .with_context(|| format!("open source {}", source_path.display()))?;
+
+    let payload_budget = options
+        .max_stream_payload
+        .saturating_sub(64 * 1024)
+        .max(1024);
+    let per_chunk_budget = options.chunk_size.saturating_add(16).max(1);
+    let max_chunks_per_batch = (payload_budget / per_chunk_budget).max(1);
+    let upload_window = upload_window_from_env().max(1);
+    let payload_capacity = payload_budget.min(BATCH_TARGET_BYTES);
+
+    let mut next_chunk_to_send = init.next_chunk.min(file.total_chunks);
+    let mut finalize_sent = false;
+    let mut sent_bytes = 0u64;
+    let mut raw_bytes = 0u64;
+    let mut inflight = VecDeque::with_capacity(upload_window);
+    let mut payload_pool: Vec<Vec<u8>> = Vec::with_capacity(upload_window);
+    let mut batch_payload = Vec::with_capacity(payload_capacity.min(256 * 1024));
+
+    loop {
+        while inflight.len() < upload_window && !finalize_sent {
+            batch_payload.clear();
+            if let Some(mut reused) = payload_pool.pop() {
+                reused.clear();
+                batch_payload = reused;
+            }
+
+            let prepared = prepare_upload_batch(
+                &source_file,
+                &source_path,
+                options,
+                file,
+                next_chunk_to_send,
+                max_chunks_per_batch,
+                &mut batch_payload,
+            )
+            .await?;
+
+            let sent_at = session
+                .send_request(prepared.frame, Some(&batch_payload))
+                .await
+                .with_context(|| format!("send upload batch for {}", file.relative_path))?;
+
+            next_chunk_to_send = prepared.end_chunk;
+            finalize_sent |= prepared.finalize;
+            inflight.push_back(InflightUploadBatch {
+                start_chunk: prepared.start_chunk,
+                end_chunk: prepared.end_chunk,
+                sent_chunks: prepared.sent_chunks,
+                finalize: prepared.finalize,
+                batch_sent: prepared.batch_sent,
+                batch_raw: prepared.batch_raw,
+                sent_at,
+            });
+            payload_pool.push(std::mem::take(&mut batch_payload));
+        }
+
+        let inflight_batch = inflight.pop_front().ok_or_else(|| {
+            anyhow::anyhow!(
+                "upload pipeline stalled without inflight batch for {}",
+                file.relative_path
+            )
+        })?;
+
+        let response = session
+            .read_response(inflight_batch.sent_at)
+            .await
+            .with_context(|| format!("read upload batch response for {}", file.relative_path))?;
+        let response = match response {
+            Frame::UploadBatchResponse(resp) => resp,
+            Frame::Error(err) => bail!(
+                "upload batch failed for {}: {}",
+                file.relative_path,
+                err.message
+            ),
+            other => bail!(
+                "unexpected batch response for {}: {other:?}",
+                file.relative_path
+            ),
+        };
+
+        if !response.accepted {
+            bail!(
+                "upload batch rejected for {} at chunk {}: {}",
+                file.relative_path,
+                inflight_batch.start_chunk,
+                response.message
+            );
+        }
+
+        sent_bytes = sent_bytes.saturating_add(inflight_batch.batch_sent);
+        raw_bytes = raw_bytes.saturating_add(inflight_batch.batch_raw);
+
+        if response.completed {
+            if !inflight.is_empty() {
+                bail!(
+                    "upload batch completed for {} but {} pipeline requests are still in-flight",
+                    file.relative_path,
+                    inflight.len()
+                );
+            }
+            if !inflight_batch.finalize {
+                bail!(
+                    "upload batch completed for {} before finalize batch was sent",
+                    file.relative_path
+                );
+            }
+            return Ok(FileResult {
+                transferred: true,
+                bytes_sent: sent_bytes,
+                bytes_raw: raw_bytes,
+            });
+        }
+
+        if response.next_chunk <= inflight_batch.start_chunk {
+            bail!(
+                "non-progress batch ack for {}: start={} next={} message={}",
+                file.relative_path,
+                inflight_batch.start_chunk,
+                response.next_chunk,
+                response.message
+            );
+        }
+
+        if response.next_chunk != inflight_batch.end_chunk {
+            bail!(
+                "unexpected batch ack progression for {}: start={} sent_chunks={} expected_next={} got_next={}",
+                file.relative_path,
+                inflight_batch.start_chunk,
+                inflight_batch.sent_chunks,
+                inflight_batch.end_chunk,
+                response.next_chunk
+            );
+        }
+    }
 }
 
 async fn push_directory_cold(
@@ -1424,6 +2783,57 @@ async fn send_frame_roundtrip(
     let frame = session.roundtrip(request, payload).await?;
     session.finish().context("finish request stream")?;
     Ok(frame)
+}
+
+async fn verify_protocol(
+    connection: &QuicConnection,
+    max_stream_payload: usize,
+    stats: &TransferStats,
+) -> Result<()> {
+    let response = send_frame_roundtrip(
+        connection,
+        Frame::HelloRequest(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            codec: crate::protocol::local_wire_codec(),
+            endianness: crate::protocol::local_wire_endianness(),
+            binary_version: crate::protocol::BINARY_VERSION.to_string(),
+        }),
+        None,
+        max_stream_payload,
+        stats,
+    )
+    .await
+    .context("send hello request")?;
+    match response {
+        Frame::HelloResponse(HelloResponse {
+            accepted: true,
+            protocol_version,
+            codec,
+            endianness,
+            binary_version,
+            ..
+        }) if protocol_version == PROTOCOL_VERSION
+            && codec == crate::protocol::local_wire_codec()
+            && endianness == crate::protocol::local_wire_endianness()
+            && binary_version == crate::protocol::BINARY_VERSION =>
+        {
+            Ok(())
+        }
+        Frame::HelloResponse(resp) => bail!(
+            "server rejected protocol: {} (client={} server={} codec={:?}/{:?} endianness={:?}/{:?} binary={}/{})",
+            resp.message,
+            PROTOCOL_VERSION,
+            resp.protocol_version,
+            crate::protocol::local_wire_codec(),
+            resp.codec,
+            crate::protocol::local_wire_endianness(),
+            resp.endianness,
+            crate::protocol::BINARY_VERSION,
+            resp.binary_version
+        ),
+        Frame::Error(err) => bail!("server hello failed: {}", err.message),
+        other => bail!("unexpected hello response frame: {other:?}"),
+    }
 }
 
 struct FrameSession<'a> {

@@ -1,17 +1,19 @@
+use crate::auth::{AuthzPolicy, load_authz_policy};
 use crate::certs;
 use crate::compression;
 use crate::protocol::{
-    ErrorFrame, Frame, InitAction, InitBatchRequest, InitBatchResponse, InitBatchResult,
-    InitFileRequest, InitFileResponse, UploadBatchRequest, UploadBatchResponse,
-    UploadColdBatchRequest, UploadColdBatchResponse, UploadColdFileMeta, UploadColdFileResult,
-    UploadSmallBatchRequest, UploadSmallBatchResponse, UploadSmallFileMeta, UploadSmallFileResult,
+    ErrorFrame, Frame, HelloRequest, HelloResponse, InitAction, InitBatchRequest,
+    InitBatchResponse, InitBatchResult, InitFileRequest, InitFileResponse, PROTOCOL_VERSION,
+    UploadBatchRequest, UploadBatchResponse, UploadColdBatchRequest, UploadColdBatchResponse,
+    UploadColdFileMeta, UploadColdFileResult, UploadSmallBatchRequest, UploadSmallBatchResponse,
+    UploadSmallFileMeta, UploadSmallFileResult,
 };
 use crate::state::{CompleteFileInput, StateStore};
 use crate::util::{partial_path, sanitize_relative};
 use anyhow::{Context, Result, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use spargio::{RuntimeHandle, fs};
-use spargio_quic::{QuicEndpoint, QuicEndpointOptions};
+use spargio_quic::{QuicBackend, QuicEndpoint, QuicEndpointOptions};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -26,8 +28,11 @@ pub struct ServeOptions {
     pub destination: PathBuf,
     pub cert: PathBuf,
     pub key: PathBuf,
+    pub client_ca: Option<PathBuf>,
+    pub authz: Option<PathBuf>,
     pub max_stream_payload: usize,
     pub preserve_metadata: bool,
+    pub once: bool,
 }
 
 #[derive(Clone)]
@@ -38,7 +43,17 @@ struct ServerContext {
     max_stream_payload: usize,
     preserve_metadata: bool,
     partials_maybe_empty: Arc<AtomicBool>,
+    authz_policy: Option<Arc<AuthzPolicy>>,
+    connection_auth: Option<Arc<ConnectionAuth>>,
     profile: ServerProfile,
+}
+
+#[derive(Debug)]
+struct ConnectionAuth {
+    client_id: String,
+    fingerprint_sha256: String,
+    allowed_prefixes: Vec<String>,
+    bytes_written: AtomicU64,
 }
 
 #[derive(Default)]
@@ -198,23 +213,43 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
         .with_context(|| format!("create destination {}", options.destination.display()))?;
 
     let server_config =
-        certs::load_server_config(&options.cert, &options.key).with_context(|| {
-            format!(
-                "load cert/key cert={} key={}",
-                options.cert.display(),
-                options.key.display()
-            )
-        })?;
+        certs::load_server_config(&options.cert, &options.key, options.client_ca.as_deref())
+            .with_context(|| {
+                format!(
+                    "load server config cert={} key={} client_ca={}",
+                    options.cert.display(),
+                    options.key.display(),
+                    options
+                        .client_ca
+                        .as_ref()
+                        .map(|v| v.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                )
+            })?;
 
-    let endpoint_options = QuicEndpointOptions::default()
+    let mut endpoint_options = QuicEndpointOptions::default()
         .with_accept_timeout(Duration::from_secs(30))
         .with_operation_timeout(Duration::from_secs(60))
         .with_max_inflight_ops(65_536);
+    if options.authz.is_some() {
+        endpoint_options = endpoint_options.with_backend(QuicBackend::Bridge);
+    }
 
     let endpoint = QuicEndpoint::server_with_options(server_config, options.bind, endpoint_options)
         .context("create quic server endpoint")?;
 
-    info!(bind = %options.bind, destination = %options.destination.display(), "sparsync server started");
+    info!(
+        bind = %options.bind,
+        destination = %options.destination.display(),
+        client_auth = options.client_ca.is_some(),
+        authz = options
+            .authz
+            .as_ref()
+            .map(|v| v.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        once = options.once,
+        "sparsync server started"
+    );
 
     let state = StateStore::open(handle.clone(), &options.destination)
         .await
@@ -232,6 +267,14 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
         max_stream_payload: options.max_stream_payload,
         preserve_metadata: options.preserve_metadata,
         partials_maybe_empty: Arc::new(AtomicBool::new(partials_maybe_empty)),
+        authz_policy: options
+            .authz
+            .as_deref()
+            .map(load_authz_policy)
+            .transpose()
+            .context("load authz policy")?
+            .map(Arc::new),
+        connection_auth: None,
         profile: ServerProfile::from_env(),
     };
 
@@ -249,18 +292,25 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
         let Some(connection) = accepted else {
             continue;
         };
-
         let context = context.clone();
         let conn_id = connection.stable_id();
         info!(connection_id = conn_id, "accepted QUIC connection");
 
-        let spawn = handle.spawn_stealable(async move {
-            if let Err(err) = handle_connection(context, connection).await {
+        if options.once {
+            if let Err(err) = handle_connection(context.clone(), connection).await {
                 warn!(connection_id = conn_id, error = %err, "connection closed with error");
             }
-        });
-        if let Err(err) = spawn {
-            error!(connection_id = conn_id, error = ?err, "failed to spawn connection task");
+            context.state.flush().await.context("flush resume state")?;
+            return Ok(());
+        } else {
+            let spawn = handle.spawn_stealable(async move {
+                if let Err(err) = handle_connection(context, connection).await {
+                    warn!(connection_id = conn_id, error = %err, "connection closed with error");
+                }
+            });
+            if let Err(err) = spawn {
+                error!(connection_id = conn_id, error = ?err, "failed to spawn connection task");
+            }
         }
     }
 }
@@ -269,7 +319,23 @@ async fn handle_connection(
     context: ServerContext,
     connection: spargio_quic::QuicConnection,
 ) -> Result<()> {
-    loop {
+    let connection_id = connection.stable_id();
+    let connection_auth = if let Some(policy) = &context.authz_policy {
+        Some(authorize_connection(
+            policy,
+            &connection,
+            context.destination.as_path(),
+            connection_id,
+        )?)
+    } else {
+        None
+    };
+    let context = ServerContext {
+        connection_auth,
+        ..context
+    };
+
+    let outcome = loop {
         match connection.accept_bi().await {
             Ok((send, recv)) => {
                 let stream_conn_id = connection.stable_id();
@@ -295,12 +361,162 @@ async fn handle_connection(
                 continue;
             }
             Err(err) if is_closed_error(&err) => {
-                return Ok(());
+                break Ok(());
             }
             Err(err) => {
-                return Err(err).context("accept bidirectional stream");
+                break Err(err).context("accept bidirectional stream");
             }
         }
+    };
+
+    if let Some(auth) = &context.connection_auth {
+        info!(
+            target: "sparsync::audit",
+            connection_id,
+            client_id = %auth.client_id,
+            fingerprint_sha256 = %auth.fingerprint_sha256,
+            decision = "allow",
+            destination_root = %context.destination.display(),
+            bytes_written = auth.bytes_written.load(Ordering::Relaxed),
+            "mTLS connection closed"
+        );
+    }
+
+    outcome
+}
+
+fn authorize_connection(
+    policy: &AuthzPolicy,
+    connection: &spargio_quic::QuicConnection,
+    destination_root: &Path,
+    connection_id: usize,
+) -> Result<Arc<ConnectionAuth>> {
+    let certs = connection
+        .peer_cert_chain_der()
+        .context("read peer certificate chain from QUIC connection")?;
+    let Some(leaf) = certs.first() else {
+        warn!(
+            target: "sparsync::audit",
+            connection_id,
+            decision = "deny",
+            reason = "no_certificate",
+            destination_root = %destination_root.display(),
+            "mTLS authorization denied"
+        );
+        bail!("peer presented no certificate");
+    };
+    let fingerprint = crate::certs::certificate_fingerprint_sha256(leaf);
+    let Some(entry) = policy.entry_for_fingerprint(&fingerprint) else {
+        warn!(
+            target: "sparsync::audit",
+            connection_id,
+            decision = "deny",
+            reason = "unknown_fingerprint",
+            fingerprint_sha256 = %fingerprint,
+            destination_root = %destination_root.display(),
+            "mTLS authorization denied"
+        );
+        bail!("peer certificate fingerprint is not authorized");
+    };
+    if entry.revoked {
+        warn!(
+            target: "sparsync::audit",
+            connection_id,
+            decision = "deny",
+            reason = "revoked",
+            client_id = %entry.client_id,
+            fingerprint_sha256 = %fingerprint,
+            destination_root = %destination_root.display(),
+            "mTLS authorization denied"
+        );
+        bail!("peer certificate fingerprint is revoked");
+    }
+
+    let allowed_prefixes = crate::auth::normalize_allowed_prefixes(&entry.allowed_prefixes)
+        .context("normalize authz prefixes from policy")?;
+    info!(
+        target: "sparsync::audit",
+        connection_id,
+        decision = "allow",
+        client_id = %entry.client_id,
+        fingerprint_sha256 = %fingerprint,
+        destination_root = %destination_root.display(),
+        allowed_prefixes = %allowed_prefixes.join(","),
+        "mTLS authorization allowed"
+    );
+
+    Ok(Arc::new(ConnectionAuth {
+        client_id: entry.client_id.clone(),
+        fingerprint_sha256: fingerprint,
+        allowed_prefixes,
+        bytes_written: AtomicU64::new(0),
+    }))
+}
+
+fn normalize_relative_for_auth(relative_path: &str) -> Result<String> {
+    let cleaned = sanitize_relative(relative_path)?;
+    Ok(cleaned.to_string_lossy().replace('\\', "/"))
+}
+
+fn is_path_allowed(allowed_prefixes: &[String], relative_path: &str) -> bool {
+    if allowed_prefixes.iter().any(|prefix| prefix == "/") {
+        return true;
+    }
+
+    allowed_prefixes.iter().any(|prefix| {
+        if relative_path == prefix {
+            return true;
+        }
+        let mut with_slash = String::with_capacity(prefix.len() + 1);
+        with_slash.push_str(prefix);
+        with_slash.push('/');
+        relative_path.starts_with(&with_slash)
+    })
+}
+
+fn authorize_relative_path(context: &ServerContext, relative_path: &str) -> Result<()> {
+    let Some(auth) = &context.connection_auth else {
+        return Ok(());
+    };
+
+    let normalized = normalize_relative_for_auth(relative_path)?;
+    if is_path_allowed(&auth.allowed_prefixes, &normalized) {
+        return Ok(());
+    }
+
+    warn!(
+        target: "sparsync::audit",
+        client_id = %auth.client_id,
+        fingerprint_sha256 = %auth.fingerprint_sha256,
+        decision = "deny",
+        reason = "prefix_not_allowed",
+        destination_path = %normalized,
+        allowed_prefixes = %auth.allowed_prefixes.join(","),
+        "mTLS path authorization denied"
+    );
+    bail!(
+        "destination path '{}' is not authorized for client '{}'",
+        relative_path,
+        auth.client_id
+    );
+}
+
+fn response_bytes_written(frame: &Frame) -> u64 {
+    match frame {
+        Frame::UploadBatchResponse(resp) => resp.bytes_written,
+        Frame::UploadSmallBatchResponse(resp) => resp.results.iter().map(|v| v.bytes_written).sum(),
+        Frame::UploadColdBatchResponse(resp) => resp.results.iter().map(|v| v.bytes_written).sum(),
+        _ => 0,
+    }
+}
+
+fn track_written_bytes(context: &ServerContext, frame: &Frame) {
+    let Some(auth) = &context.connection_auth else {
+        return;
+    };
+    let bytes = response_bytes_written(frame);
+    if bytes > 0 {
+        auth.bytes_written.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -327,6 +543,7 @@ async fn handle_stream(
 
         let process_started = Instant::now();
         let response = match frame {
+            Frame::HelloRequest(req) => process_hello(req).await,
             Frame::InitFileRequest(req) => process_init_file(&context, req).await,
             Frame::InitBatchRequest(req) => process_init_batch(&context, req).await,
             Frame::UploadBatchRequest(req) => process_upload_batch(&context, req, payload).await,
@@ -336,6 +553,9 @@ async fn handle_stream(
             Frame::UploadColdBatchRequest(req) => {
                 process_upload_cold_batch(&context, req, payload).await
             }
+            Frame::HelloResponse(_) => Ok(Frame::Error(ErrorFrame {
+                message: "unexpected hello response on server".to_string(),
+            })),
             other => Ok(Frame::Error(ErrorFrame {
                 message: format!("unexpected frame on server: {other:?}"),
             })),
@@ -347,6 +567,7 @@ async fn handle_stream(
                 message: format!("{err:#}"),
             }),
         };
+        track_written_bytes(&context, &response);
         context.profile.add_process(process_started.elapsed());
 
         let encode_started = Instant::now();
@@ -365,6 +586,72 @@ async fn handle_stream(
     context.profile.add_write(finish_started.elapsed());
     context.profile.maybe_log_stream_totals(stream_idx);
     Ok(())
+}
+
+async fn process_hello(req: HelloRequest) -> Result<Frame> {
+    if req.protocol_version != PROTOCOL_VERSION {
+        return Ok(Frame::HelloResponse(HelloResponse {
+            protocol_version: PROTOCOL_VERSION,
+            codec: crate::protocol::local_wire_codec(),
+            endianness: crate::protocol::local_wire_endianness(),
+            binary_version: crate::protocol::BINARY_VERSION.to_string(),
+            accepted: false,
+            message: format!(
+                "protocol mismatch: client={} server={}",
+                req.protocol_version, PROTOCOL_VERSION
+            ),
+        }));
+    }
+    if req.codec != crate::protocol::local_wire_codec() {
+        return Ok(Frame::HelloResponse(HelloResponse {
+            protocol_version: PROTOCOL_VERSION,
+            codec: crate::protocol::local_wire_codec(),
+            endianness: crate::protocol::local_wire_endianness(),
+            binary_version: crate::protocol::BINARY_VERSION.to_string(),
+            accepted: false,
+            message: format!(
+                "codec mismatch: client={:?} server={:?}",
+                req.codec,
+                crate::protocol::local_wire_codec()
+            ),
+        }));
+    }
+    if req.endianness != crate::protocol::local_wire_endianness() {
+        return Ok(Frame::HelloResponse(HelloResponse {
+            protocol_version: PROTOCOL_VERSION,
+            codec: crate::protocol::local_wire_codec(),
+            endianness: crate::protocol::local_wire_endianness(),
+            binary_version: crate::protocol::BINARY_VERSION.to_string(),
+            accepted: false,
+            message: format!(
+                "endianness mismatch: client={:?} server={:?}",
+                req.endianness,
+                crate::protocol::local_wire_endianness()
+            ),
+        }));
+    }
+    if req.binary_version != crate::protocol::BINARY_VERSION {
+        return Ok(Frame::HelloResponse(HelloResponse {
+            protocol_version: PROTOCOL_VERSION,
+            codec: crate::protocol::local_wire_codec(),
+            endianness: crate::protocol::local_wire_endianness(),
+            binary_version: crate::protocol::BINARY_VERSION.to_string(),
+            accepted: false,
+            message: format!(
+                "binary version mismatch: client={} server={}",
+                req.binary_version,
+                crate::protocol::BINARY_VERSION
+            ),
+        }));
+    }
+    Ok(Frame::HelloResponse(HelloResponse {
+        protocol_version: PROTOCOL_VERSION,
+        codec: crate::protocol::local_wire_codec(),
+        endianness: crate::protocol::local_wire_endianness(),
+        binary_version: crate::protocol::BINARY_VERSION.to_string(),
+        accepted: true,
+        message: "ok".to_string(),
+    }))
 }
 
 async fn read_next_frame(
@@ -456,6 +743,7 @@ fn try_extract_frame(
 }
 
 async fn process_init_file(context: &ServerContext, req: InitFileRequest) -> Result<Frame> {
+    authorize_relative_path(context, &req.relative_path)?;
     let response = initialize_one_file(context, &req).await?;
     Ok(Frame::InitFileResponse(response))
 }
@@ -466,6 +754,7 @@ async fn process_init_batch(context: &ServerContext, req: InitBatchRequest) -> R
     let mut partial_parents = HashSet::new();
 
     for file in req.files {
+        authorize_relative_path(context, &file.relative_path)?;
         let relative = sanitize_relative(&file.relative_path)?;
         let skip =
             context
@@ -607,6 +896,7 @@ async fn process_upload_batch(
     req: UploadBatchRequest,
     payload: &[u8],
 ) -> Result<Frame> {
+    authorize_relative_path(context, &req.relative_path)?;
     let relative = sanitize_relative(&req.relative_path)?;
     let key = req.relative_path.as_str();
 
@@ -736,6 +1026,9 @@ async fn process_upload_small_batch(
     req: UploadSmallBatchRequest,
     payload: &[u8],
 ) -> Result<Frame> {
+    for meta in &req.files {
+        authorize_relative_path(context, &meta.relative_path)?;
+    }
     let write_concurrency =
         choose_write_concurrency(req.files.len(), req.files.iter().map(|f| f.size).sum());
     let split_started = Instant::now();
@@ -830,6 +1123,9 @@ async fn process_upload_cold_batch(
     req: UploadColdBatchRequest,
     payload: &[u8],
 ) -> Result<Frame> {
+    for meta in &req.files {
+        authorize_relative_path(context, &meta.relative_path)?;
+    }
     let write_concurrency =
         choose_write_concurrency(req.files.len(), req.files.iter().map(|f| f.size).sum());
     let split_started = Instant::now();

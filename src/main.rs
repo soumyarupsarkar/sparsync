@@ -1,18 +1,23 @@
+mod auth;
 mod bench;
+mod bootstrap;
 mod certs;
 mod compression;
+mod endpoint;
 mod model;
+mod profile;
 mod protocol;
 mod scan;
 mod server;
 mod state;
+mod stdio_server;
 mod transfer;
 mod util;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use spargio::RuntimeHandle;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -30,7 +35,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Serve(ServeArgs),
+    #[command(name = "serve-stdio", hide = true)]
+    ServeStdio(ServeStdioArgs),
     Push(PushArgs),
+    Sync(SyncArgs),
+    Auth(AuthArgs),
     Scan(ScanArgs),
     Bench(BenchArgs),
     GenCert(GenCertArgs),
@@ -50,6 +59,27 @@ struct ServeArgs {
     #[arg(long)]
     key: PathBuf,
 
+    #[arg(long)]
+    client_ca: Option<PathBuf>,
+
+    #[arg(long)]
+    authz: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_stream_payload: usize,
+
+    #[arg(long)]
+    preserve_metadata: bool,
+
+    #[arg(long)]
+    once: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ServeStdioArgs {
+    #[arg(long)]
+    destination: PathBuf,
+
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     max_stream_payload: usize,
 
@@ -63,13 +93,22 @@ struct PushArgs {
     source: PathBuf,
 
     #[arg(long)]
-    server: SocketAddr,
-
-    #[arg(long, default_value = "localhost")]
-    server_name: String,
+    server: Option<SocketAddr>,
 
     #[arg(long)]
-    ca: PathBuf,
+    server_name: Option<String>,
+
+    #[arg(long)]
+    ca: Option<PathBuf>,
+
+    #[arg(long)]
+    client_cert: Option<PathBuf>,
+
+    #[arg(long)]
+    client_key: Option<PathBuf>,
+
+    #[arg(long)]
+    profile: Option<String>,
 
     #[arg(long, default_value_t = 1024 * 1024)]
     chunk_size: usize,
@@ -106,6 +145,123 @@ struct PushArgs {
 
     #[arg(long)]
     manifest_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct SyncArgs {
+    source: String,
+    destination: String,
+
+    #[arg(long)]
+    profile: Option<String>,
+
+    #[arg(long, default_value = "ssh")]
+    bootstrap: String,
+
+    #[arg(long, default_value = "quic")]
+    transport: String,
+
+    #[arg(long, default_value = "auto")]
+    install: String,
+
+    #[arg(long, default_value_t = 7844)]
+    server_port: u16,
+
+    #[arg(long, default_value_t = 1024 * 1024)]
+    chunk_size: usize,
+
+    #[arg(long, default_value_t = num_cpus::get().max(1) * 4)]
+    parallel_files: usize,
+
+    #[arg(long, default_value_t = 1)]
+    connections: usize,
+
+    #[arg(long, default_value_t = num_cpus::get().max(1))]
+    scan_workers: usize,
+
+    #[arg(long, default_value_t = num_cpus::get().max(1) * 2)]
+    hash_workers: usize,
+
+    #[arg(long, default_value_t = 3)]
+    compression_level: i32,
+
+    #[arg(long, default_value_t = 5000)]
+    connect_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 15000)]
+    op_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_stream_payload: usize,
+
+    #[arg(long)]
+    no_resume: bool,
+
+    #[arg(long)]
+    cold_start: bool,
+
+    #[arg(long)]
+    manifest_out: Option<PathBuf>,
+
+    #[arg(long)]
+    preserve_metadata: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct AuthArgs {
+    #[command(subcommand)]
+    command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+enum AuthCommand {
+    InitServer(AuthInitServerArgs),
+    IssueClient(AuthIssueClientArgs),
+    RevokeClient(AuthRevokeClientArgs),
+    Rotate(AuthRotateArgs),
+    Status(AuthStatusArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct AuthInitServerArgs {
+    #[arg(long)]
+    dir: Option<PathBuf>,
+
+    #[arg(long, default_value = "localhost")]
+    server_name: String,
+}
+
+#[derive(Debug, Args, Clone)]
+struct AuthIssueClientArgs {
+    #[arg(long)]
+    dir: Option<PathBuf>,
+
+    #[arg(long)]
+    client_id: String,
+
+    #[arg(long = "allow-prefix")]
+    allow_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct AuthRevokeClientArgs {
+    #[arg(long)]
+    dir: Option<PathBuf>,
+
+    #[arg(long)]
+    client_id: String,
+}
+
+#[derive(Debug, Args, Clone)]
+struct AuthRotateArgs {
+    #[arg(long)]
+    dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct AuthStatusArgs {
+    #[arg(long)]
+    dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -193,12 +349,58 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 destination: args.destination,
                 cert: args.cert,
                 key: args.key,
+                client_ca: args.client_ca,
+                authz: args.authz,
                 max_stream_payload: args.max_stream_payload,
                 preserve_metadata: args.preserve_metadata,
+                once: args.once,
             };
             server::run_server(handle, options).await
         }
+        Command::ServeStdio(args) => {
+            let options = stdio_server::ServeStdioOptions {
+                destination: args.destination,
+                max_stream_payload: args.max_stream_payload,
+                preserve_metadata: args.preserve_metadata,
+            };
+            stdio_server::run_server_stdio(handle, options).await
+        }
         Command::Push(args) => {
+            let profile = if let Some(name) = args.profile.as_deref() {
+                Some(
+                    profile::get_profile(name)
+                        .with_context(|| format!("load profile '{}'", name))?,
+                )
+            } else {
+                None
+            };
+
+            let server = match (args.server, profile.as_ref().map(|v| v.server.as_str())) {
+                (Some(v), _) => v,
+                (None, Some(raw)) => raw
+                    .parse::<SocketAddr>()
+                    .with_context(|| format!("parse server socket '{}' from profile", raw))?,
+                (None, None) => bail!("missing --server (or provide --profile with server)"),
+            };
+            let server_name = match (args.server_name.clone(), profile.as_ref()) {
+                (Some(v), _) => v,
+                (None, Some(p)) => p.server_name.clone(),
+                (None, None) => "localhost".to_string(),
+            };
+            let ca = match (args.ca.clone(), profile.as_ref()) {
+                (Some(v), _) => v,
+                (None, Some(p)) => p.ca.clone(),
+                (None, None) => bail!("missing --ca (or provide --profile with ca)"),
+            };
+            let client_cert = args
+                .client_cert
+                .clone()
+                .or_else(|| profile.as_ref().and_then(|p| p.client_cert.clone()));
+            let client_key = args
+                .client_key
+                .clone()
+                .or_else(|| profile.as_ref().and_then(|p| p.client_key.clone()));
+
             let scan_options = scan::ScanOptions {
                 chunk_size: args.chunk_size,
                 scan_workers: args.scan_workers.max(1),
@@ -206,9 +408,11 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
             };
             let options = transfer::PushOptions {
                 source: args.source,
-                server: args.server,
-                server_name: args.server_name,
-                ca: args.ca,
+                server,
+                server_name,
+                ca,
+                client_cert,
+                client_key,
                 scan: scan_options,
                 parallel_files: args.parallel_files.max(1),
                 connections: args.connections.max(1),
@@ -231,6 +435,270 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 summary.megabits_per_sec()
             );
             Ok(())
+        }
+        Command::Sync(args) => {
+            let source = endpoint::parse_endpoint(&args.source)
+                .with_context(|| format!("parse source endpoint '{}'", args.source))?;
+            let destination = endpoint::parse_endpoint(&args.destination)
+                .with_context(|| format!("parse destination endpoint '{}'", args.destination))?;
+
+            let (source_path, remote) = match (source, destination) {
+                (endpoint::Endpoint::Local(path), endpoint::Endpoint::Remote(remote)) => {
+                    (path, remote)
+                }
+                _ => bail!(
+                    "sync currently supports local->remote only (example: /src user@host:/dest)"
+                ),
+            };
+
+            let profile_name = args
+                .profile
+                .clone()
+                .unwrap_or_else(|| format!("{}-{}", remote.host, args.server_port));
+            let scan_options = scan::ScanOptions {
+                chunk_size: args.chunk_size,
+                scan_workers: args.scan_workers.max(1),
+                hash_workers: args.hash_workers.max(1),
+            };
+
+            match args.transport.as_str() {
+                "quic" => {
+                    let (server, server_name, ca, client_cert, client_key, bootstrap_session) =
+                        if args.bootstrap == "ssh" {
+                            let install_mode = bootstrap::InstallMode::parse(&args.install)?;
+                            let client_id = bootstrap::default_client_id();
+                            let session =
+                                bootstrap::bootstrap_remote_push(&bootstrap::BootstrapOptions {
+                                    remote: remote.clone(),
+                                    destination: remote.path.clone(),
+                                    server_port: args.server_port,
+                                    server_name: remote.host.clone(),
+                                    client_id,
+                                    profile_name: profile_name.clone(),
+                                    install_mode,
+                                    preserve_metadata: args.preserve_metadata,
+                                })?;
+
+                            profile::upsert_profile(profile::SyncProfile {
+                                name: profile_name.clone(),
+                                server: session.server.to_string(),
+                                server_name: session.server_name.clone(),
+                                ca: session.ca.clone(),
+                                client_cert: Some(session.client_cert.clone()),
+                                client_key: Some(session.client_key.clone()),
+                                ssh_target: Some(remote.ssh_target()),
+                                destination: Some(remote.path.clone()),
+                            })?;
+
+                            (
+                                session.server,
+                                session.server_name.clone(),
+                                session.ca.clone(),
+                                Some(session.client_cert.clone()),
+                                Some(session.client_key.clone()),
+                                Some(session),
+                            )
+                        } else if args.bootstrap == "none" {
+                            let profile =
+                                profile::get_profile(&profile_name).with_context(|| {
+                                    format!("load profile '{}' for --bootstrap none", profile_name)
+                                })?;
+                            let server = profile
+                                .server
+                                .parse::<SocketAddr>()
+                                .or_else(|_| {
+                                    profile
+                                        .server
+                                        .to_socket_addrs()
+                                        .map(|mut iter| iter.next())
+                                        .map_err(|err| {
+                                            std::io::Error::new(
+                                                std::io::ErrorKind::InvalidInput,
+                                                err,
+                                            )
+                                        })
+                                        .and_then(|addr| {
+                                            addr.ok_or_else(|| {
+                                                std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidInput,
+                                                    "no socket address resolved for profile server",
+                                                )
+                                            })
+                                        })
+                                })
+                                .with_context(|| {
+                                    format!("parse profile server '{}'", profile.server)
+                                })?;
+                            (
+                                server,
+                                profile.server_name,
+                                profile.ca,
+                                profile.client_cert,
+                                profile.client_key,
+                                None,
+                            )
+                        } else {
+                            bail!(
+                                "invalid bootstrap mode '{}' (expected ssh|none)",
+                                args.bootstrap
+                            );
+                        };
+
+                    let summary = transfer::push_directory(
+                        handle,
+                        transfer::PushOptions {
+                            source: source_path,
+                            server,
+                            server_name,
+                            ca,
+                            client_cert,
+                            client_key,
+                            scan: scan_options,
+                            parallel_files: args.parallel_files.max(1),
+                            connections: args.connections.max(1),
+                            compression_level: args.compression_level,
+                            connect_timeout: Duration::from_millis(args.connect_timeout_ms),
+                            operation_timeout: Duration::from_millis(args.op_timeout_ms),
+                            max_stream_payload: args.max_stream_payload,
+                            resume: !args.no_resume,
+                            cold_start: args.cold_start,
+                            manifest_out: args.manifest_out,
+                        },
+                    )
+                    .await?;
+
+                    println!(
+                        "synced files={} skipped={} bytes_sent={} bytes_raw={} elapsed_ms={} throughput_mbps={:.2}",
+                        summary.files_transferred,
+                        summary.files_skipped,
+                        summary.bytes_sent,
+                        summary.bytes_raw,
+                        summary.elapsed.as_millis(),
+                        summary.megabits_per_sec()
+                    );
+
+                    if let Some(session) = bootstrap_session {
+                        session.wait()?;
+                    }
+                    Ok(())
+                }
+                "ssh" => {
+                    match args.bootstrap.as_str() {
+                        "ssh" => {
+                            let install_mode = bootstrap::InstallMode::parse(&args.install)?;
+                            bootstrap::ensure_remote_binary_available(&remote, install_mode)?;
+                        }
+                        "none" => {}
+                        other => {
+                            bail!("invalid bootstrap mode '{}' (expected ssh|none)", other);
+                        }
+                    }
+
+                    let remote_destination = remote.path.clone();
+                    let summary = transfer::push_directory_over_ssh_stdio(
+                        handle,
+                        transfer::PushOverSshOptions {
+                            source: source_path,
+                            remote,
+                            destination: remote_destination,
+                            scan: scan_options,
+                            compression_level: args.compression_level,
+                            max_stream_payload: args.max_stream_payload,
+                            resume: !args.no_resume,
+                            cold_start: args.cold_start,
+                            manifest_out: args.manifest_out,
+                            preserve_metadata: args.preserve_metadata,
+                        },
+                    )
+                    .await?;
+
+                    println!(
+                        "synced files={} skipped={} bytes_sent={} bytes_raw={} elapsed_ms={} throughput_mbps={:.2}",
+                        summary.files_transferred,
+                        summary.files_skipped,
+                        summary.bytes_sent,
+                        summary.bytes_raw,
+                        summary.elapsed.as_millis(),
+                        summary.megabits_per_sec()
+                    );
+                    Ok(())
+                }
+                other => bail!("invalid transport '{}' (expected quic|ssh)", other),
+            }
+        }
+        Command::Auth(args) => {
+            let resolve_dir = |input: Option<PathBuf>| -> Result<PathBuf> {
+                if let Some(dir) = input {
+                    return Ok(dir);
+                }
+                let mut dir = profile::ensure_config_root()?;
+                dir.push("auth");
+                Ok(dir)
+            };
+
+            match args.command {
+                AuthCommand::InitServer(cmd) => {
+                    let dir = resolve_dir(cmd.dir)?;
+                    let layout = auth::AuthLayout::under(&dir);
+                    let out = auth::init_server(&layout, &cmd.server_name)?;
+                    println!(
+                        "auth initialized dir={} server_cert={} client_ca={} authz={}",
+                        out.layout.root.display(),
+                        out.layout.server_cert.display(),
+                        out.layout.client_ca_cert.display(),
+                        out.layout.authz_path.display()
+                    );
+                    Ok(())
+                }
+                AuthCommand::IssueClient(cmd) => {
+                    let dir = resolve_dir(cmd.dir)?;
+                    let layout = auth::AuthLayout::under(&dir);
+                    let out = auth::issue_client(&layout, &cmd.client_id, &cmd.allow_prefixes)?;
+                    println!(
+                        "issued client id={} cert={} key={} fingerprint_sha256={} allow_prefixes={}",
+                        cmd.client_id,
+                        out.cert_path.display(),
+                        out.key_path.display(),
+                        out.fingerprint_sha256,
+                        out.allowed_prefixes.join(",")
+                    );
+                    Ok(())
+                }
+                AuthCommand::RevokeClient(cmd) => {
+                    let dir = resolve_dir(cmd.dir)?;
+                    let layout = auth::AuthLayout::under(&dir);
+                    let found = auth::revoke_client(&layout, &cmd.client_id)?;
+                    println!(
+                        "revoke client id={} result={}",
+                        cmd.client_id,
+                        if found { "updated" } else { "not_found" }
+                    );
+                    Ok(())
+                }
+                AuthCommand::Rotate(cmd) => {
+                    let dir = resolve_dir(cmd.dir)?;
+                    let layout = auth::AuthLayout::under(&dir);
+                    auth::rotate_client_ca(&layout)?;
+                    println!(
+                        "rotated client CA and reset authz dir={}",
+                        layout.root.display()
+                    );
+                    Ok(())
+                }
+                AuthCommand::Status(cmd) => {
+                    let dir = resolve_dir(cmd.dir)?;
+                    let layout = auth::AuthLayout::under(&dir);
+                    let status = auth::auth_status(&layout)?;
+                    println!(
+                        "auth status dir={} total_clients={} active_clients={} revoked_clients={}",
+                        layout.root.display(),
+                        status.total_clients,
+                        status.active_clients,
+                        status.revoked_clients
+                    );
+                    Ok(())
+                }
+            }
         }
         Command::Scan(args) => {
             let options = scan::ScanOptions {

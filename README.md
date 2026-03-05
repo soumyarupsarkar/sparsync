@@ -9,12 +9,18 @@ Goal: become the fastest lightweight Rust rsync-style sync tool for large trees 
 - Fast parallel directory walk on top of `spargio::fs::read_dir`
 - Full-file hashing with BLAKE3 + persistent source hash cache
 - Parallel file transfer over `spargio-quic` (`QuicEndpoint`)
+- Protocol compatibility handshake (`Hello` frame version check)
 - Resume support with partial-file restart offsets
 - Binary protocol framing with `rkyv` control messages (no JSON wire headers)
 - Batched init + small-file multi-upload streams (fewer round trips)
 - Batched chunk upload streams for resumed/large-file paths
 - Direct initialized-file batching for medium files (reduced first-sync stream churn)
 - Optional per-chunk compression (Zstd)
+- Optional mTLS client auth (`serve --client-ca`, `push --client-cert/--client-key`)
+- Prefix-scoped authorization policies (`auth issue-client --allow-prefix`)
+- Auth CLI for mTLS lifecycle (`auth init-server|issue-client|revoke-client|rotate|status`)
+- Structured auth audit logs for allow/deny and per-connection bytes transferred
+- SSH bootstrap + one-command local->remote sync (`sync /src user@host:/dest`)
 - Synthetic benchmark harness for scan/task/I/O pressure
 
 ## Quick Start
@@ -62,9 +68,73 @@ Add `--preserve-metadata` for rsync-like mode/mtime preservation.
 ```
 
 Re-running `push` skips already complete files via persisted hashes.
+You can save and reuse connection credentials with `--profile <name>`.
 
 Use `--cold-start` for the experimental cold-copy fast path (optimized for initial empty-target syncs).
 Set `SPARSYNC_PROFILE=1` to emit per-push transfer counters/timers.
+
+## Secure mTLS Workflow
+
+Initialize server-side auth materials:
+
+```bash
+./target/release/sparsync auth init-server --dir ~/.config/sparsync/auth --server-name sync-host
+```
+
+Issue a client certificate and authorize it:
+
+```bash
+./target/release/sparsync auth issue-client \
+  --dir ~/.config/sparsync/auth \
+  --client-id alice-laptop \
+  --allow-prefix team-a/inbox
+```
+
+Use `--allow-prefix /` to grant access to the full server destination root.
+
+Run server with client cert enforcement and authz policy:
+
+```bash
+./target/release/sparsync serve \
+  --bind 0.0.0.0:7844 \
+  --destination /data/replica \
+  --cert ~/.config/sparsync/auth/server.cert.der \
+  --key ~/.config/sparsync/auth/server.key.der \
+  --client-ca ~/.config/sparsync/auth/client-ca.cert.der \
+  --authz ~/.config/sparsync/auth/authz.json
+```
+
+Push using mTLS credentials:
+
+```bash
+./target/release/sparsync push \
+  --source /data/source \
+  --server 10.0.0.10:7844 \
+  --server-name sync-host \
+  --ca ~/.config/sparsync/auth/server.cert.der \
+  --client-cert ~/.config/sparsync/auth/clients/alice-laptop.cert.der \
+  --client-key ~/.config/sparsync/auth/clients/alice-laptop.key.der
+```
+
+Audit events are emitted on `sparsync::audit` (allow/deny decisions, authorized client identity,
+destination path denials, and bytes written per connection).
+
+## One-Command SSH Bootstrap Sync
+
+For local->remote sync, `sync` defaults to:
+
+- `--bootstrap ssh`
+- `--transport quic`
+- `--install auto`
+
+Example:
+
+```bash
+./target/release/sparsync sync /data/source user@sync-host:/data/replica
+```
+
+This flow bootstraps remote auth material, issues client credentials, launches a one-shot remote
+receiver, transfers over QUIC+mTLS, and stores a local profile for reuse.
 
 ## Scan Command
 

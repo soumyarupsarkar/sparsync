@@ -1,8 +1,18 @@
 use anyhow::{Context, Result, bail};
 use rkyv::{Archive, Deserialize, Serialize};
 
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const WIRE_MAGIC: [u8; 4] = *b"SPS1";
+pub const WIRE_CODEC_RKYV: u8 = 1;
+pub const WIRE_ENDIAN_LITTLE: u8 = 1;
+pub const WIRE_ENDIAN_BIG: u8 = 2;
+
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub enum Frame {
+    HelloRequest(HelloRequest),
+    HelloResponse(HelloResponse),
     InitFileRequest(InitFileRequest),
     InitFileResponse(InitFileResponse),
     InitBatchRequest(InitBatchRequest),
@@ -17,6 +27,62 @@ pub enum Frame {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct HelloRequest {
+    pub protocol_version: u16,
+    pub codec: WireCodec,
+    pub endianness: WireEndianness,
+    pub binary_version: String,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct HelloResponse {
+    pub protocol_version: u16,
+    pub codec: WireCodec,
+    pub endianness: WireEndianness,
+    pub binary_version: String,
+    pub accepted: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[archive(check_bytes)]
+pub enum WireCodec {
+    Rkyv,
+}
+
+#[derive(Debug, Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[archive(check_bytes)]
+pub enum WireEndianness {
+    Little,
+    Big,
+}
+
+pub fn local_wire_codec() -> WireCodec {
+    WireCodec::Rkyv
+}
+
+pub fn local_wire_endianness() -> WireEndianness {
+    #[cfg(target_endian = "little")]
+    {
+        WireEndianness::Little
+    }
+    #[cfg(target_endian = "big")]
+    {
+        WireEndianness::Big
+    }
+}
+
+fn local_wire_endianness_id() -> u8 {
+    match local_wire_endianness() {
+        WireEndianness::Little => WIRE_ENDIAN_LITTLE,
+        WireEndianness::Big => WIRE_ENDIAN_BIG,
+    }
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct InitFileRequest {
     pub relative_path: String,
     pub size: u64,
@@ -29,6 +95,7 @@ pub struct InitFileRequest {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct InitFileResponse {
     pub action: InitAction,
     pub next_chunk: usize,
@@ -36,12 +103,14 @@ pub struct InitFileResponse {
 }
 
 #[derive(Debug, Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[archive(check_bytes)]
 pub enum InitAction {
     Skip,
     Upload,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadBatchRequest {
     pub relative_path: String,
     pub size: u64,
@@ -56,6 +125,7 @@ pub struct UploadBatchRequest {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadBatchResponse {
     pub accepted: bool,
     pub message: String,
@@ -65,16 +135,19 @@ pub struct UploadBatchResponse {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct InitBatchRequest {
     pub files: Vec<InitFileRequest>,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct InitBatchResponse {
     pub results: Vec<InitBatchResult>,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct InitBatchResult {
     pub action: InitAction,
     pub next_chunk: usize,
@@ -82,11 +155,13 @@ pub struct InitBatchResult {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadSmallBatchRequest {
     pub files: Vec<UploadSmallFileMeta>,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadSmallFileMeta {
     pub relative_path: String,
     pub size: u64,
@@ -100,11 +175,13 @@ pub struct UploadSmallFileMeta {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadSmallBatchResponse {
     pub results: Vec<UploadSmallFileResult>,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadSmallFileResult {
     pub accepted: bool,
     pub skipped: bool,
@@ -113,12 +190,14 @@ pub struct UploadSmallFileResult {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadColdBatchRequest {
     pub allow_skip: bool,
     pub files: Vec<UploadColdFileMeta>,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadColdFileMeta {
     pub relative_path: String,
     pub size: u64,
@@ -132,11 +211,13 @@ pub struct UploadColdFileMeta {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadColdBatchResponse {
     pub results: Vec<UploadColdFileResult>,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct UploadColdFileResult {
     pub accepted: bool,
     pub skipped: bool,
@@ -145,6 +226,7 @@ pub struct UploadColdFileResult {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct ErrorFrame {
     pub message: String,
 }
@@ -158,7 +240,7 @@ pub struct ChunkPacketRef<'a> {
 
 const CHUNK_ENTRY_HEADER_SIZE: usize = 9;
 const CHUNK_FLAG_COMPRESSED: u8 = 1;
-pub const FRAME_PREFIX_LEN: usize = 8;
+pub const FRAME_PREFIX_LEN: usize = 16;
 
 pub fn encode(frame: &Frame, payload: Option<&[u8]>) -> Result<Vec<u8>> {
     let payload_len = payload.map_or(0usize, |p| p.len());
@@ -182,6 +264,10 @@ pub fn encode_header(frame: &Frame, payload_len: usize) -> Result<Vec<u8>> {
     }
 
     let mut out = Vec::with_capacity(FRAME_PREFIX_LEN + frame_bytes.len());
+    out.extend_from_slice(&WIRE_MAGIC);
+    out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    out.push(WIRE_CODEC_RKYV);
+    out.push(local_wire_endianness_id());
     out.extend_from_slice(&(frame_bytes.len() as u32).to_be_bytes());
     out.extend_from_slice(&(payload_len as u32).to_be_bytes());
     out.extend_from_slice(&frame_bytes);
@@ -197,8 +283,34 @@ pub fn frame_total_len(prefix: &[u8]) -> Result<usize> {
         );
     }
 
-    let header_len = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
-    let payload_len = u32::from_be_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as usize;
+    if prefix[0..4] != WIRE_MAGIC {
+        bail!(
+            "wire magic mismatch: got {:02x?} expected {:02x?}",
+            &prefix[0..4],
+            WIRE_MAGIC
+        );
+    }
+    let wire_protocol = u16::from_be_bytes([prefix[4], prefix[5]]);
+    if wire_protocol != PROTOCOL_VERSION {
+        bail!(
+            "wire protocol mismatch: peer={} local={}",
+            wire_protocol,
+            PROTOCOL_VERSION
+        );
+    }
+    if prefix[6] != WIRE_CODEC_RKYV {
+        bail!("unsupported wire codec id {}", prefix[6]);
+    }
+    if prefix[7] != local_wire_endianness_id() {
+        bail!(
+            "wire endianness mismatch: peer={} local={}",
+            prefix[7],
+            local_wire_endianness_id()
+        );
+    }
+
+    let header_len = u32::from_be_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]) as usize;
+    let payload_len = u32::from_be_bytes([prefix[12], prefix[13], prefix[14], prefix[15]]) as usize;
 
     FRAME_PREFIX_LEN
         .checked_add(header_len)
@@ -212,8 +324,8 @@ pub fn decode(bytes: &[u8]) -> Result<(Frame, &[u8])> {
     }
 
     let expected = frame_total_len(bytes)?;
-    let header_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    let payload_len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let header_len = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    let payload_len = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
 
     if expected != bytes.len() {
         bail!(
@@ -228,9 +340,8 @@ pub fn decode(bytes: &[u8]) -> Result<(Frame, &[u8])> {
     let payload_start = header_end;
     let payload_end = payload_start + payload_len;
 
-    // Framing validates exact header bounds; decode avoids additional validation pass.
-    let frame = unsafe { rkyv::from_bytes_unchecked::<Frame>(&bytes[header_start..header_end]) }
-        .context("deserialize frame (rkyv)")?;
+    let frame = rkyv::from_bytes::<Frame>(&bytes[header_start..header_end])
+        .map_err(|err| anyhow::anyhow!("deserialize frame (rkyv + validation): {err}"))?;
 
     Ok((frame, &bytes[payload_start..payload_end]))
 }
@@ -367,4 +478,57 @@ pub fn split_cold_file_payload<'a>(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello_request() -> Frame {
+        Frame::HelloRequest(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            codec: local_wire_codec(),
+            endianness: local_wire_endianness(),
+            binary_version: BINARY_VERSION.to_string(),
+        })
+    }
+
+    #[test]
+    fn roundtrip_hello_uses_wire_preamble() {
+        let bytes = encode(&hello_request(), None).expect("encode hello");
+        assert_eq!(&bytes[0..4], &WIRE_MAGIC);
+        assert_eq!([bytes[4], bytes[5]], PROTOCOL_VERSION.to_be_bytes());
+        assert_eq!(bytes[6], WIRE_CODEC_RKYV);
+
+        let (frame, payload) = decode(&bytes).expect("decode hello");
+        assert!(payload.is_empty());
+        match frame {
+            Frame::HelloRequest(req) => {
+                assert_eq!(req.protocol_version, PROTOCOL_VERSION);
+                assert_eq!(req.codec, local_wire_codec());
+                assert_eq!(req.endianness, local_wire_endianness());
+                assert_eq!(req.binary_version, BINARY_VERSION);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_bad_wire_magic_before_rkyv_decode() {
+        let mut bytes = encode(&hello_request(), None).expect("encode hello");
+        bytes[0] ^= 0xff;
+        let err = decode(&bytes).expect_err("decode should fail");
+        assert!(err.to_string().contains("wire magic mismatch"));
+    }
+
+    #[test]
+    fn decode_rejects_endianness_mismatch_before_rkyv_decode() {
+        let mut bytes = encode(&hello_request(), None).expect("encode hello");
+        bytes[7] = match bytes[7] {
+            WIRE_ENDIAN_LITTLE => WIRE_ENDIAN_BIG,
+            _ => WIRE_ENDIAN_LITTLE,
+        };
+        let err = decode(&bytes).expect_err("decode should fail");
+        assert!(err.to_string().contains("wire endianness mismatch"));
+    }
 }

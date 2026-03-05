@@ -272,6 +272,10 @@ impl StateStore {
         self.persist_if_needed(false).await
     }
 
+    pub async fn flush(&self) -> Result<()> {
+        self.persist_if_needed(true).await
+    }
+
     async fn persist(&self, bytes: Vec<u8>) -> Result<()> {
         let tmp = self
             .state_path
