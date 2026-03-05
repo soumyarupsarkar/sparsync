@@ -1,6 +1,7 @@
 use crate::certs;
 use crate::compression;
 use crate::endpoint::RemoteEndpoint;
+use crate::filter::PathFilter;
 use crate::model::FileManifest;
 use crate::protocol::{
     Frame, HelloRequest, HelloResponse, InitAction, InitBatchRequest, InitFileRequest,
@@ -22,6 +23,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -51,8 +53,11 @@ pub struct PushOptions {
     pub operation_timeout: Duration,
     pub max_stream_payload: usize,
     pub resume: bool,
+    pub update_only: bool,
     pub cold_start: bool,
     pub manifest_out: Option<PathBuf>,
+    pub path_filter: Option<PathFilter>,
+    pub bwlimit_kbps: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,9 +70,12 @@ pub struct PushOverSshOptions {
     pub compression_level: i32,
     pub max_stream_payload: usize,
     pub resume: bool,
+    pub update_only: bool,
     pub cold_start: bool,
     pub manifest_out: Option<PathBuf>,
     pub preserve_metadata: bool,
+    pub path_filter: Option<PathFilter>,
+    pub bwlimit_kbps: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,9 +140,11 @@ struct FileTransferOptions {
     compression_level: i32,
     max_stream_payload: usize,
     resume: bool,
+    update_only: bool,
     stats: TransferStats,
     small_file_max_bytes: u64,
     direct_file_max_bytes: u64,
+    bw_limiter: Option<BwLimiter>,
 }
 
 #[derive(Default)]
@@ -334,6 +344,53 @@ impl SshProfile {
     }
 }
 
+#[derive(Clone)]
+struct BwLimiter {
+    bytes_per_sec: u64,
+    state: Arc<Mutex<BwLimiterState>>,
+}
+
+#[derive(Debug)]
+struct BwLimiterState {
+    started: Option<Instant>,
+    sent_bytes: u64,
+}
+
+impl BwLimiter {
+    fn from_kbps(kbps: Option<u64>) -> Option<Self> {
+        let kbps = kbps.filter(|value| *value > 0)?;
+        Some(Self {
+            bytes_per_sec: kbps.saturating_mul(1024),
+            state: Arc::new(Mutex::new(BwLimiterState {
+                started: None,
+                sent_bytes: 0,
+            })),
+        })
+    }
+
+    async fn throttle(&self, bytes: usize) {
+        if bytes == 0 || self.bytes_per_sec == 0 {
+            return;
+        }
+        let sleep_for = {
+            let mut guard = match self.state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            let now = Instant::now();
+            let started = *guard.started.get_or_insert(now);
+            guard.sent_bytes = guard.sent_bytes.saturating_add(bytes as u64);
+            let expected =
+                Duration::from_secs_f64(guard.sent_bytes as f64 / self.bytes_per_sec as f64);
+            let elapsed = started.elapsed();
+            expected.saturating_sub(elapsed)
+        };
+        if !sleep_for.is_zero() {
+            spargio::sleep(sleep_for).await;
+        }
+    }
+}
+
 fn small_file_max_bytes_from_env() -> u64 {
     std::env::var("SPARSYNC_SMALL_FILE_MAX_BYTES")
         .ok()
@@ -434,10 +491,24 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         return Ok(summary);
     }
 
-    let (manifest, scan_stats) =
+    let (mut manifest, scan_stats) =
         scan::build_manifest(handle.clone(), &options.source, options.scan)
             .await
             .with_context(|| format!("build source manifest {}", options.source.display()))?;
+    if let Some(path_filter) = options.path_filter.as_ref() {
+        let before = manifest.files.len();
+        manifest
+            .files
+            .retain(|file| path_filter.allows(&file.relative_path));
+        manifest.total_bytes = manifest.files.iter().map(|item| item.size).sum();
+        if manifest.files.len() != before {
+            println!(
+                "filter applied kept_files={} dropped_files={}",
+                manifest.files.len(),
+                before.saturating_sub(manifest.files.len())
+            );
+        }
+    }
 
     if let Some(path) = &options.manifest_out {
         let bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -460,9 +531,11 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         compression_level: options.compression_level,
         max_stream_payload: options.max_stream_payload,
         resume: options.resume,
+        update_only: options.update_only,
         stats: stats.clone(),
         small_file_max_bytes: small_file_max_bytes_from_env(),
         direct_file_max_bytes: direct_file_max_bytes_from_env(),
+        bw_limiter: BwLimiter::from_kbps(options.bwlimit_kbps),
     };
 
     let (small_files, large_files) = partition_small_files(
@@ -593,6 +666,7 @@ pub async fn push_directory_over_ssh_stdio(
     let started = Instant::now();
     let stats = TransferStats::from_env();
     let ssh_profile = SshProfile::from_env();
+    let bw_limiter = BwLimiter::from_kbps(options.bwlimit_kbps);
 
     let connect_started = Instant::now();
     let mut session = SshFrameSession::connect(
@@ -604,6 +678,7 @@ pub async fn push_directory_over_ssh_stdio(
         options.preserve_metadata,
         &stats,
         ssh_profile.clone(),
+        bw_limiter.clone(),
     )
     .await
     .context("open SSH stdio data session")?;
@@ -628,10 +703,24 @@ pub async fn push_directory_over_ssh_stdio(
         return Ok(summary);
     }
 
-    let (manifest, scan_stats) =
+    let (mut manifest, scan_stats) =
         scan::build_manifest(handle.clone(), &options.source, options.scan)
             .await
             .with_context(|| format!("build source manifest {}", options.source.display()))?;
+    if let Some(path_filter) = options.path_filter.as_ref() {
+        let before = manifest.files.len();
+        manifest
+            .files
+            .retain(|file| path_filter.allows(&file.relative_path));
+        manifest.total_bytes = manifest.files.iter().map(|item| item.size).sum();
+        if manifest.files.len() != before {
+            println!(
+                "filter applied kept_files={} dropped_files={}",
+                manifest.files.len(),
+                before.saturating_sub(manifest.files.len())
+            );
+        }
+    }
     ssh_profile.add_scan_time(scan_stats.total_elapsed);
 
     if let Some(path) = &options.manifest_out {
@@ -655,9 +744,11 @@ pub async fn push_directory_over_ssh_stdio(
         compression_level: options.compression_level,
         max_stream_payload: options.max_stream_payload,
         resume: options.resume,
+        update_only: options.update_only,
         stats: stats.clone(),
         small_file_max_bytes: small_file_max_bytes_from_env(),
         direct_file_max_bytes: direct_file_max_bytes_from_env(),
+        bw_limiter: BwLimiter::from_kbps(options.bwlimit_kbps),
     };
 
     let (small_files, large_files) = partition_small_files(
@@ -727,7 +818,7 @@ async fn push_directory_over_ssh_cold(
     started: Instant,
 ) -> Result<PushSummary> {
     let chunk_size = options.scan.chunk_size.max(1);
-    let (source_root, files, enumeration_elapsed, metadata_elapsed) = scan::build_file_list(
+    let (source_root, mut files, enumeration_elapsed, metadata_elapsed) = scan::build_file_list(
         handle.clone(),
         &options.source,
         options.scan.scan_workers.max(1),
@@ -735,6 +826,17 @@ async fn push_directory_over_ssh_cold(
     )
     .await
     .with_context(|| format!("build cold file list {}", options.source.display()))?;
+    if let Some(path_filter) = options.path_filter.as_ref() {
+        let before = files.len();
+        files.retain(|file| path_filter.allows(&file.relative_path));
+        if files.len() != before {
+            println!(
+                "filter applied kept_files={} dropped_files={}",
+                files.len(),
+                before.saturating_sub(files.len())
+            );
+        }
+    }
     ssh_profile.add_scan_time(enumeration_elapsed.saturating_add(metadata_elapsed));
 
     let total_bytes = files.iter().map(|item| item.size).sum::<u64>();
@@ -879,6 +981,7 @@ async fn initialize_large_files_over_ssh(
                     size: file.size,
                     mode: file.mode,
                     mtime_sec: file.mtime_sec,
+                    update_only: options.update_only,
                     file_hash: file.file_hash.clone(),
                     chunk_size: options.chunk_size,
                     total_chunks: file.total_chunks,
@@ -942,6 +1045,7 @@ async fn transfer_small_batch_over_ssh(
                 size: file.size,
                 mode: file.mode,
                 mtime_sec: file.mtime_sec,
+                update_only: options.update_only,
                 file_hash: file.file_hash.clone(),
                 chunk_size: options.chunk_size,
                 total_chunks: file.total_chunks,
@@ -1256,6 +1360,7 @@ struct SshFrameSession<'a> {
     response_buffer: Vec<u8>,
     response_frame_len: Option<usize>,
     finished: bool,
+    bw_limiter: Option<BwLimiter>,
 }
 
 impl<'a> SshFrameSession<'a> {
@@ -1268,6 +1373,7 @@ impl<'a> SshFrameSession<'a> {
         preserve_metadata: bool,
         stats: &'a TransferStats,
         profile: SshProfile,
+        bw_limiter: Option<BwLimiter>,
     ) -> Result<Self> {
         let remote_shell_prefix =
             remote_shell_prefix.unwrap_or("PATH=\"$HOME/.local/bin:$PATH\" sparsync");
@@ -1325,6 +1431,7 @@ impl<'a> SshFrameSession<'a> {
             response_buffer: Vec::with_capacity(64 * 1024),
             response_frame_len: None,
             finished: false,
+            bw_limiter,
         })
     }
 
@@ -1352,6 +1459,9 @@ impl<'a> SshFrameSession<'a> {
         self.stats.add_control_frame();
         self.stats.add_request_bytes(encoded_len);
         self.profile.add_frame_sent();
+        if let Some(limiter) = &self.bw_limiter {
+            limiter.throttle(encoded_len).await;
+        }
         let sent_at = Instant::now();
 
         self.write_all(frame_header.as_ref())
@@ -1815,7 +1925,7 @@ async fn push_directory_cold(
     stats: TransferStats,
 ) -> Result<PushSummary> {
     let chunk_size = options.scan.chunk_size.max(1);
-    let (source_root, files, enumeration_elapsed, metadata_elapsed) = scan::build_file_list(
+    let (source_root, mut files, enumeration_elapsed, metadata_elapsed) = scan::build_file_list(
         handle.clone(),
         &options.source,
         options.scan.scan_workers.max(1),
@@ -1823,6 +1933,17 @@ async fn push_directory_cold(
     )
     .await
     .with_context(|| format!("build cold file list {}", options.source.display()))?;
+    if let Some(path_filter) = options.path_filter.as_ref() {
+        let before = files.len();
+        files.retain(|file| path_filter.allows(&file.relative_path));
+        if files.len() != before {
+            println!(
+                "filter applied kept_files={} dropped_files={}",
+                files.len(),
+                before.saturating_sub(files.len())
+            );
+        }
+    }
 
     let total_bytes = files.iter().map(|item| item.size).sum::<u64>();
     println!(
@@ -2279,9 +2400,14 @@ async fn initialize_large_files(
     if init_batches.is_empty() {
         return Ok((totals, uploads));
     }
-    let mut session = FrameSession::open(connection, options.max_stream_payload, &options.stats)
-        .await
-        .context("open large-file init stream")?;
+    let mut session = FrameSession::open(
+        connection,
+        options.max_stream_payload,
+        &options.stats,
+        options.bw_limiter.clone(),
+    )
+    .await
+    .context("open large-file init stream")?;
 
     for batch in init_batches {
         let init_request = Frame::InitBatchRequest(InitBatchRequest {
@@ -2292,6 +2418,7 @@ async fn initialize_large_files(
                     size: file.size,
                     mode: file.mode,
                     mtime_sec: file.mtime_sec,
+                    update_only: options.update_only,
                     file_hash: file.file_hash.clone(),
                     chunk_size: options.chunk_size,
                     total_chunks: file.total_chunks,
@@ -2349,9 +2476,14 @@ async fn transfer_small_batch(
         return Ok(BatchResult::default());
     }
 
-    let mut session = FrameSession::open(connection, options.max_stream_payload, &options.stats)
-        .await
-        .context("open small-batch stream")?;
+    let mut session = FrameSession::open(
+        connection,
+        options.max_stream_payload,
+        &options.stats,
+        options.bw_limiter.clone(),
+    )
+    .await
+    .context("open small-batch stream")?;
 
     let init_request = Frame::InitBatchRequest(InitBatchRequest {
         files: files
@@ -2361,6 +2493,7 @@ async fn transfer_small_batch(
                 size: file.size,
                 mode: file.mode,
                 mtime_sec: file.mtime_sec,
+                update_only: options.update_only,
                 file_hash: file.file_hash.clone(),
                 chunk_size: options.chunk_size,
                 total_chunks: file.total_chunks,
@@ -2548,9 +2681,14 @@ async fn upload_file_batches(
     let mut raw_bytes = 0u64;
     let mut inflight = VecDeque::with_capacity(upload_window);
     let mut payload_pool: Vec<Vec<u8>> = Vec::with_capacity(upload_window);
-    let mut session = FrameSession::open(connection, options.max_stream_payload, &options.stats)
-        .await
-        .with_context(|| format!("open upload stream for {}", file.relative_path))?;
+    let mut session = FrameSession::open(
+        connection,
+        options.max_stream_payload,
+        &options.stats,
+        options.bw_limiter.clone(),
+    )
+    .await
+    .with_context(|| format!("open upload stream for {}", file.relative_path))?;
 
     loop {
         while inflight.len() < upload_window && !finalize_sent {
@@ -2785,7 +2923,7 @@ async fn send_frame_roundtrip(
     max_stream_payload: usize,
     stats: &TransferStats,
 ) -> Result<Frame> {
-    let mut session = FrameSession::open(connection, max_stream_payload, stats).await?;
+    let mut session = FrameSession::open(connection, max_stream_payload, stats, None).await?;
     let frame = session.roundtrip(request, payload).await?;
     session.finish().context("finish request stream")?;
     Ok(frame)
@@ -2849,6 +2987,7 @@ struct FrameSession<'a> {
     stats: &'a TransferStats,
     response_buffer: Vec<u8>,
     response_frame_len: Option<usize>,
+    bw_limiter: Option<BwLimiter>,
 }
 
 impl<'a> FrameSession<'a> {
@@ -2856,6 +2995,7 @@ impl<'a> FrameSession<'a> {
         connection: &QuicConnection,
         max_stream_payload: usize,
         stats: &'a TransferStats,
+        bw_limiter: Option<BwLimiter>,
     ) -> Result<Self> {
         let (send, recv) = connection
             .open_bi()
@@ -2869,6 +3009,7 @@ impl<'a> FrameSession<'a> {
             stats,
             response_buffer: Vec::with_capacity(64 * 1024),
             response_frame_len: None,
+            bw_limiter,
         })
     }
 
@@ -2894,6 +3035,9 @@ impl<'a> FrameSession<'a> {
         }
         self.stats.add_control_frame();
         self.stats.add_request_bytes(encoded_len);
+        if let Some(limiter) = &self.bw_limiter {
+            limiter.throttle(encoded_len).await;
+        }
 
         let sent_at = Instant::now();
         self.send

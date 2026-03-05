@@ -21,6 +21,9 @@ Goal: become the fastest lightweight Rust rsync-style sync tool for large trees 
 - Auth CLI for mTLS lifecycle (`auth init-server|issue-client|revoke-client|rotate|status`)
 - Structured auth audit logs for allow/deny and per-connection bytes transferred
 - SSH bootstrap + one-command local->remote sync (`sync /src user@host:/dest`)
+- rsync-like primary invocation (`sparsync [OPTIONS] SRC DEST`)
+- Endpoint auto transport (`ssh` for SSH-style remotes, QUIC for `sparsync://`)
+- Explicit enrollment and server lifecycle commands (`enroll`, `server start|stop|status`)
 - Synthetic benchmark harness for scan/task/I/O pressure
 
 ## Quick Start
@@ -119,22 +122,51 @@ Push using mTLS credentials:
 Audit events are emitted on `sparsync::audit` (allow/deny decisions, authorized client identity,
 destination path denials, and bytes written per connection).
 
-## One-Command SSH Bootstrap Sync
+## Rsync-Style Sync
 
-For local->remote sync, `sync` defaults to:
-
-- `--bootstrap ssh`
-- `--transport quic`
-- `--install ephemeral` (uploads `sparsync` to a remote temp path for this sync only)
+Primary UX:
 
 Example:
 
 ```bash
-./target/release/sparsync sync /data/source user@sync-host:/data/replica
+./target/release/sparsync -av /data/source user@sync-host:/data/replica
 ```
 
-This flow bootstraps remote auth material, issues client credentials, launches a one-shot remote
-receiver, transfers over QUIC+mTLS, and stores a local profile for reuse.
+Transport defaults:
+
+- SSH-style remote (`user@host:/path`, `ssh://...`) => SSH stdio transport
+- `sparsync://host[:port]/path` => QUIC transport
+
+Explicit bootstrap for QUIC from SSH:
+
+```bash
+./target/release/sparsync -av \
+  --transport quic \
+  --bootstrap ssh \
+  --ssh-target user@sync-host \
+  /data/source sparsync://sync-host:7844/data/replica
+```
+
+## Enrollment and Server Lifecycle
+
+One-time enrollment:
+
+```bash
+./target/release/sparsync enroll user@sync-host:/data/replica
+```
+
+Manage remote long-lived server:
+
+```bash
+./target/release/sparsync server start user@sync-host --destination /data/replica
+./target/release/sparsync server status user@sync-host
+./target/release/sparsync server stop user@sync-host
+```
+
+Local secrets (certs/keys) are stored under XDG data by default:
+
+- `$XDG_DATA_HOME/sparsync/secrets` (or `~/.local/share/sparsync/secrets`)
+- Config/profiles remain under `$XDG_CONFIG_HOME/sparsync` (or `~/.config/sparsync`)
 
 ## Scan Command
 

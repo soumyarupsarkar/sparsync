@@ -7,12 +7,19 @@ pub enum Endpoint {
     Remote(RemoteEndpoint),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteKind {
+    Ssh,
+    Quic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteEndpoint {
     pub user: Option<String>,
     pub host: String,
     pub port: Option<u16>,
     pub path: String,
+    pub kind: RemoteKind,
 }
 
 impl RemoteEndpoint {
@@ -21,6 +28,14 @@ impl RemoteEndpoint {
             Some(user) => format!("{user}@{}", self.host),
             None => self.host.clone(),
         }
+    }
+
+    pub fn is_quic(&self) -> bool {
+        matches!(self.kind, RemoteKind::Quic)
+    }
+
+    pub fn is_ssh(&self) -> bool {
+        matches!(self.kind, RemoteKind::Ssh)
     }
 }
 
@@ -53,6 +68,24 @@ fn parse_user_host_port(input: &str) -> Result<(Option<String>, String, Option<u
 }
 
 pub fn parse_endpoint(value: &str) -> Result<Endpoint> {
+    if let Some(raw) = value.strip_prefix("sparsync://") {
+        let (host_part, path_part) = raw
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("sparsync endpoint missing path: {}", value))?;
+        let (user, host, port) = parse_user_host_port(host_part)?;
+        let path = format!("/{}", path_part);
+        if path == "/" {
+            bail!("remote path is empty");
+        }
+        return Ok(Endpoint::Remote(RemoteEndpoint {
+            user,
+            host,
+            port,
+            path,
+            kind: RemoteKind::Quic,
+        }));
+    }
+
     if let Some(raw) = value.strip_prefix("ssh://") {
         let (host_part, path_part) = raw
             .split_once('/')
@@ -67,6 +100,7 @@ pub fn parse_endpoint(value: &str) -> Result<Endpoint> {
             host,
             port,
             path,
+            kind: RemoteKind::Ssh,
         }));
     }
 
@@ -83,6 +117,7 @@ pub fn parse_endpoint(value: &str) -> Result<Endpoint> {
                     host,
                     port,
                     path: path.to_string(),
+                    kind: RemoteKind::Ssh,
                 }));
             }
         }
@@ -93,7 +128,7 @@ pub fn parse_endpoint(value: &str) -> Result<Endpoint> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Endpoint, parse_endpoint};
+    use super::{Endpoint, RemoteKind, parse_endpoint};
 
     #[test]
     fn parses_scp_style_remote() {
@@ -104,6 +139,7 @@ mod tests {
                 assert_eq!(remote.host, "example.com");
                 assert_eq!(remote.port, None);
                 assert_eq!(remote.path, "/srv/data");
+                assert_eq!(remote.kind, RemoteKind::Ssh);
             }
             other => panic!("expected remote endpoint, got {other:?}"),
         }
@@ -118,6 +154,22 @@ mod tests {
                 assert_eq!(remote.host, "example.com");
                 assert_eq!(remote.port, Some(2222));
                 assert_eq!(remote.path, "/srv/data");
+                assert_eq!(remote.kind, RemoteKind::Ssh);
+            }
+            other => panic!("expected remote endpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_quic_url_remote() {
+        let parsed = parse_endpoint("sparsync://example.com:7844/srv/data").expect("parse remote");
+        match parsed {
+            Endpoint::Remote(remote) => {
+                assert_eq!(remote.user, None);
+                assert_eq!(remote.host, "example.com");
+                assert_eq!(remote.port, Some(7844));
+                assert_eq!(remote.path, "/srv/data");
+                assert_eq!(remote.kind, RemoteKind::Quic);
             }
             other => panic!("expected remote endpoint, got {other:?}"),
         }

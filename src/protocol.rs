@@ -88,6 +88,7 @@ pub struct InitFileRequest {
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub update_only: bool,
     pub file_hash: String,
     pub chunk_size: usize,
     pub total_chunks: usize,

@@ -23,5 +23,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zstd = "0.13"
 io-uring = "0.7"
 libc = "0.2"
+globset = "0.4"
 spargio = { version = "0.5.8", features = ["uring-native"] }
 spargio-quic = "0.5.8"

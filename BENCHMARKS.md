@@ -1,5 +1,33 @@
 # Benchmark Summary
 
+## Post-Compat Snapshot (March 5, 2026)
+
+After implementing `RSYNC_COMPAT` flows (rsync-style CLI, `enroll`, `server` lifecycle, local/SSH/QUIC paths, reverse direction orchestration), median benchmark reruns were executed with:
+
+- `RUNS=3 TRANSPORTS=ssh ./scripts/bench_remote_rsync_vs_sparsync_median.sh`
+- `RUNS=3 TRANSPORTS=daemon ./scripts/bench_remote_rsync_vs_sparsync_median.sh`
+
+Dataset (median across runs):
+
+- `files=1008`
+- `bytes=20873216`
+
+### SSH Transport (`RUNS=3`)
+
+| Metric | sparsync (ms) | rsync over SSH (ms) | sparsync / rsync |
+|---|---:|---:|---:|
+| Initial sync | 403 | 510 | 0.79x |
+| Second sync (no changes) | 34 | 244 | 0.14x |
+| Changed sync | 56 | 260 | 0.22x |
+
+### Daemon Transport (`RUNS=3`)
+
+| Metric | sparsync (ms) | rsync daemon (ms) | sparsync / rsync |
+|---|---:|---:|---:|
+| Initial sync | 396 | 228 | 1.74x |
+| Second sync (no changes) | 31 | 137 | 0.23x |
+| Changed sync | 57 | 156 | 0.37x |
+
 ## Latest Snapshot (March 4, 2026)
 
 Remote-style comparison was run with:
@@ -61,6 +89,24 @@ Experimental notes:
 - `--cold-start` is implemented. In a 3-run sample on this dataset, first-sync median was `491ms` (`sparsync_first_ms`) versus `229ms` (`rsync_remote_first_ms`), so it remains slower than the normal path here.
 - Server write fan-out can be tuned with `SPARSYNC_BATCH_WRITE_CONCURRENCY` (auto-tuned by default).
 - Latest profiled first-sync pass shows `control_frames=5` and `streams_opened=4` (from `SPARSYNC_PROFILE=1`), reflecting one fewer client stream open than prior snapshots due to long-lived framed stream reuse.
+
+## Compatibility Refactor Smoke (March 5, 2026)
+
+Quick post-`RSYNC_COMPAT` implementation sanity run:
+
+- Command:
+  - `SMALL_DIRS=2 SMALL_FILES_PER_DIR=20 LARGE_FILES=2 CHANGED_FILES=10 RSYNC_TRANSPORT=ssh ./scripts/bench_remote_rsync_vs_sparsync.sh`
+- Dataset:
+  - `files=42`
+  - `bytes=4358144`
+
+| Metric | sparsync (ms) | rsync over SSH (ms) | sparsync / rsync |
+|---|---:|---:|---:|
+| Initial sync | 128 | 343 | 0.37x |
+| Second sync (no changes) | 17 | 237 | 0.07x |
+| Changed sync | 27 | 236 | 0.11x |
+
+Note: this is a reduced-size smoke dataset to validate behavior after major CLI/transport compatibility changes, not a replacement for full benchmark medians.
 
 ## Profiling Notes (March 4, 2026)
 

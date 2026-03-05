@@ -478,6 +478,27 @@ async fn initialize_one_file_with_relative(
 
     let final_path = context.destination.join(relative);
     let partial = partial_path(context.state.partial_root(), relative);
+    if req.update_only {
+        match fs::metadata_lite(&context.handle, &final_path).await {
+            Ok(meta) if meta.is_file() && meta.mtime_sec > req.mtime_sec => {
+                return Ok(InitFileResponse {
+                    action: InitAction::Skip,
+                    next_chunk: req.total_chunks,
+                    message: format!(
+                        "destination is newer (dst_mtime={} src_mtime={})",
+                        meta.mtime_sec, req.mtime_sec
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("read destination metadata {}", final_path.display())
+                });
+            }
+        }
+    }
 
     if prepare_dirs {
         if let Some(parent) = final_path.parent() {
