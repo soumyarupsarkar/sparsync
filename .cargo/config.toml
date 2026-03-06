@@ -1,3 +1,0 @@
-[patch.crates-io]
-spargio = { path = "/workspace/spargio" }
-spargio-quic = { path = "/workspace/spargio/crates/spargio-quic" }
