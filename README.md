@@ -45,6 +45,8 @@ However, sometimes I kick off a sync for a large file tree (e.g., home dir backu
 ## When shouldn't I use sparsync?
 For maximum performance, `sparsync` requires running a daemon on the server and connecting through UDP (QUIC) ports. If this isn't possible, `sparsync` still works but it likely won't be faster than just using `rsync`.
 
+Additionally, sparsync trades off portability for performance: it is Linux-only (kernel version 6.0+ recommended for io_uring/msg_ring support), and strictly enforces compatibility between clients and servers (matching protocol expectations including endianness and binary version). This is often the case when transferring files between machines, but when it isn't, sparsync will fail early with an explicit error message without initiating data transfer instead of falling back to a slower compatibility mode.
+
 ## Disclaimer
 Like `spargio`, this is an experimental crate, with contributions from Codex that haven't been fully audited yet. Keep backups and do not use in production.
 
@@ -199,4 +201,3 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE).
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in `sparsync` by you shall be licensed as MIT, without any
 additional terms or conditions.
-
