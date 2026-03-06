@@ -1,5 +1,37 @@
 # Benchmark Summary
 
+## Latest Snapshot (March 6, 2026)
+
+After QUIC no-change overhead reductions (`7f3137c`), median benchmark reruns were executed with:
+
+- `RUNS=3 TRANSPORTS=ssh ./scripts/bench_remote_rsync_vs_sparsync_median.sh`
+
+Dataset (median across runs):
+
+- `files=1008`
+- `bytes=20873216`
+
+### Baseline Harness (`RUNS=3`, QUIC vs rsync over SSH)
+
+| Metric | sparsync QUIC (ms) | rsync over SSH (ms) | sparsync / rsync |
+|---|---:|---:|---:|
+| Initial sync | 416 | 520 | 0.80x |
+| Second sync (no changes) | 26 | 245 | 0.11x |
+| Changed sync | 51 | 263 | 0.19x |
+
+### Unified 3-Mode Comparison (`RUNS=3`, same per-run dataset for all modes)
+
+| Mode | Initial sync (ms) | Second sync (ms) | Changed sync (ms) |
+|---|---:|---:|---:|
+| rsync over SSH | 514 | 247 | 261 |
+| sparsync over QUIC | 436 | 29 | 51 |
+| sparsync over SSH stdio | 896 | 490 | 511 |
+
+Ratios vs `rsync over SSH` in the unified run:
+
+- `sparsync over QUIC`: `0.85x` (first), `0.12x` (second), `0.20x` (changed)
+- `sparsync over SSH stdio`: `1.74x` (first), `1.98x` (second), `1.96x` (changed)
+
 ## Post-Compat Snapshot (March 5, 2026)
 
 After implementing `RSYNC_COMPAT` flows (rsync-style CLI, `enroll`, `server` lifecycle, local/SSH/QUIC paths, reverse direction orchestration), median benchmark reruns were executed with:
@@ -28,7 +60,7 @@ Dataset (median across runs):
 | Second sync (no changes) | 31 | 137 | 0.23x |
 | Changed sync | 57 | 156 | 0.37x |
 
-## Latest Snapshot (March 4, 2026)
+## Historical Snapshot (March 4, 2026)
 
 Remote-style comparison was run with:
 

@@ -221,6 +221,23 @@ Benchmark snapshot (March 5, 2026, localhost loopback):
   - `sparsync over quic (no mTLS)`: `1.10x` slower first, then `~7.3x` faster second and `~3.9x` faster changed
   - `sparsync over quic (mTLS)`: `1.04x` slower first, then `~6.9x` faster second and `~3.4x` faster changed
 
+## Update (March 6, 2026, Latest Loopback Snapshot)
+
+Recent reruns after QUIC no-change control-plane reductions show:
+
+- Baseline harness (`RUNS=3 TRANSPORTS=ssh ./scripts/bench_remote_rsync_vs_sparsync_median.sh`)
+  - `sparsync over QUIC`: first `416`, second `26`, changed `51`
+  - `rsync over SSH`: first `520`, second `245`, changed `263`
+- Unified 3-mode run (`RUNS=3`, same per-run dataset for all three modes)
+  - `rsync over SSH`: first `514`, second `247`, changed `261`
+  - `sparsync over QUIC`: first `436`, second `29`, changed `51`
+  - `sparsync over SSH stdio`: first `896`, second `490`, changed `511`
+
+Interpretation:
+
+- QUIC second-sync is back in the prior fast range (`~29ms` in unified runs, `26ms` in baseline medians).
+- SSH stdio remains substantially slower than `rsync -e ssh`; the major remaining gap is in SSH transport overhead, not QUIC.
+
 ## SSH Stdio Performance Remediation Plan (March 5, 2026)
 
 Goal:
