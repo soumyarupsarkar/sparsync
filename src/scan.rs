@@ -110,6 +110,67 @@ pub async fn build_manifest(
     Ok((manifest, stats))
 }
 
+pub async fn build_manifest_with_symlinks(
+    handle: RuntimeHandle,
+    root: &Path,
+    options: ScanOptions,
+) -> Result<(Manifest, Vec<FileEntry>, ScanStats)> {
+    let total_started = Instant::now();
+    let root = fs::canonicalize(&handle, root)
+        .await
+        .with_context(|| format!("canonicalize {}", root.display()))?;
+
+    let enum_started = Instant::now();
+    let (files, symlink_paths) =
+        enumerate_paths_split(handle.clone(), &root, options.scan_workers.max(1), true).await?;
+    let enumeration_elapsed = enum_started.elapsed();
+    let chunk_size = options.chunk_size.max(1);
+
+    let hash_cache = load_hash_cache(handle.clone(), &root, chunk_size).await;
+
+    let hash_started = Instant::now();
+    let file_manifests = hash_files(
+        handle.clone(),
+        &root,
+        files,
+        chunk_size,
+        options.hash_workers.max(1),
+        Arc::new(hash_cache),
+    )
+    .await?;
+    let hash_elapsed = hash_started.elapsed();
+
+    let symlink_entries = if symlink_paths.is_empty() {
+        Vec::new()
+    } else {
+        collect_file_metadata(
+            handle.clone(),
+            &root,
+            symlink_paths,
+            options.hash_workers.max(1),
+        )
+        .await?
+    };
+
+    persist_hash_cache(handle.clone(), &root, chunk_size, &file_manifests).await?;
+
+    let total_bytes = file_manifests.iter().map(|item| item.size).sum();
+    let manifest = Manifest {
+        root: root.to_string_lossy().into_owned(),
+        chunk_size,
+        files: file_manifests,
+        total_bytes,
+    };
+
+    let stats = ScanStats {
+        enumeration_elapsed,
+        hash_elapsed,
+        total_elapsed: total_started.elapsed(),
+    };
+
+    Ok((manifest, symlink_entries, stats))
+}
+
 pub async fn build_file_list(
     handle: RuntimeHandle,
     root: &Path,
@@ -138,8 +199,24 @@ async fn enumerate_paths(
     workers: usize,
     include_symlinks: bool,
 ) -> Result<Vec<PathBuf>> {
+    let (mut files, symlinks) =
+        enumerate_paths_split(handle, root, workers, include_symlinks).await?;
+    if include_symlinks {
+        files.extend(symlinks);
+        files.sort();
+    }
+    Ok(files)
+}
+
+async fn enumerate_paths_split(
+    handle: RuntimeHandle,
+    root: &Path,
+    workers: usize,
+    include_symlinks: bool,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let directories = Arc::new(Mutex::new(VecDeque::from([root.to_path_buf()])));
     let files = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+    let symlinks = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
     let in_progress = Arc::new(AtomicUsize::new(0));
 
     let mut joins = Vec::with_capacity(workers);
@@ -148,6 +225,7 @@ async fn enumerate_paths(
         let task_handle = handle.clone();
         let directories = Arc::clone(&directories);
         let files = Arc::clone(&files);
+        let symlinks = Arc::clone(&symlinks);
         let in_progress = Arc::clone(&in_progress);
 
         let join = handle
@@ -183,9 +261,9 @@ async fn enumerate_paths(
                                     guard.push(entry.path);
                                 }
                                 fs::DirEntryType::Symlink if include_symlinks => {
-                                    let mut guard = files
-                                        .lock()
-                                        .map_err(|_| anyhow::anyhow!("file list mutex poisoned"))?;
+                                    let mut guard = symlinks.lock().map_err(|_| {
+                                        anyhow::anyhow!("symlink list mutex poisoned")
+                                    })?;
                                     guard.push(entry.path);
                                 }
                                 _ => {}
@@ -217,9 +295,14 @@ async fn enumerate_paths(
         .map_err(|_| anyhow::anyhow!("scanner still holds file list"))?
         .into_inner()
         .map_err(|_| anyhow::anyhow!("file list mutex poisoned"))?;
+    let mut out_symlinks = Arc::try_unwrap(symlinks)
+        .map_err(|_| anyhow::anyhow!("scanner still holds symlink list"))?
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("symlink list mutex poisoned"))?;
 
     out.sort();
-    Ok(out)
+    out_symlinks.sort();
+    Ok((out, out_symlinks))
 }
 
 async fn hash_files(

@@ -217,22 +217,12 @@ fn collect_path_xattrs(
     metadata::collect_xattrs(path, follow_symlink)
 }
 
-async fn collect_symlink_batch(
-    handle: RuntimeHandle,
-    source: &Path,
-    scan: ScanOptions,
+fn symlink_batch_from_entries(
+    root: &Path,
+    entries: Vec<scan::FileEntry>,
     path_filter: Option<&PathFilter>,
     preserve_xattrs: bool,
 ) -> Result<Vec<SymlinkMeta>> {
-    let (root, entries, _, _) = scan::build_file_list(
-        handle,
-        source,
-        scan.scan_workers.max(1),
-        scan.hash_workers.max(1),
-    )
-    .await
-    .with_context(|| format!("build symlink list {}", source.display()))?;
-
     let mut symlinks = Vec::new();
     for entry in entries {
         if entry.kind != FileEntryKind::Symlink {
@@ -1257,9 +1247,6 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
             .connect(options.server, &options.server_name)
             .await
             .with_context(|| format!("connect to {} ({})", options.server, options.server_name))?;
-        verify_protocol(&connection, options.max_stream_payload, &stats)
-            .await
-            .context("validate protocol compatibility")?;
         connections.push(connection);
     }
     stats.add_connect_time(connect_started.elapsed());
@@ -1271,8 +1258,8 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         return Ok(summary);
     }
 
-    let (mut manifest, scan_stats) =
-        scan::build_manifest(handle.clone(), &options.source, options.scan)
+    let (mut manifest, symlink_entries, scan_stats) =
+        scan::build_manifest_with_symlinks(handle.clone(), &options.source, options.scan)
             .await
             .with_context(|| format!("build source manifest {}", options.source.display()))?;
     if let Some(path_filter) = options.path_filter.as_ref() {
@@ -1304,14 +1291,12 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         scan_stats.enumeration_elapsed.as_millis(),
         scan_stats.hash_elapsed.as_millis(),
     );
-    let symlinks = collect_symlink_batch(
-        handle.clone(),
-        &options.source,
-        options.scan,
+    let symlinks = symlink_batch_from_entries(
+        Path::new(&manifest.root),
+        symlink_entries,
         options.path_filter.as_ref(),
         options.preserve_xattrs,
-    )
-    .await?;
+    )?;
     let total_files = manifest.files.len().saturating_add(symlinks.len());
 
     let transfer_options = FileTransferOptions {
@@ -1329,13 +1314,20 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         bw_limiter: BwLimiter::from_kbps(options.bwlimit_kbps),
     };
 
-    let (small_files, large_files) = partition_small_files(
-        manifest.files,
-        transfer_options.chunk_size,
-        transfer_options.small_file_max_bytes,
+    let mut totals = BatchResult::default();
+    let (init_totals, small_upload_files, uploads) =
+        initialize_files_for_push(&connections[0], &transfer_options, manifest.files).await?;
+    totals.merge(init_totals);
+    maybe_print_transfer_progress(
+        options.progress,
+        totals.files_transferred,
+        totals.files_skipped,
+        total_files,
+        totals.bytes_sent,
     );
 
-    let small_batches = build_small_batches(small_files, transfer_options.max_stream_payload);
+    let small_batches =
+        build_small_batches(small_upload_files, transfer_options.max_stream_payload);
     let small_join = if small_batches.is_empty() {
         None
     } else {
@@ -1347,7 +1339,7 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
                 .spawn_stealable(async move {
                     let mut totals = BatchResult::default();
                     for batch in small_batches {
-                        let result = transfer_small_batch(
+                        let result = transfer_small_upload_batch(
                             &small_handle,
                             &small_connection,
                             &small_options,
@@ -1361,18 +1353,6 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
                 .map_err(|err| runtime_error("spawn small-batch transfer task", err))?,
         )
     };
-
-    let mut totals = BatchResult::default();
-    let (init_totals, uploads) =
-        initialize_large_files(&connections[0], &transfer_options, large_files).await?;
-    totals.merge(init_totals);
-    maybe_print_transfer_progress(
-        options.progress,
-        totals.files_transferred,
-        totals.files_skipped,
-        total_files,
-        totals.bytes_sent,
-    );
 
     if auto_connections_enabled() && options.connections == 1 {
         let upload_bytes = uploads.iter().map(|(file, _)| file.size).sum::<u64>();
@@ -1540,8 +1520,8 @@ pub async fn push_directory_over_ssh_stdio(
         return Ok(summary);
     }
 
-    let (mut manifest, scan_stats) =
-        scan::build_manifest(handle.clone(), &options.source, options.scan)
+    let (mut manifest, symlink_entries, scan_stats) =
+        scan::build_manifest_with_symlinks(handle.clone(), &options.source, options.scan)
             .await
             .with_context(|| format!("build source manifest {}", options.source.display()))?;
     if let Some(path_filter) = options.path_filter.as_ref() {
@@ -1574,14 +1554,12 @@ pub async fn push_directory_over_ssh_stdio(
         scan_stats.enumeration_elapsed.as_millis(),
         scan_stats.hash_elapsed.as_millis(),
     );
-    let symlinks = collect_symlink_batch(
-        handle.clone(),
-        &options.source,
-        options.scan,
+    let symlinks = symlink_batch_from_entries(
+        Path::new(&manifest.root),
+        symlink_entries,
         options.path_filter.as_ref(),
         options.preserve_xattrs,
-    )
-    .await?;
+    )?;
     let total_files = manifest.files.len().saturating_add(symlinks.len());
 
     let transfer_options = FileTransferOptions {
@@ -3394,17 +3372,22 @@ fn spawn_upload_job(
         .map_err(|err| runtime_error("spawn transfer task", err))
 }
 
-async fn initialize_large_files(
+async fn initialize_files_for_push(
     connection: &QuicConnection,
     options: &FileTransferOptions,
     files: Vec<FileManifest>,
-) -> Result<(BatchResult, Vec<(FileManifest, InitFileResponse)>)> {
+) -> Result<(
+    BatchResult,
+    Vec<FileManifest>,
+    Vec<(FileManifest, InitFileResponse)>,
+)> {
     let init_batches = build_init_batches(files, options.max_stream_payload);
     let mut totals = BatchResult::default();
+    let mut small_uploads = Vec::new();
     let mut uploads = Vec::new();
     let mut skipped_for_metadata = Vec::new();
     if init_batches.is_empty() {
-        return Ok((totals, uploads));
+        return Ok((totals, small_uploads, uploads));
     }
     let mut session = FrameSession::open(
         connection,
@@ -3413,7 +3396,7 @@ async fn initialize_large_files(
         options.bw_limiter.clone(),
     )
     .await
-    .context("open large-file init stream")?;
+    .context("open init stream")?;
 
     for batch in init_batches {
         let mut init_files = Vec::with_capacity(batch.len());
@@ -3425,16 +3408,16 @@ async fn initialize_large_files(
         let init_response = session
             .roundtrip(init_request, None)
             .await
-            .context("roundtrip large-file init batch")?;
+            .context("roundtrip init batch")?;
         let init = match init_response {
             Frame::InitBatchResponse(resp) => resp,
-            Frame::Error(err) => bail!("large batch init rejected: {}", err.message),
-            other => bail!("unexpected large batch init response: {other:?}"),
+            Frame::Error(err) => bail!("init batch rejected: {}", err.message),
+            other => bail!("unexpected init batch response: {other:?}"),
         };
 
         if init.results.len() != batch.len() {
             bail!(
-                "large batch init response size mismatch: got {} expected {}",
+                "init batch response size mismatch: got {} expected {}",
                 init.results.len(),
                 batch.len()
             );
@@ -3448,15 +3431,20 @@ async fn initialize_large_files(
                 }
                 continue;
             }
-            uploads.push((
-                file,
-                InitFileResponse {
-                    action: InitAction::Upload,
-                    next_chunk: result.next_chunk,
-                    metadata_sync_required: false,
-                    message: result.message,
-                },
-            ));
+            let next_chunk = result.next_chunk;
+            let init = InitFileResponse {
+                action: InitAction::Upload,
+                next_chunk,
+                metadata_sync_required: false,
+                message: result.message,
+            };
+            if next_chunk == 0
+                && is_small_file_candidate(&file, options.chunk_size, options.small_file_max_bytes)
+            {
+                small_uploads.push(file);
+            } else {
+                uploads.push((file, init));
+            }
         }
     }
 
@@ -3471,12 +3459,12 @@ async fn initialize_large_files(
         .await?;
     }
 
-    session.finish().context("finish large-file init stream")?;
+    session.finish().context("finish init stream")?;
 
-    Ok((totals, uploads))
+    Ok((totals, small_uploads, uploads))
 }
 
-async fn transfer_small_batch(
+async fn transfer_small_upload_batch(
     handle: &RuntimeHandle,
     connection: &QuicConnection,
     options: &FileTransferOptions,
@@ -3495,60 +3483,11 @@ async fn transfer_small_batch(
     .await
     .context("open small-batch stream")?;
 
-    let init_request = Frame::InitBatchRequest(InitBatchRequest {
-        files: files
-            .iter()
-            .map(|file| build_init_file_request(file, options))
-            .collect::<Result<Vec<_>>>()?,
-    });
-
-    let init_response = session
-        .roundtrip(init_request, None)
-        .await
-        .context("roundtrip small-batch init")?;
-    let init = match init_response {
-        Frame::InitBatchResponse(resp) => resp,
-        Frame::Error(err) => bail!("small batch init rejected: {}", err.message),
-        other => bail!("unexpected small batch init response: {other:?}"),
-    };
-
-    if init.results.len() != files.len() {
-        bail!(
-            "small batch init response size mismatch: got {} expected {}",
-            init.results.len(),
-            files.len()
-        );
-    }
-
     let mut totals = BatchResult::default();
-    let mut skipped_for_metadata = Vec::new();
     let mut upload_metas = Vec::new();
     let mut upload_payload = Vec::new();
     let mut upload_paths = Vec::new();
-    let mut fallback = Vec::new();
-
-    for (file, result) in files.iter().zip(init.results.into_iter()) {
-        if matches!(result.action, InitAction::Skip) {
-            totals.files_skipped = totals.files_skipped.saturating_add(1);
-            if options.preserve_metadata && result.metadata_sync_required {
-                skipped_for_metadata.push(file.clone());
-            }
-            continue;
-        }
-
-        if result.next_chunk > 0 {
-            fallback.push((
-                file.clone(),
-                InitFileResponse {
-                    action: InitAction::Upload,
-                    next_chunk: result.next_chunk,
-                    metadata_sync_required: false,
-                    message: result.message,
-                },
-            ));
-            continue;
-        }
-
+    for file in files {
         let source_path = options.source_root.join(Path::new(&file.relative_path));
         let read_started = Instant::now();
         let raw = fs::read(handle, &source_path)
@@ -3596,17 +3535,6 @@ async fn transfer_small_batch(
         });
     }
 
-    if options.preserve_metadata && !skipped_for_metadata.is_empty() {
-        let metadata_entries = collect_file_metadata_entries(options, &skipped_for_metadata)?;
-        sync_file_metadata_over_quic(
-            connection,
-            &metadata_entries,
-            options.max_stream_payload,
-            &options.stats,
-        )
-        .await?;
-    }
-
     if !upload_metas.is_empty() {
         let upload_request = Frame::UploadSmallBatchRequest(UploadSmallBatchRequest {
             files: upload_metas,
@@ -3644,11 +3572,6 @@ async fn transfer_small_batch(
     }
 
     session.finish().context("finish small-batch stream")?;
-
-    for (file, init) in fallback {
-        let result = upload_file_batches(handle, connection, options, &file, &init).await?;
-        totals.add_file_result(result);
-    }
 
     Ok(totals)
 }
