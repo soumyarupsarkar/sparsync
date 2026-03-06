@@ -2,6 +2,19 @@
 name = "sparsync"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "rsync-style high-performance file synchronization over QUIC and Spargio"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/soumyarupsarkar/sparsync"
+homepage = "https://github.com/soumyarupsarkar/sparsync"
+documentation = "https://docs.rs/sparsync"
+keywords = ["rsync", "sync", "quic", "io-uring", "backup"]
+categories = ["command-line-utilities", "filesystem", "network-programming"]
+exclude = [
+    ".github/**",
+    "target/**",
+]
 
 [dependencies]
 anyhow = "1.0"
