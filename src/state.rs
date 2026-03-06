@@ -15,6 +15,8 @@ pub struct CompleteFile {
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    #[serde(default)]
+    pub xattr_sig: Option<u64>,
     pub total_chunks: usize,
     pub updated_at_sec: i64,
 }
@@ -36,6 +38,7 @@ pub struct CompleteFileInput {
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub xattr_sig: Option<u64>,
     pub total_chunks: usize,
 }
 
@@ -121,6 +124,9 @@ impl StateStore {
                     let resp = InitFileResponse {
                         action: InitAction::Skip,
                         next_chunk: req.total_chunks,
+                        metadata_sync_required: done.mode != req.mode
+                            || done.mtime_sec != req.mtime_sec
+                            || done.xattr_sig != req.xattr_sig,
                         message: "already up to date".to_string(),
                     };
                     return Ok(resp);
@@ -157,6 +163,7 @@ impl StateStore {
             InitFileResponse {
                 action: InitAction::Upload,
                 next_chunk,
+                metadata_sync_required: false,
                 message: if next_chunk > 0 {
                     format!("resuming at chunk {next_chunk}")
                 } else {
@@ -215,6 +222,7 @@ impl StateStore {
         size: u64,
         mode: u32,
         mtime_sec: i64,
+        xattr_sig: Option<u64>,
         total_chunks: usize,
     ) -> Result<()> {
         let now = now_sec();
@@ -232,6 +240,7 @@ impl StateStore {
                     size,
                     mode,
                     mtime_sec,
+                    xattr_sig,
                     total_chunks,
                     updated_at_sec: now,
                 },
@@ -262,6 +271,7 @@ impl StateStore {
                         size: entry.size,
                         mode: entry.mode,
                         mtime_sec: entry.mtime_sec,
+                        xattr_sig: entry.xattr_sig,
                         total_chunks: entry.total_chunks,
                         updated_at_sec: now,
                     },

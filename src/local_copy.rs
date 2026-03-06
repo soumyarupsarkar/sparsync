@@ -1,7 +1,10 @@
 use crate::filter::PathFilter;
+use crate::metadata;
 use anyhow::{Context, Result};
 use spargio::{RuntimeHandle, fs};
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -14,6 +17,7 @@ pub struct LocalCopyOptions {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
     pub dry_run: bool,
     pub delete: bool,
     pub update_only: bool,
@@ -86,6 +90,131 @@ pub async fn copy_tree(
 
         let src_path = source.join(&rel);
         let dst_path = options.destination.join(&rel);
+        let src_link_meta = fs::symlink_metadata(&handle, &src_path)
+            .await
+            .with_context(|| format!("lstat source {}", src_path.display()))?;
+        let is_symlink = src_link_meta.file_type().is_symlink();
+        if is_symlink {
+            #[cfg(unix)]
+            let src_mtime = src_link_meta.mtime();
+            #[cfg(not(unix))]
+            let src_mtime = 0i64;
+            #[cfg(unix)]
+            let src_uid = src_link_meta.uid();
+            #[cfg(not(unix))]
+            let src_uid = 0u32;
+            #[cfg(unix)]
+            let src_gid = src_link_meta.gid();
+            #[cfg(not(unix))]
+            let src_gid = 0u32;
+            #[cfg(unix)]
+            let src_mode = src_link_meta.mode() as u32;
+            #[cfg(not(unix))]
+            let src_mode = 0u32;
+
+            let target = metadata::read_link_target(&src_path)
+                .with_context(|| format!("read source symlink {}", src_path.display()))?;
+            let mut copy = true;
+            if let Ok(existing) = fs::symlink_metadata(&handle, &dst_path).await {
+                #[cfg(unix)]
+                let existing_mtime = existing.mtime();
+                #[cfg(not(unix))]
+                let existing_mtime = 0i64;
+                if options.update_only {
+                    if existing_mtime >= src_mtime {
+                        copy = false;
+                    }
+                } else if existing_mtime == src_mtime
+                    && metadata::read_link_target(&dst_path)
+                        .map(|value| value == target)
+                        .unwrap_or(false)
+                {
+                    copy = false;
+                }
+            }
+
+            if options.dry_run {
+                if copy {
+                    summary.files_copied = summary.files_copied.saturating_add(1);
+                } else {
+                    summary.files_skipped = summary.files_skipped.saturating_add(1);
+                }
+                processed = processed.saturating_add(1);
+                maybe_print_progress(
+                    options.progress,
+                    processed,
+                    total_files,
+                    summary.bytes_copied,
+                );
+                continue;
+            }
+
+            if copy {
+                if let Some(parent) = dst_path.parent() {
+                    fs::create_dir_all(&handle, parent).await.with_context(|| {
+                        format!("create destination parent {}", parent.display())
+                    })?;
+                }
+                remove_existing_path_for_symlink(&handle, &dst_path).await?;
+                fs::symlink(&handle, Path::new(&target), &dst_path)
+                    .await
+                    .with_context(|| {
+                        format!("create symlink {} -> {}", dst_path.display(), target)
+                    })?;
+                if options.preserve_metadata {
+                    let xattrs = if options.preserve_xattrs {
+                        metadata::collect_xattrs(&src_path, false)
+                            .with_context(|| format!("collect xattrs {}", src_path.display()))?
+                    } else {
+                        Vec::new()
+                    };
+                    apply_preserve_metadata(
+                        &handle,
+                        &dst_path,
+                        src_mode,
+                        src_mtime,
+                        src_uid,
+                        src_gid,
+                        &xattrs,
+                        options.preserve_xattrs,
+                        false,
+                    )
+                    .await?;
+                }
+                summary.files_copied = summary.files_copied.saturating_add(1);
+            } else {
+                if options.preserve_metadata && !options.update_only {
+                    let xattrs = if options.preserve_xattrs {
+                        metadata::collect_xattrs(&src_path, false)
+                            .with_context(|| format!("collect xattrs {}", src_path.display()))?
+                    } else {
+                        Vec::new()
+                    };
+                    apply_preserve_metadata(
+                        &handle,
+                        &dst_path,
+                        src_mode,
+                        src_mtime,
+                        src_uid,
+                        src_gid,
+                        &xattrs,
+                        options.preserve_xattrs,
+                        false,
+                    )
+                    .await?;
+                }
+                summary.files_skipped = summary.files_skipped.saturating_add(1);
+            }
+            processed = processed.saturating_add(1);
+            maybe_print_progress(
+                options.progress,
+                processed,
+                total_files,
+                summary.bytes_copied,
+            );
+            continue;
+        }
+
         let src_meta = fs::metadata_lite(&handle, &src_path)
             .await
             .with_context(|| format!("stat source {}", src_path.display()))?;
@@ -104,6 +233,26 @@ pub async fn copy_tree(
                     continue;
                 }
             } else if dst_meta.size == src_meta.size && dst_meta.mtime_sec == src_meta.mtime_sec {
+                if options.preserve_metadata && !options.update_only && !options.dry_run {
+                    let xattrs = if options.preserve_xattrs {
+                        metadata::collect_xattrs(&src_path, true)
+                            .with_context(|| format!("collect xattrs {}", src_path.display()))?
+                    } else {
+                        Vec::new()
+                    };
+                    apply_preserve_metadata(
+                        &handle,
+                        &dst_path,
+                        src_meta.mode as u32,
+                        src_meta.mtime_sec,
+                        src_meta.uid,
+                        src_meta.gid,
+                        &xattrs,
+                        options.preserve_xattrs,
+                        true,
+                    )
+                    .await?;
+                }
                 summary.files_skipped = summary.files_skipped.saturating_add(1);
                 processed = processed.saturating_add(1);
                 maybe_print_progress(
@@ -137,8 +286,24 @@ pub async fn copy_tree(
 
         let copied = copy_one_file(&handle, &src_path, &dst_path).await?;
         if options.preserve_metadata {
-            apply_preserve_metadata(&handle, &dst_path, src_meta.mode as u32, src_meta.mtime_sec)
-                .await?;
+            let xattrs = if options.preserve_xattrs {
+                metadata::collect_xattrs(&src_path, true)
+                    .with_context(|| format!("collect xattrs {}", src_path.display()))?
+            } else {
+                Vec::new()
+            };
+            apply_preserve_metadata(
+                &handle,
+                &dst_path,
+                src_meta.mode as u32,
+                src_meta.mtime_sec,
+                src_meta.uid,
+                src_meta.gid,
+                &xattrs,
+                options.preserve_xattrs,
+                true,
+            )
+            .await?;
         }
         summary.files_copied = summary.files_copied.saturating_add(1);
         summary.bytes_copied = summary.bytes_copied.saturating_add(copied);
@@ -257,21 +422,49 @@ async fn copy_one_file(handle: &RuntimeHandle, source: &Path, destination: &Path
     Ok(offset)
 }
 
+async fn remove_existing_path_for_symlink(handle: &RuntimeHandle, path: &Path) -> Result<()> {
+    match fs::symlink_metadata(handle, path).await {
+        Ok(meta) => {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("remove existing directory {}", path.display()))?;
+            } else {
+                fs::remove_file(handle, path)
+                    .await
+                    .with_context(|| format!("remove existing file {}", path.display()))?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("lstat {}", path.display())),
+    }
+}
+
 async fn apply_preserve_metadata(
     handle: &RuntimeHandle,
     path: &Path,
     mode: u32,
     mtime_sec: i64,
+    uid: u32,
+    gid: u32,
+    xattrs: &[crate::protocol::XattrEntry],
+    preserve_xattrs: bool,
+    follow_symlink: bool,
 ) -> Result<()> {
     #[cfg(unix)]
     {
-        let perms = std::fs::Permissions::from_mode(mode & 0o7777);
-        fs::set_permissions(handle, path, perms)
-            .await
-            .with_context(|| format!("set permissions {}", path.display()))?;
+        if follow_symlink {
+            let perms = std::fs::Permissions::from_mode(mode & 0o7777);
+            fs::set_permissions(handle, path, perms)
+                .await
+                .with_context(|| format!("set permissions {}", path.display()))?;
+        }
     }
-    let mtime = filetime::FileTime::from_unix_time(mtime_sec, 0);
-    filetime::set_file_mtime(path, mtime).with_context(|| format!("set mtime {}", path.display()))
+    metadata::set_owner(path, uid, gid, follow_symlink)?;
+    if preserve_xattrs {
+        metadata::apply_xattrs(path, xattrs, follow_symlink)?;
+    }
+    metadata::set_mtime(path, mtime_sec, follow_symlink)
 }
 
 async fn enumerate_relative_files(handle: &RuntimeHandle, root: &Path) -> Result<Vec<PathBuf>> {
@@ -295,6 +488,16 @@ async fn enumerate_relative_files(handle: &RuntimeHandle, root: &Path) -> Result
             match entry.entry_type {
                 fs::DirEntryType::Directory => stack.push(entry.path),
                 fs::DirEntryType::File => {
+                    let rel = entry.path.strip_prefix(root).with_context(|| {
+                        format!(
+                            "path {} escaped root {}",
+                            entry.path.display(),
+                            root.display()
+                        )
+                    })?;
+                    out.push(rel.to_path_buf());
+                }
+                fs::DirEntryType::Symlink => {
                     let rel = entry.path.strip_prefix(root).with_context(|| {
                         format!(
                             "path {} escaped root {}",

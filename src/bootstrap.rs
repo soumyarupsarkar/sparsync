@@ -5,7 +5,6 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread;
 use std::time::Duration;
 
 const DEFAULT_REMOTE_AUTH_SUBPATH: &str = ".config/sparsync/auth";
@@ -45,6 +44,7 @@ pub struct BootstrapOptions {
     pub profile_name: String,
     pub install_mode: InstallMode,
     pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
 }
 
 pub struct BootstrapSession {
@@ -96,23 +96,13 @@ impl BootstrapSession {
         let Some(mut child) = self.child.take() else {
             return Ok(());
         };
-        let mut waited = Duration::ZERO;
-        let step = Duration::from_millis(100);
-        let timeout = Duration::from_secs(5);
-        let status = loop {
-            if let Some(status) = child
-                .try_wait()
-                .context("poll remote serve-session ssh process")?
-            {
-                break status;
-            }
-            if waited >= timeout {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(());
-            }
-            thread::sleep(step);
-            waited += step;
+        let status = child
+            .try_wait()
+            .context("poll remote serve-session ssh process")?;
+        let Some(status) = status else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
         };
         if !status.success() {
             bail!("remote serve-session exited with status {}", status);
@@ -407,17 +397,9 @@ pub fn default_client_id() -> String {
 }
 
 fn wait_for_server_ready(server: SocketAddr, timeout: Duration) -> Result<()> {
-    let started = std::time::Instant::now();
-    let step = Duration::from_millis(50);
-    loop {
-        if TcpStream::connect_timeout(&server, Duration::from_millis(250)).is_ok() {
-            return Ok(());
-        }
-        if started.elapsed() >= timeout {
-            bail!("timed out waiting for server readiness at {}", server);
-        }
-        thread::sleep(step);
-    }
+    TcpStream::connect_timeout(&server, timeout)
+        .with_context(|| format!("connect to bootstrap server {}", server))?;
+    Ok(())
 }
 
 fn enroll_remote_with_lease(
@@ -505,6 +487,9 @@ pub fn bootstrap_remote_push(options: &BootstrapOptions) -> Result<BootstrapSess
     if options.preserve_metadata {
         remote_cmd.push_str(" --preserve-metadata");
     }
+    if options.preserve_xattrs {
+        remote_cmd.push_str(" --preserve-xattrs");
+    }
 
     let child = ssh_base_command(&options.remote)
         .arg(remote_cmd)
@@ -558,6 +543,9 @@ pub fn start_remote_server(options: &BootstrapOptions) -> Result<Enrollment> {
     );
     if options.preserve_metadata {
         remote_cmd.push_str(" --preserve-metadata");
+    }
+    if options.preserve_xattrs {
+        remote_cmd.push_str(" --preserve-xattrs");
     }
     run_ssh(&options.remote, &remote_cmd).context("start remote sparsync server")?;
     wait_for_server_ready(enrollment.server, Duration::from_secs(10))

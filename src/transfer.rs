@@ -2,14 +2,17 @@ use crate::certs;
 use crate::compression;
 use crate::endpoint::RemoteEndpoint;
 use crate::filter::PathFilter;
+use crate::metadata;
 use crate::model::FileManifest;
 use crate::protocol::{
-    DeletePlanRequest, DeletePlanResponse, Frame, HelloRequest, HelloResponse, InitAction,
-    InitBatchRequest, InitFileRequest, InitFileResponse, PROTOCOL_VERSION, SourceStreamChunk,
-    SourceStreamDone, SourceStreamFileEnd, SourceStreamFileStart, UploadBatchRequest,
-    UploadColdBatchRequest, UploadColdFileMeta, UploadSmallBatchRequest, UploadSmallFileMeta,
+    DeletePlanRequest, DeletePlanResponse, DeletePlanStage, FileMetadataSyncEntry, Frame,
+    HelloRequest, HelloResponse, InitAction, InitBatchRequest, InitFileRequest, InitFileResponse,
+    PROTOCOL_VERSION, SourceEntryKind, SourceStreamChunk, SourceStreamDone, SourceStreamFileEnd,
+    SourceStreamFileStart, SourceStreamRequest, SymlinkMeta, SyncFileMetadataBatchRequest,
+    SyncSymlinkBatchRequest, UploadBatchRequest, UploadColdBatchRequest, UploadColdFileMeta,
+    UploadSmallBatchRequest, UploadSmallFileMeta, XattrEntry,
 };
-use crate::scan::{self, ScanOptions};
+use crate::scan::{self, FileEntryKind, ScanOptions};
 use crate::util::{join_error, runtime_error};
 use anyhow::{Context, Result, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -21,6 +24,8 @@ use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -59,6 +64,8 @@ pub struct PushOptions {
     pub update_only: bool,
     pub cold_start: bool,
     pub manifest_out: Option<PathBuf>,
+    pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
     pub path_filter: Option<PathFilter>,
     pub bwlimit_kbps: Option<u64>,
     pub progress: bool,
@@ -78,6 +85,7 @@ pub struct PushOverSshOptions {
     pub cold_start: bool,
     pub manifest_out: Option<PathBuf>,
     pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
     pub path_filter: Option<PathFilter>,
     pub bwlimit_kbps: Option<u64>,
     pub progress: bool,
@@ -91,6 +99,8 @@ pub struct StreamSourceOptions {
     pub chunk_size: usize,
     pub max_stream_payload: usize,
     pub metadata_only: bool,
+    pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +113,7 @@ pub struct PullOverSshStreamOptions {
     pub path_filter: PathFilter,
     pub update_only: bool,
     pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
     pub delete: bool,
     pub dry_run: bool,
     pub progress: bool,
@@ -112,6 +123,31 @@ pub struct PullOverSshStreamOptions {
     pub bwlimit_kbps: Option<u64>,
     pub include_patterns: Vec<String>,
     pub exclude_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullOverQuicOptions {
+    pub server: SocketAddr,
+    pub server_name: String,
+    pub ca: PathBuf,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+    pub destination: PathBuf,
+    pub path_filter: PathFilter,
+    pub update_only: bool,
+    pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
+    pub delete: bool,
+    pub dry_run: bool,
+    pub progress: bool,
+    pub chunk_size: usize,
+    pub max_stream_payload: usize,
+    pub metadata_only: bool,
+    pub bwlimit_kbps: Option<u64>,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub connect_timeout: Duration,
+    pub operation_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -170,13 +206,440 @@ impl PushSummary {
     }
 }
 
-fn encode_keep_paths_payload(keep_paths: &[String]) -> Vec<u8> {
-    if keep_paths.is_empty() {
-        return Vec::new();
+fn collect_path_xattrs(
+    path: &Path,
+    preserve_xattrs: bool,
+    follow_symlink: bool,
+) -> Result<Vec<XattrEntry>> {
+    if !preserve_xattrs {
+        return Ok(Vec::new());
     }
-    let mut out = keep_paths.join("\n").into_bytes();
-    out.push(b'\n');
-    out
+    metadata::collect_xattrs(path, follow_symlink)
+}
+
+async fn collect_symlink_batch(
+    handle: RuntimeHandle,
+    source: &Path,
+    scan: ScanOptions,
+    path_filter: Option<&PathFilter>,
+    preserve_xattrs: bool,
+) -> Result<Vec<SymlinkMeta>> {
+    let (root, entries, _, _) = scan::build_file_list(
+        handle,
+        source,
+        scan.scan_workers.max(1),
+        scan.hash_workers.max(1),
+    )
+    .await
+    .with_context(|| format!("build symlink list {}", source.display()))?;
+
+    let mut symlinks = Vec::new();
+    for entry in entries {
+        if entry.kind != FileEntryKind::Symlink {
+            continue;
+        }
+        if let Some(filter) = path_filter {
+            if !filter.allows(&entry.relative_path) {
+                continue;
+            }
+        }
+        let target = entry
+            .symlink_target
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("missing symlink target for {}", entry.relative_path))?;
+        let absolute_path = root.join(Path::new(&entry.relative_path));
+        let xattrs = collect_path_xattrs(&absolute_path, preserve_xattrs, false)
+            .with_context(|| format!("collect symlink xattrs {}", absolute_path.display()))?;
+        symlinks.push(SymlinkMeta {
+            relative_path: entry.relative_path,
+            target,
+            mode: entry.mode,
+            mtime_sec: entry.mtime_sec,
+            uid: entry.uid,
+            gid: entry.gid,
+            xattrs,
+        });
+    }
+    Ok(symlinks)
+}
+
+fn collect_file_metadata_entries(
+    options: &FileTransferOptions,
+    files: &[FileManifest],
+) -> Result<Vec<FileMetadataSyncEntry>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::with_capacity(files.len());
+    for file in files {
+        let source_path = options.source_root.join(Path::new(&file.relative_path));
+        let xattrs = collect_path_xattrs(&source_path, options.preserve_xattrs, true)
+            .with_context(|| format!("collect xattrs {}", source_path.display()))?;
+        entries.push(FileMetadataSyncEntry {
+            relative_path: file.relative_path.clone(),
+            size: file.size,
+            file_hash: file.file_hash.clone(),
+            mode: file.mode,
+            mtime_sec: file.mtime_sec,
+            uid: file.uid,
+            gid: file.gid,
+            xattrs,
+        });
+    }
+    Ok(entries)
+}
+
+fn build_init_file_request(
+    file: &FileManifest,
+    options: &FileTransferOptions,
+) -> Result<InitFileRequest> {
+    let xattr_sig = if options.preserve_xattrs {
+        let source_path = options.source_root.join(Path::new(&file.relative_path));
+        metadata::path_xattr_signature(&source_path, true)
+            .with_context(|| format!("collect xattr signature {}", source_path.display()))?
+    } else {
+        None
+    };
+    Ok(InitFileRequest {
+        relative_path: file.relative_path.clone(),
+        size: file.size,
+        mode: file.mode,
+        mtime_sec: file.mtime_sec,
+        xattr_sig,
+        update_only: options.update_only,
+        file_hash: file.file_hash.clone(),
+        chunk_size: options.chunk_size,
+        total_chunks: file.total_chunks,
+        resume: options.resume,
+    })
+}
+
+async fn sync_file_metadata_over_ssh(
+    session: &mut SshFrameSession<'_>,
+    entries: &[FileMetadataSyncEntry],
+    max_stream_payload: usize,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut batch = Vec::new();
+    for item in entries {
+        batch.push(item.clone());
+        let request = Frame::SyncFileMetadataBatchRequest(SyncFileMetadataBatchRequest {
+            entries: batch.clone(),
+        });
+        let encoded_len = crate::protocol::encode_header(&request, 0)
+            .context("encode file metadata sync header")?
+            .len();
+        if encoded_len > max_stream_payload {
+            let last = batch.pop().expect("batch has item");
+            if batch.is_empty() {
+                bail!(
+                    "single file metadata sync frame exceeds max_stream_payload for {}",
+                    last.relative_path
+                );
+            }
+            let response = session
+                .roundtrip(
+                    Frame::SyncFileMetadataBatchRequest(SyncFileMetadataBatchRequest {
+                        entries: std::mem::take(&mut batch),
+                    }),
+                    None,
+                )
+                .await
+                .context("sync file metadata batch over ssh")?;
+            let resp = match response {
+                Frame::SyncFileMetadataBatchResponse(resp) => resp,
+                Frame::Error(err) => bail!("file metadata sync rejected over ssh: {}", err.message),
+                other => bail!("unexpected file metadata sync response over ssh: {other:?}"),
+            };
+            for result in resp.results {
+                if !result.accepted {
+                    bail!("file metadata sync rejected: {}", result.message);
+                }
+            }
+            batch.push(last);
+        }
+    }
+
+    if !batch.is_empty() {
+        let response = session
+            .roundtrip(
+                Frame::SyncFileMetadataBatchRequest(SyncFileMetadataBatchRequest {
+                    entries: batch,
+                }),
+                None,
+            )
+            .await
+            .context("sync file metadata batch over ssh")?;
+        let resp = match response {
+            Frame::SyncFileMetadataBatchResponse(resp) => resp,
+            Frame::Error(err) => bail!("file metadata sync rejected over ssh: {}", err.message),
+            other => bail!("unexpected file metadata sync response over ssh: {other:?}"),
+        };
+        for result in resp.results {
+            if !result.accepted {
+                bail!("file metadata sync rejected: {}", result.message);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn sync_file_metadata_over_quic(
+    connection: &QuicConnection,
+    entries: &[FileMetadataSyncEntry],
+    max_stream_payload: usize,
+    stats: &TransferStats,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut cursor = 0usize;
+    while cursor < entries.len() {
+        let mut hi = cursor + 1;
+        let mut best = cursor;
+        while hi <= entries.len() {
+            let request = Frame::SyncFileMetadataBatchRequest(SyncFileMetadataBatchRequest {
+                entries: entries[cursor..hi].to_vec(),
+            });
+            let encoded_len = crate::protocol::encode_header(&request, 0)
+                .context("encode file metadata sync header")?
+                .len();
+            if encoded_len > max_stream_payload {
+                break;
+            }
+            best = hi;
+            hi = hi.saturating_add(1);
+        }
+        if best == cursor {
+            bail!(
+                "single file metadata sync frame exceeds max_stream_payload for {}",
+                entries[cursor].relative_path
+            );
+        }
+        let response = send_frame_roundtrip(
+            connection,
+            Frame::SyncFileMetadataBatchRequest(SyncFileMetadataBatchRequest {
+                entries: entries[cursor..best].to_vec(),
+            }),
+            None,
+            max_stream_payload,
+            stats,
+        )
+        .await
+        .context("sync file metadata batch over quic")?;
+        let resp = match response {
+            Frame::SyncFileMetadataBatchResponse(resp) => resp,
+            Frame::Error(err) => bail!("file metadata sync rejected over quic: {}", err.message),
+            other => bail!("unexpected file metadata sync response over quic: {other:?}"),
+        };
+        for result in resp.results {
+            if !result.accepted {
+                bail!("file metadata sync rejected: {}", result.message);
+            }
+        }
+        cursor = best;
+    }
+
+    Ok(())
+}
+
+async fn sync_symlinks_over_ssh(
+    session: &mut SshFrameSession<'_>,
+    symlinks: &[SymlinkMeta],
+    max_stream_payload: usize,
+) -> Result<(usize, usize)> {
+    if symlinks.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut transferred = 0usize;
+    let mut skipped = 0usize;
+    let mut batch = Vec::new();
+    for item in symlinks {
+        batch.push(item.clone());
+        let request = Frame::SyncSymlinkBatchRequest(SyncSymlinkBatchRequest {
+            entries: batch.clone(),
+        });
+        let encoded_len = crate::protocol::encode_header(&request, 0)
+            .context("encode symlink batch header")?
+            .len();
+        if encoded_len > max_stream_payload {
+            let last = batch.pop().expect("batch has item");
+            if batch.is_empty() {
+                bail!(
+                    "single symlink metadata frame exceeds max_stream_payload for {}",
+                    last.relative_path
+                );
+            }
+            let response = session
+                .roundtrip(
+                    Frame::SyncSymlinkBatchRequest(SyncSymlinkBatchRequest {
+                        entries: std::mem::take(&mut batch),
+                    }),
+                    None,
+                )
+                .await
+                .context("sync symlink batch over ssh")?;
+            let resp = match response {
+                Frame::SyncSymlinkBatchResponse(resp) => resp,
+                Frame::Error(err) => bail!("sync symlink batch rejected over ssh: {}", err.message),
+                other => bail!("unexpected symlink batch response over ssh: {other:?}"),
+            };
+            for result in resp.results {
+                if !result.accepted {
+                    bail!("symlink sync rejected: {}", result.message);
+                }
+                if result.skipped {
+                    skipped = skipped.saturating_add(1);
+                } else {
+                    transferred = transferred.saturating_add(1);
+                }
+            }
+            batch.push(last);
+        }
+    }
+
+    if !batch.is_empty() {
+        let response = session
+            .roundtrip(
+                Frame::SyncSymlinkBatchRequest(SyncSymlinkBatchRequest { entries: batch }),
+                None,
+            )
+            .await
+            .context("sync symlink batch over ssh")?;
+        let resp = match response {
+            Frame::SyncSymlinkBatchResponse(resp) => resp,
+            Frame::Error(err) => bail!("sync symlink batch rejected over ssh: {}", err.message),
+            other => bail!("unexpected symlink batch response over ssh: {other:?}"),
+        };
+        for result in resp.results {
+            if !result.accepted {
+                bail!("symlink sync rejected: {}", result.message);
+            }
+            if result.skipped {
+                skipped = skipped.saturating_add(1);
+            } else {
+                transferred = transferred.saturating_add(1);
+            }
+        }
+    }
+
+    Ok((transferred, skipped))
+}
+
+async fn sync_symlinks_over_quic(
+    connection: &QuicConnection,
+    symlinks: &[SymlinkMeta],
+    max_stream_payload: usize,
+    stats: &TransferStats,
+) -> Result<(usize, usize)> {
+    if symlinks.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut transferred = 0usize;
+    let mut skipped = 0usize;
+    let mut cursor = 0usize;
+    while cursor < symlinks.len() {
+        let mut hi = cursor + 1;
+        let mut best = cursor;
+        while hi <= symlinks.len() {
+            let request = Frame::SyncSymlinkBatchRequest(SyncSymlinkBatchRequest {
+                entries: symlinks[cursor..hi].to_vec(),
+            });
+            let encoded_len = crate::protocol::encode_header(&request, 0)
+                .context("encode symlink batch header")?
+                .len();
+            if encoded_len > max_stream_payload {
+                break;
+            }
+            best = hi;
+            hi = hi.saturating_add(1);
+        }
+        if best == cursor {
+            bail!(
+                "single symlink metadata frame exceeds max_stream_payload for {}",
+                symlinks[cursor].relative_path
+            );
+        }
+        let response = send_frame_roundtrip(
+            connection,
+            Frame::SyncSymlinkBatchRequest(SyncSymlinkBatchRequest {
+                entries: symlinks[cursor..best].to_vec(),
+            }),
+            None,
+            max_stream_payload,
+            stats,
+        )
+        .await
+        .context("sync symlink batch over quic")?;
+        let resp = match response {
+            Frame::SyncSymlinkBatchResponse(resp) => resp,
+            Frame::Error(err) => bail!("sync symlink batch rejected over quic: {}", err.message),
+            other => bail!("unexpected symlink batch response over quic: {other:?}"),
+        };
+        for result in resp.results {
+            if !result.accepted {
+                bail!("symlink sync rejected: {}", result.message);
+            }
+            if result.skipped {
+                skipped = skipped.saturating_add(1);
+            } else {
+                transferred = transferred.saturating_add(1);
+            }
+        }
+        cursor = best;
+    }
+
+    Ok((transferred, skipped))
+}
+
+fn chunk_keep_paths_payloads(
+    keep_paths: &[String],
+    max_stream_payload: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if keep_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target = max_stream_payload.saturating_sub(128 * 1024).max(8 * 1024);
+    let mut chunks = Vec::new();
+    let mut current = Vec::with_capacity(target.min(256 * 1024));
+    for path in keep_paths {
+        let line = format!("{path}\n");
+        let line_bytes = line.as_bytes();
+        if line_bytes.len() > target {
+            bail!(
+                "delete keep-list entry '{}' ({} bytes) exceeds chunk budget {}",
+                path,
+                line_bytes.len(),
+                target
+            );
+        }
+        if !current.is_empty() && current.len().saturating_add(line_bytes.len()) > target {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.extend_from_slice(line_bytes);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+fn parse_delete_plan_response(response: Frame, transport: &str) -> Result<DeletePlanResponse> {
+    match response {
+        Frame::DeletePlanResponse(resp) => Ok(resp),
+        Frame::Error(err) => bail!("delete plan rejected over {}: {}", transport, err.message),
+        other => bail!(
+            "unexpected delete plan response over {}: {other:?}",
+            transport
+        ),
+    }
 }
 
 pub async fn apply_delete_plan_over_ssh_stdio(
@@ -192,6 +655,7 @@ pub async fn apply_delete_plan_over_ssh_stdio(
         options.remote_shell_prefix.as_deref(),
         options.max_stream_payload,
         false,
+        false,
         &stats,
         profile,
         None,
@@ -201,24 +665,64 @@ pub async fn apply_delete_plan_over_ssh_stdio(
     verify_protocol_over_ssh(&mut session)
         .await
         .context("validate protocol compatibility over ssh")?;
-    let payload = encode_keep_paths_payload(&options.keep_paths);
-    let response = session
-        .roundtrip(
-            Frame::DeletePlanRequest(DeletePlanRequest {
-                dry_run: options.dry_run,
-                include: options.include_patterns,
-                exclude: options.exclude_patterns,
-            }),
-            Some(&payload),
-        )
-        .await
-        .context("send delete plan request over ssh")?;
-    session.finish().context("finish SSH delete session")?;
-    match response {
-        Frame::DeletePlanResponse(DeletePlanResponse { deleted }) => Ok(deleted),
-        Frame::Error(err) => bail!("delete plan rejected over ssh: {}", err.message),
-        other => bail!("unexpected delete plan response over ssh: {other:?}"),
+    let begin = parse_delete_plan_response(
+        session
+            .roundtrip(
+                Frame::DeletePlanRequest(DeletePlanRequest {
+                    stage: DeletePlanStage::Begin,
+                    dry_run: options.dry_run,
+                    include: options.include_patterns,
+                    exclude: options.exclude_patterns,
+                }),
+                None,
+            )
+            .await
+            .context("send delete plan begin over ssh")?,
+        "ssh",
+    )?;
+    if !begin.accepted {
+        bail!("delete plan begin rejected over ssh: {}", begin.message);
     }
+    for payload in chunk_keep_paths_payloads(&options.keep_paths, options.max_stream_payload)? {
+        let chunk = parse_delete_plan_response(
+            session
+                .roundtrip(
+                    Frame::DeletePlanRequest(DeletePlanRequest {
+                        stage: DeletePlanStage::AddKeepChunk,
+                        dry_run: false,
+                        include: Vec::new(),
+                        exclude: Vec::new(),
+                    }),
+                    Some(&payload),
+                )
+                .await
+                .context("send delete plan keep chunk over ssh")?,
+            "ssh",
+        )?;
+        if !chunk.accepted {
+            bail!("delete plan chunk rejected over ssh: {}", chunk.message);
+        }
+    }
+    let applied = parse_delete_plan_response(
+        session
+            .roundtrip(
+                Frame::DeletePlanRequest(DeletePlanRequest {
+                    stage: DeletePlanStage::Apply,
+                    dry_run: false,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                }),
+                None,
+            )
+            .await
+            .context("send delete plan apply over ssh")?,
+        "ssh",
+    )?;
+    if !applied.accepted {
+        bail!("delete plan apply rejected over ssh: {}", applied.message);
+    }
+    session.finish().context("finish SSH delete session")?;
+    Ok(applied.deleted)
 }
 
 pub async fn apply_delete_plan_over_quic(
@@ -269,25 +773,67 @@ pub async fn apply_delete_plan_over_quic(
         .await
         .context("validate protocol compatibility for delete plan")?;
 
-    let payload = encode_keep_paths_payload(&options.keep_paths);
-    let response = send_frame_roundtrip(
-        &connection,
-        Frame::DeletePlanRequest(DeletePlanRequest {
-            dry_run: options.dry_run,
-            include: options.include_patterns,
-            exclude: options.exclude_patterns,
-        }),
-        Some(&payload),
-        options.max_stream_payload,
-        &stats,
-    )
-    .await
-    .context("send delete plan request over quic")?;
-    match response {
-        Frame::DeletePlanResponse(DeletePlanResponse { deleted }) => Ok(deleted),
-        Frame::Error(err) => bail!("delete plan rejected over quic: {}", err.message),
-        other => bail!("unexpected delete plan response over quic: {other:?}"),
+    let mut session = FrameSession::open(&connection, options.max_stream_payload, &stats, None)
+        .await
+        .context("open quic delete plan stream")?;
+    let begin = parse_delete_plan_response(
+        session
+            .roundtrip(
+                Frame::DeletePlanRequest(DeletePlanRequest {
+                    stage: DeletePlanStage::Begin,
+                    dry_run: options.dry_run,
+                    include: options.include_patterns,
+                    exclude: options.exclude_patterns,
+                }),
+                None,
+            )
+            .await
+            .context("send delete plan begin over quic")?,
+        "quic",
+    )?;
+    if !begin.accepted {
+        bail!("delete plan begin rejected over quic: {}", begin.message);
     }
+    for payload in chunk_keep_paths_payloads(&options.keep_paths, options.max_stream_payload)? {
+        let chunk = parse_delete_plan_response(
+            session
+                .roundtrip(
+                    Frame::DeletePlanRequest(DeletePlanRequest {
+                        stage: DeletePlanStage::AddKeepChunk,
+                        dry_run: false,
+                        include: Vec::new(),
+                        exclude: Vec::new(),
+                    }),
+                    Some(&payload),
+                )
+                .await
+                .context("send delete plan keep chunk over quic")?,
+            "quic",
+        )?;
+        if !chunk.accepted {
+            bail!("delete plan chunk rejected over quic: {}", chunk.message);
+        }
+    }
+    let applied = parse_delete_plan_response(
+        session
+            .roundtrip(
+                Frame::DeletePlanRequest(DeletePlanRequest {
+                    stage: DeletePlanStage::Apply,
+                    dry_run: false,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                }),
+                None,
+            )
+            .await
+            .context("send delete plan apply over quic")?,
+        "quic",
+    )?;
+    if !applied.accepted {
+        bail!("delete plan apply rejected over quic: {}", applied.message);
+    }
+    session.finish().context("finish quic delete plan stream")?;
+    Ok(applied.deleted)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -355,6 +901,8 @@ struct FileTransferOptions {
     max_stream_payload: usize,
     resume: bool,
     update_only: bool,
+    preserve_metadata: bool,
+    preserve_xattrs: bool,
     stats: TransferStats,
     small_file_max_bytes: u64,
     direct_file_max_bytes: u64,
@@ -756,7 +1304,15 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         scan_stats.enumeration_elapsed.as_millis(),
         scan_stats.hash_elapsed.as_millis(),
     );
-    let total_files = manifest.files.len();
+    let symlinks = collect_symlink_batch(
+        handle.clone(),
+        &options.source,
+        options.scan,
+        options.path_filter.as_ref(),
+        options.preserve_xattrs,
+    )
+    .await?;
+    let total_files = manifest.files.len().saturating_add(symlinks.len());
 
     let transfer_options = FileTransferOptions {
         source_root: PathBuf::from(&manifest.root),
@@ -765,6 +1321,8 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         max_stream_payload: options.max_stream_payload,
         resume: options.resume,
         update_only: options.update_only,
+        preserve_metadata: options.preserve_metadata,
+        preserve_xattrs: options.preserve_xattrs,
         stats: stats.clone(),
         small_file_max_bytes: small_file_max_bytes_from_env(),
         direct_file_max_bytes: direct_file_max_bytes_from_env(),
@@ -908,6 +1466,23 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         );
     }
 
+    let (symlink_transferred, symlink_skipped) = sync_symlinks_over_quic(
+        &connections[0],
+        &symlinks,
+        transfer_options.max_stream_payload,
+        &stats,
+    )
+    .await?;
+    totals.files_transferred = totals.files_transferred.saturating_add(symlink_transferred);
+    totals.files_skipped = totals.files_skipped.saturating_add(symlink_skipped);
+    maybe_print_transfer_progress(
+        options.progress,
+        totals.files_transferred,
+        totals.files_skipped,
+        total_files,
+        totals.bytes_sent,
+    );
+
     let elapsed = started.elapsed();
     stats.print_if_enabled(elapsed, false);
 
@@ -937,6 +1512,7 @@ pub async fn push_directory_over_ssh_stdio(
         options.remote_shell_prefix.as_deref(),
         options.max_stream_payload,
         options.preserve_metadata,
+        options.preserve_xattrs,
         &stats,
         ssh_profile.clone(),
         bw_limiter.clone(),
@@ -998,7 +1574,15 @@ pub async fn push_directory_over_ssh_stdio(
         scan_stats.enumeration_elapsed.as_millis(),
         scan_stats.hash_elapsed.as_millis(),
     );
-    let total_files = manifest.files.len();
+    let symlinks = collect_symlink_batch(
+        handle.clone(),
+        &options.source,
+        options.scan,
+        options.path_filter.as_ref(),
+        options.preserve_xattrs,
+    )
+    .await?;
+    let total_files = manifest.files.len().saturating_add(symlinks.len());
 
     let transfer_options = FileTransferOptions {
         source_root: PathBuf::from(&manifest.root),
@@ -1007,6 +1591,8 @@ pub async fn push_directory_over_ssh_stdio(
         max_stream_payload: options.max_stream_payload,
         resume: options.resume,
         update_only: options.update_only,
+        preserve_metadata: options.preserve_metadata,
+        preserve_xattrs: options.preserve_xattrs,
         stats: stats.clone(),
         small_file_max_bytes: small_file_max_bytes_from_env(),
         direct_file_max_bytes: direct_file_max_bytes_from_env(),
@@ -1084,6 +1670,19 @@ pub async fn push_directory_over_ssh_stdio(
     }
     ssh_profile.add_upload_time(upload_started.elapsed());
 
+    let (symlink_transferred, symlink_skipped) =
+        sync_symlinks_over_ssh(&mut session, &symlinks, transfer_options.max_stream_payload)
+            .await?;
+    totals.files_transferred = totals.files_transferred.saturating_add(symlink_transferred);
+    totals.files_skipped = totals.files_skipped.saturating_add(symlink_skipped);
+    maybe_print_transfer_progress(
+        options.progress,
+        totals.files_transferred,
+        totals.files_skipped,
+        total_files,
+        totals.bytes_sent,
+    );
+
     session.finish().context("finish SSH stdio session")?;
 
     let elapsed = started.elapsed();
@@ -1129,10 +1728,37 @@ async fn push_directory_over_ssh_cold(
     }
     ssh_profile.add_scan_time(enumeration_elapsed.saturating_add(metadata_elapsed));
 
-    let total_bytes = files.iter().map(|item| item.size).sum::<u64>();
+    let mut symlinks = Vec::new();
+    let mut regular_files = Vec::new();
+    for file in files {
+        match file.kind {
+            FileEntryKind::File => regular_files.push(file),
+            FileEntryKind::Symlink => {
+                let target = file.symlink_target.clone().ok_or_else(|| {
+                    anyhow::anyhow!("missing symlink target for {}", file.relative_path)
+                })?;
+                let absolute_path = source_root.join(Path::new(&file.relative_path));
+                let xattrs = collect_path_xattrs(&absolute_path, options.preserve_xattrs, false)
+                    .with_context(|| {
+                        format!("collect symlink xattrs {}", absolute_path.display())
+                    })?;
+                symlinks.push(SymlinkMeta {
+                    relative_path: file.relative_path,
+                    target,
+                    mode: file.mode,
+                    mtime_sec: file.mtime_sec,
+                    uid: file.uid,
+                    gid: file.gid,
+                    xattrs,
+                });
+            }
+        }
+    }
+
+    let total_bytes = regular_files.iter().map(|item| item.size).sum::<u64>();
     println!(
         "scan complete files={} bytes={} enumerate_ms={} hash_ms={}",
-        files.len(),
+        regular_files.len().saturating_add(symlinks.len()),
         total_bytes,
         enumeration_elapsed.as_millis(),
         metadata_elapsed.as_millis(),
@@ -1142,7 +1768,7 @@ async fn push_directory_over_ssh_cold(
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
             "root": source_root,
             "chunk_size": chunk_size,
-            "files": files.iter().map(|item| serde_json::json!({
+            "files": regular_files.iter().map(|item| serde_json::json!({
                 "relative_path": item.relative_path,
                 "size": item.size,
                 "mode": item.mode,
@@ -1166,7 +1792,7 @@ async fn push_directory_over_ssh_cold(
     let mut pending = Vec::new();
 
     let upload_started = Instant::now();
-    for file in files {
+    for file in regular_files {
         let source_path = source_root.join(Path::new(&file.relative_path));
         let read_started = Instant::now();
         let raw = fs::read(&handle, &source_path)
@@ -1212,11 +1838,16 @@ async fn push_directory_over_ssh_cold(
             raw_len as u64,
             encoded_len as u64,
         ));
+        let xattrs = collect_path_xattrs(&source_path, options.preserve_xattrs, true)
+            .with_context(|| format!("collect xattrs {}", source_path.display()))?;
         metas.push(UploadColdFileMeta {
             relative_path: file.relative_path,
             size: file.size,
             mode: file.mode,
             mtime_sec: file.mtime_sec,
+            uid: file.uid,
+            gid: file.gid,
+            xattrs,
             file_hash,
             total_chunks,
             compressed,
@@ -1235,6 +1866,10 @@ async fn push_directory_over_ssh_cold(
         .await?;
         totals.merge(batch);
     }
+    let (symlink_transferred, symlink_skipped) =
+        sync_symlinks_over_ssh(session, &symlinks, options.max_stream_payload).await?;
+    totals.files_transferred = totals.files_transferred.saturating_add(symlink_transferred);
+    totals.files_skipped = totals.files_skipped.saturating_add(symlink_skipped);
     ssh_profile.add_upload_time(upload_started.elapsed());
 
     let elapsed = started.elapsed();
@@ -1258,27 +1893,17 @@ async fn initialize_large_files_over_ssh(
     let init_batches = build_init_batches(files, options.max_stream_payload);
     let mut totals = BatchResult::default();
     let mut uploads = Vec::new();
+    let mut skipped_for_metadata = Vec::new();
     if init_batches.is_empty() {
         return Ok((totals, uploads));
     }
 
     for batch in init_batches {
-        let init_request = Frame::InitBatchRequest(InitBatchRequest {
-            files: batch
-                .iter()
-                .map(|file| InitFileRequest {
-                    relative_path: file.relative_path.clone(),
-                    size: file.size,
-                    mode: file.mode,
-                    mtime_sec: file.mtime_sec,
-                    update_only: options.update_only,
-                    file_hash: file.file_hash.clone(),
-                    chunk_size: options.chunk_size,
-                    total_chunks: file.total_chunks,
-                    resume: options.resume,
-                })
-                .collect(),
-        });
+        let mut init_files = Vec::with_capacity(batch.len());
+        for file in &batch {
+            init_files.push(build_init_file_request(file, options)?);
+        }
+        let init_request = Frame::InitBatchRequest(InitBatchRequest { files: init_files });
 
         let init_response = session
             .roundtrip(init_request, None)
@@ -1301,6 +1926,9 @@ async fn initialize_large_files_over_ssh(
         for (file, result) in batch.into_iter().zip(init.results.into_iter()) {
             if matches!(result.action, InitAction::Skip) {
                 totals.files_skipped = totals.files_skipped.saturating_add(1);
+                if options.preserve_metadata && result.metadata_sync_required {
+                    skipped_for_metadata.push(file);
+                }
                 continue;
             }
             uploads.push((
@@ -1308,10 +1936,16 @@ async fn initialize_large_files_over_ssh(
                 InitFileResponse {
                     action: InitAction::Upload,
                     next_chunk: result.next_chunk,
+                    metadata_sync_required: false,
                     message: result.message,
                 },
             ));
         }
+    }
+
+    if options.preserve_metadata && !skipped_for_metadata.is_empty() {
+        let metadata_entries = collect_file_metadata_entries(options, &skipped_for_metadata)?;
+        sync_file_metadata_over_ssh(session, &metadata_entries, options.max_stream_payload).await?;
     }
 
     Ok((totals, uploads))
@@ -1330,18 +1964,8 @@ async fn transfer_small_batch_over_ssh(
     let init_request = Frame::InitBatchRequest(InitBatchRequest {
         files: files
             .iter()
-            .map(|file| InitFileRequest {
-                relative_path: file.relative_path.clone(),
-                size: file.size,
-                mode: file.mode,
-                mtime_sec: file.mtime_sec,
-                update_only: options.update_only,
-                file_hash: file.file_hash.clone(),
-                chunk_size: options.chunk_size,
-                total_chunks: file.total_chunks,
-                resume: options.resume,
-            })
-            .collect(),
+            .map(|file| build_init_file_request(file, options))
+            .collect::<Result<Vec<_>>>()?,
     });
 
     let init_response = session
@@ -1363,6 +1987,7 @@ async fn transfer_small_batch_over_ssh(
     }
 
     let mut totals = BatchResult::default();
+    let mut skipped_for_metadata = Vec::new();
     let mut upload_metas = Vec::new();
     let mut upload_payload = Vec::new();
     let mut upload_paths = Vec::new();
@@ -1371,6 +1996,9 @@ async fn transfer_small_batch_over_ssh(
     for (file, result) in files.iter().zip(init.results.into_iter()) {
         if matches!(result.action, InitAction::Skip) {
             totals.files_skipped = totals.files_skipped.saturating_add(1);
+            if options.preserve_metadata && result.metadata_sync_required {
+                skipped_for_metadata.push(file.clone());
+            }
             continue;
         }
 
@@ -1380,6 +2008,7 @@ async fn transfer_small_batch_over_ssh(
                 InitFileResponse {
                     action: InitAction::Upload,
                     next_chunk: result.next_chunk,
+                    metadata_sync_required: false,
                     message: result.message,
                 },
             ));
@@ -1415,17 +2044,27 @@ async fn transfer_small_batch_over_ssh(
         totals.bytes_sent = totals.bytes_sent.saturating_add(encoded.len() as u64);
         upload_payload.extend_from_slice(&encoded);
         upload_paths.push(file.relative_path.clone());
+        let xattrs = collect_path_xattrs(&source_path, options.preserve_xattrs, true)
+            .with_context(|| format!("collect xattrs {}", source_path.display()))?;
         upload_metas.push(UploadSmallFileMeta {
             relative_path: file.relative_path.clone(),
             size: file.size,
             mode: file.mode,
             mtime_sec: file.mtime_sec,
+            uid: file.uid,
+            gid: file.gid,
+            xattrs,
             file_hash: file.file_hash.clone(),
             total_chunks: file.total_chunks,
             compressed,
             raw_len,
             data_len: encoded.len(),
         });
+    }
+
+    if options.preserve_metadata && !skipped_for_metadata.is_empty() {
+        let metadata_entries = collect_file_metadata_entries(options, &skipped_for_metadata)?;
+        sync_file_metadata_over_ssh(session, &metadata_entries, options.max_stream_payload).await?;
     }
 
     if !upload_metas.is_empty() {
@@ -1540,11 +2179,16 @@ async fn transfer_initialized_direct_batches_over_ssh(
             raw_len as u64,
             encoded_len as u64,
         ));
+        let xattrs = collect_path_xattrs(&source_path, options.preserve_xattrs, true)
+            .with_context(|| format!("collect xattrs {}", source_path.display()))?;
         metas.push(UploadColdFileMeta {
             relative_path: file.relative_path,
             size: file.size,
             mode: file.mode,
             mtime_sec: file.mtime_sec,
+            uid: file.uid,
+            gid: file.gid,
+            xattrs,
             file_hash: file.file_hash,
             total_chunks: file.total_chunks,
             compressed,
@@ -1681,6 +2325,7 @@ impl<'a> SshFrameSession<'a> {
         remote_shell_prefix: Option<&str>,
         max_stream_payload: usize,
         preserve_metadata: bool,
+        preserve_xattrs: bool,
         stats: &'a TransferStats,
         profile: SshProfile,
         bw_limiter: Option<BwLimiter>,
@@ -1695,6 +2340,9 @@ impl<'a> SshFrameSession<'a> {
         );
         if preserve_metadata {
             remote_cmd.push_str(" --preserve-metadata");
+        }
+        if preserve_xattrs {
+            remote_cmd.push_str(" --preserve-xattrs");
         }
 
         let mut child = ssh_base_command(remote)
@@ -2255,10 +2903,37 @@ async fn push_directory_cold(
         }
     }
 
-    let total_bytes = files.iter().map(|item| item.size).sum::<u64>();
+    let mut symlinks = Vec::new();
+    let mut regular_files = Vec::new();
+    for file in files {
+        match file.kind {
+            FileEntryKind::File => regular_files.push(file),
+            FileEntryKind::Symlink => {
+                let target = file.symlink_target.clone().ok_or_else(|| {
+                    anyhow::anyhow!("missing symlink target for {}", file.relative_path)
+                })?;
+                let absolute_path = source_root.join(Path::new(&file.relative_path));
+                let xattrs = collect_path_xattrs(&absolute_path, options.preserve_xattrs, false)
+                    .with_context(|| {
+                        format!("collect symlink xattrs {}", absolute_path.display())
+                    })?;
+                symlinks.push(SymlinkMeta {
+                    relative_path: file.relative_path,
+                    target,
+                    mode: file.mode,
+                    mtime_sec: file.mtime_sec,
+                    uid: file.uid,
+                    gid: file.gid,
+                    xattrs,
+                });
+            }
+        }
+    }
+
+    let total_bytes = regular_files.iter().map(|item| item.size).sum::<u64>();
     println!(
         "scan complete files={} bytes={} enumerate_ms={} hash_ms={}",
-        files.len(),
+        regular_files.len().saturating_add(symlinks.len()),
         total_bytes,
         enumeration_elapsed.as_millis(),
         metadata_elapsed.as_millis(),
@@ -2268,7 +2943,7 @@ async fn push_directory_cold(
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
             "root": source_root,
             "chunk_size": chunk_size,
-            "files": files.iter().map(|item| serde_json::json!({
+            "files": regular_files.iter().map(|item| serde_json::json!({
                 "relative_path": item.relative_path,
                 "size": item.size,
                 "mode": item.mode,
@@ -2301,7 +2976,7 @@ async fn push_directory_cold(
     let mut running = FuturesUnordered::new();
     let mut next_connection = 0usize;
 
-    for file in files {
+    for file in regular_files {
         let source_path = source_root.join(Path::new(&file.relative_path));
         let read_started = Instant::now();
         let raw = fs::read(&handle, &source_path)
@@ -2357,11 +3032,16 @@ async fn push_directory_cold(
             raw_len as u64,
             encoded_len as u64,
         ));
+        let xattrs = collect_path_xattrs(&source_path, options.preserve_xattrs, true)
+            .with_context(|| format!("collect xattrs {}", source_path.display()))?;
         metas.push(UploadColdFileMeta {
             relative_path: file.relative_path,
             size: file.size,
             mode: file.mode,
             mtime_sec: file.mtime_sec,
+            uid: file.uid,
+            gid: file.gid,
+            xattrs,
             file_hash,
             total_chunks,
             compressed,
@@ -2385,6 +3065,16 @@ async fn push_directory_cold(
     while let Some(joined) = running.next().await {
         totals.merge(joined?);
     }
+
+    let (symlink_transferred, symlink_skipped) = sync_symlinks_over_quic(
+        &connections[0],
+        &symlinks,
+        options.max_stream_payload,
+        &stats,
+    )
+    .await?;
+    totals.files_transferred = totals.files_transferred.saturating_add(symlink_transferred);
+    totals.files_skipped = totals.files_skipped.saturating_add(symlink_skipped);
 
     let elapsed = started.elapsed();
     stats.print_if_enabled(elapsed, true);
@@ -2537,11 +3227,16 @@ async fn transfer_initialized_direct_batches(
             raw_len as u64,
             encoded_len as u64,
         ));
+        let xattrs = collect_path_xattrs(&source_path, options.preserve_xattrs, true)
+            .with_context(|| format!("collect xattrs {}", source_path.display()))?;
         metas.push(UploadColdFileMeta {
             relative_path: file.relative_path,
             size: file.size,
             mode: file.mode,
             mtime_sec: file.mtime_sec,
+            uid: file.uid,
+            gid: file.gid,
+            xattrs,
             file_hash: file.file_hash,
             total_chunks: file.total_chunks,
             compressed,
@@ -2707,6 +3402,7 @@ async fn initialize_large_files(
     let init_batches = build_init_batches(files, options.max_stream_payload);
     let mut totals = BatchResult::default();
     let mut uploads = Vec::new();
+    let mut skipped_for_metadata = Vec::new();
     if init_batches.is_empty() {
         return Ok((totals, uploads));
     }
@@ -2720,22 +3416,11 @@ async fn initialize_large_files(
     .context("open large-file init stream")?;
 
     for batch in init_batches {
-        let init_request = Frame::InitBatchRequest(InitBatchRequest {
-            files: batch
-                .iter()
-                .map(|file| InitFileRequest {
-                    relative_path: file.relative_path.clone(),
-                    size: file.size,
-                    mode: file.mode,
-                    mtime_sec: file.mtime_sec,
-                    update_only: options.update_only,
-                    file_hash: file.file_hash.clone(),
-                    chunk_size: options.chunk_size,
-                    total_chunks: file.total_chunks,
-                    resume: options.resume,
-                })
-                .collect(),
-        });
+        let mut init_files = Vec::with_capacity(batch.len());
+        for file in &batch {
+            init_files.push(build_init_file_request(file, options)?);
+        }
+        let init_request = Frame::InitBatchRequest(InitBatchRequest { files: init_files });
 
         let init_response = session
             .roundtrip(init_request, None)
@@ -2758,6 +3443,9 @@ async fn initialize_large_files(
         for (file, result) in batch.into_iter().zip(init.results.into_iter()) {
             if matches!(result.action, InitAction::Skip) {
                 totals.files_skipped = totals.files_skipped.saturating_add(1);
+                if options.preserve_metadata && result.metadata_sync_required {
+                    skipped_for_metadata.push(file);
+                }
                 continue;
             }
             uploads.push((
@@ -2765,10 +3453,22 @@ async fn initialize_large_files(
                 InitFileResponse {
                     action: InitAction::Upload,
                     next_chunk: result.next_chunk,
+                    metadata_sync_required: false,
                     message: result.message,
                 },
             ));
         }
+    }
+
+    if options.preserve_metadata && !skipped_for_metadata.is_empty() {
+        let metadata_entries = collect_file_metadata_entries(options, &skipped_for_metadata)?;
+        sync_file_metadata_over_quic(
+            connection,
+            &metadata_entries,
+            options.max_stream_payload,
+            &options.stats,
+        )
+        .await?;
     }
 
     session.finish().context("finish large-file init stream")?;
@@ -2798,18 +3498,8 @@ async fn transfer_small_batch(
     let init_request = Frame::InitBatchRequest(InitBatchRequest {
         files: files
             .iter()
-            .map(|file| InitFileRequest {
-                relative_path: file.relative_path.clone(),
-                size: file.size,
-                mode: file.mode,
-                mtime_sec: file.mtime_sec,
-                update_only: options.update_only,
-                file_hash: file.file_hash.clone(),
-                chunk_size: options.chunk_size,
-                total_chunks: file.total_chunks,
-                resume: options.resume,
-            })
-            .collect(),
+            .map(|file| build_init_file_request(file, options))
+            .collect::<Result<Vec<_>>>()?,
     });
 
     let init_response = session
@@ -2831,6 +3521,7 @@ async fn transfer_small_batch(
     }
 
     let mut totals = BatchResult::default();
+    let mut skipped_for_metadata = Vec::new();
     let mut upload_metas = Vec::new();
     let mut upload_payload = Vec::new();
     let mut upload_paths = Vec::new();
@@ -2839,6 +3530,9 @@ async fn transfer_small_batch(
     for (file, result) in files.iter().zip(init.results.into_iter()) {
         if matches!(result.action, InitAction::Skip) {
             totals.files_skipped = totals.files_skipped.saturating_add(1);
+            if options.preserve_metadata && result.metadata_sync_required {
+                skipped_for_metadata.push(file.clone());
+            }
             continue;
         }
 
@@ -2848,6 +3542,7 @@ async fn transfer_small_batch(
                 InitFileResponse {
                     action: InitAction::Upload,
                     next_chunk: result.next_chunk,
+                    metadata_sync_required: false,
                     message: result.message,
                 },
             ));
@@ -2883,17 +3578,33 @@ async fn transfer_small_batch(
         totals.bytes_sent = totals.bytes_sent.saturating_add(encoded.len() as u64);
         upload_payload.extend_from_slice(&encoded);
         upload_paths.push(file.relative_path.clone());
+        let xattrs = collect_path_xattrs(&source_path, options.preserve_xattrs, true)
+            .with_context(|| format!("collect xattrs {}", source_path.display()))?;
         upload_metas.push(UploadSmallFileMeta {
             relative_path: file.relative_path.clone(),
             size: file.size,
             mode: file.mode,
             mtime_sec: file.mtime_sec,
+            uid: file.uid,
+            gid: file.gid,
+            xattrs,
             file_hash: file.file_hash.clone(),
             total_chunks: file.total_chunks,
             compressed,
             raw_len,
             data_len: encoded.len(),
         });
+    }
+
+    if options.preserve_metadata && !skipped_for_metadata.is_empty() {
+        let metadata_entries = collect_file_metadata_entries(options, &skipped_for_metadata)?;
+        sync_file_metadata_over_quic(
+            connection,
+            &metadata_entries,
+            options.max_stream_payload,
+            &options.stats,
+        )
+        .await?;
     }
 
     if !upload_metas.is_empty() {
@@ -3207,6 +3918,14 @@ async fn prepare_upload_batch(
         size: file.size,
         mode: file.mode,
         mtime_sec: file.mtime_sec,
+        uid: file.uid,
+        gid: file.gid,
+        xattrs: if finalize {
+            collect_path_xattrs(source_path.as_ref(), options.preserve_xattrs, true)
+                .with_context(|| format!("collect xattrs {}", source_path.display()))?
+        } else {
+            Vec::new()
+        },
         file_hash: file.file_hash.clone(),
         total_chunks: file.total_chunks,
         start_chunk,
@@ -3500,18 +4219,38 @@ pub async fn stream_source_to_stdout(
     let mut bytes_streamed = 0u64;
 
     for file in files {
+        let source_path = source_root.join(Path::new(&file.relative_path));
+        let (entry_kind, symlink_target, size, follow_symlink) = match file.kind {
+            FileEntryKind::File => (SourceEntryKind::File, None, file.size, true),
+            FileEntryKind::Symlink => (
+                SourceEntryKind::Symlink,
+                file.symlink_target.clone(),
+                0,
+                false,
+            ),
+        };
+        let xattrs = if options.preserve_xattrs {
+            collect_path_xattrs(&source_path, options.preserve_xattrs, follow_symlink)
+                .with_context(|| format!("collect xattrs {}", source_path.display()))?
+        } else {
+            Vec::new()
+        };
         let start = Frame::SourceStreamFileStart(SourceStreamFileStart {
             relative_path: file.relative_path.clone(),
-            size: file.size,
+            entry_kind,
+            symlink_target,
+            size,
             mode: file.mode,
             mtime_sec: file.mtime_sec,
+            uid: file.uid,
+            gid: file.gid,
+            xattrs,
         });
         write_frame_to_fd(&native, stdout_fd, options.max_stream_payload, &start, None)
             .await
             .with_context(|| format!("write source stream start {}", file.relative_path))?;
 
-        if !options.metadata_only {
-            let source_path = source_root.join(Path::new(&file.relative_path));
+        if !options.metadata_only && matches!(file.kind, FileEntryKind::File) {
             let source_file = fs::File::open(handle.clone(), &source_path)
                 .await
                 .with_context(|| format!("open source file {}", source_path.display()))?;
@@ -3590,6 +4329,9 @@ pub async fn pull_directory_over_ssh_stream(
     if options.metadata_only {
         remote_cmd.push_str(" --metadata-only");
     }
+    if options.preserve_metadata {
+        remote_cmd.push_str(" --preserve-metadata");
+    }
     for pattern in &options.include_patterns {
         remote_cmd.push_str(" --include ");
         remote_cmd.push_str(&sh_quote(pattern));
@@ -3664,8 +4406,25 @@ pub async fn pull_directory_over_ssh_stream(
                 }
                 keep.insert(meta.relative_path.clone());
                 let destination_path = options.destination.join(Path::new(&meta.relative_path));
+                let is_symlink = matches!(meta.entry_kind, SourceEntryKind::Symlink);
                 let mut copy = true;
-                if let Ok(existing) = fs::metadata_lite(&handle, &destination_path).await {
+                if is_symlink {
+                    if let Ok(existing) = fs::symlink_metadata(&handle, &destination_path).await {
+                        #[cfg(unix)]
+                        let existing_mtime = existing.mtime();
+                        #[cfg(not(unix))]
+                        let existing_mtime = 0i64;
+                        if options.update_only {
+                            if existing_mtime >= meta.mtime_sec {
+                                copy = false;
+                            }
+                        } else if existing_mtime == meta.mtime_sec {
+                            if let Some(target) = meta.symlink_target.as_deref() {
+                                copy = !existing_symlink_matches(&destination_path, target);
+                            }
+                        }
+                    }
+                } else if let Ok(existing) = fs::metadata_lite(&handle, &destination_path).await {
                     if options.update_only {
                         if existing.mtime_sec >= meta.mtime_sec {
                             copy = false;
@@ -3695,7 +4454,54 @@ pub async fn pull_directory_over_ssh_stream(
                             format!("create destination parent {}", parent.display())
                         })?;
                     }
+                    if is_symlink {
+                        let target = meta.symlink_target.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("missing symlink target for {}", meta.relative_path)
+                        })?;
+                        create_or_replace_symlink(&handle, &destination_path, target).await?;
+                        apply_pulled_metadata(
+                            &handle,
+                            &destination_path,
+                            meta.mode,
+                            meta.mtime_sec,
+                            meta.uid,
+                            meta.gid,
+                            &meta.xattrs,
+                            options.preserve_metadata,
+                            options.preserve_xattrs,
+                            false,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "apply metadata to pulled symlink {}",
+                                destination_path.display()
+                            )
+                        })?;
+                    }
                 } else {
+                    if options.preserve_metadata && !options.update_only {
+                        let follow_symlink = !is_symlink;
+                        apply_pulled_metadata(
+                            &handle,
+                            &destination_path,
+                            meta.mode,
+                            meta.mtime_sec,
+                            meta.uid,
+                            meta.gid,
+                            &meta.xattrs,
+                            options.preserve_metadata,
+                            options.preserve_xattrs,
+                            follow_symlink,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "apply metadata to skipped pulled path {}",
+                                destination_path.display()
+                            )
+                        })?;
+                    }
                     summary.files_skipped = summary.files_skipped.saturating_add(1);
                     maybe_print_pull_progress(
                         options.progress,
@@ -3706,13 +4512,20 @@ pub async fn pull_directory_over_ssh_stream(
                 }
 
                 let writer = if copy {
-                    Some(
-                        fs::File::create(handle.clone(), &destination_path)
-                            .await
-                            .with_context(|| {
-                                format!("create destination file {}", destination_path.display())
-                            })?,
-                    )
+                    if is_symlink {
+                        None
+                    } else {
+                        Some(
+                            fs::File::create(handle.clone(), &destination_path)
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "create destination file {}",
+                                        destination_path.display()
+                                    )
+                                })?,
+                        )
+                    }
                 } else {
                     None
                 };
@@ -3728,6 +4541,12 @@ pub async fn pull_directory_over_ssh_stream(
                 let Some(state) = active.as_mut() else {
                     bail!("received source chunk without active file");
                 };
+                if matches!(state.meta.entry_kind, SourceEntryKind::Symlink) {
+                    bail!(
+                        "received data chunk for symlink {}",
+                        state.meta.relative_path
+                    );
+                }
                 if payload.len() != chunk.chunk_len as usize {
                     bail!(
                         "source chunk payload mismatch for {}: header={} payload={}",
@@ -3768,7 +4587,10 @@ pub async fn pull_directory_over_ssh_stream(
                         end.relative_path
                     );
                 }
-                if !options.metadata_only && state.offset != state.meta.size {
+                if matches!(state.meta.entry_kind, SourceEntryKind::File)
+                    && !options.metadata_only
+                    && state.offset != state.meta.size
+                {
                     bail!(
                         "source stream size mismatch for {}: expected {} got {}",
                         state.meta.relative_path,
@@ -3777,25 +4599,32 @@ pub async fn pull_directory_over_ssh_stream(
                     );
                 }
                 if state.copy && !options.dry_run {
-                    if let Some(writer) = state.writer.take() {
-                        writer.fsync().await.with_context(|| {
-                            format!("fsync {}", state.destination_path.display())
+                    if matches!(state.meta.entry_kind, SourceEntryKind::File) {
+                        if let Some(writer) = state.writer.take() {
+                            writer.fsync().await.with_context(|| {
+                                format!("fsync {}", state.destination_path.display())
+                            })?;
+                        }
+                        apply_pulled_metadata(
+                            &handle,
+                            &state.destination_path,
+                            state.meta.mode,
+                            state.meta.mtime_sec,
+                            state.meta.uid,
+                            state.meta.gid,
+                            &state.meta.xattrs,
+                            options.preserve_metadata,
+                            options.preserve_xattrs,
+                            true,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "apply metadata to pulled file {}",
+                                state.destination_path.display()
+                            )
                         })?;
                     }
-                    apply_pulled_metadata(
-                        &handle,
-                        &state.destination_path,
-                        state.meta.mode,
-                        state.meta.mtime_sec,
-                        options.preserve_metadata,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "apply metadata to pulled file {}",
-                            state.destination_path.display()
-                        )
-                    })?;
                     summary.files_copied = summary.files_copied.saturating_add(1);
                     maybe_print_pull_progress(
                         options.progress,
@@ -3850,6 +4679,429 @@ pub async fn pull_directory_over_ssh_stream(
     }
     summary.elapsed = started.elapsed();
     Ok(summary)
+}
+
+pub async fn pull_directory_over_quic(
+    handle: RuntimeHandle,
+    options: PullOverQuicOptions,
+) -> Result<PullSummary> {
+    let started = Instant::now();
+    let stats = TransferStats::from_env();
+    let client_config = certs::load_client_config(
+        &options.ca,
+        options.client_cert.as_deref(),
+        options.client_key.as_deref(),
+    )
+    .with_context(|| {
+        format!(
+            "load client TLS config for pull ca={} client_cert={} client_key={}",
+            options.ca.display(),
+            options
+                .client_cert
+                .as_ref()
+                .map(|v| v.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            options
+                .client_key
+                .as_ref()
+                .map(|v| v.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        )
+    })?;
+
+    let endpoint_options = QuicEndpointOptions::default()
+        .with_connect_timeout(options.connect_timeout)
+        .with_operation_timeout(options.operation_timeout)
+        .with_max_inflight_ops(65_536);
+    let mut endpoint =
+        QuicEndpoint::client_with_options("0.0.0.0:0".parse().unwrap(), endpoint_options)
+            .context("create quic client endpoint for pull")?;
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(options.server, &options.server_name)
+        .await
+        .with_context(|| {
+            format!(
+                "connect for pull to {} ({})",
+                options.server, options.server_name
+            )
+        })?;
+    verify_protocol(&connection, options.max_stream_payload, &stats)
+        .await
+        .context("validate protocol compatibility for pull")?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("open quic stream for source pull")?;
+    let request = Frame::SourceStreamRequest(SourceStreamRequest {
+        chunk_size: options.chunk_size.max(1),
+        metadata_only: options.metadata_only,
+        preserve_metadata: options.preserve_metadata,
+        preserve_xattrs: options.preserve_xattrs,
+        include: options.include_patterns.clone(),
+        exclude: options.exclude_patterns.clone(),
+    });
+    let request_bytes = crate::protocol::encode(&request, None).context("encode source request")?;
+    if request_bytes.len() > options.max_stream_payload {
+        bail!(
+            "source stream request too large: {} > {}",
+            request_bytes.len(),
+            options.max_stream_payload
+        );
+    }
+    send.write_all(&request_bytes)
+        .await
+        .context("write source stream request")?;
+    send.finish().context("finish source stream request")?;
+
+    let bw_limiter = BwLimiter::from_kbps(options.bwlimit_kbps);
+    let mut read_buffer = Vec::with_capacity(64 * 1024);
+    let mut read_frame_len = None;
+    let mut keep = HashSet::new();
+    let mut summary = PullSummary::default();
+    let mut done_summary = None;
+    let mut active: Option<PullActiveFile> = None;
+
+    loop {
+        let maybe_frame = read_next_frame_from_quic_recv(
+            &mut recv,
+            &mut read_buffer,
+            &mut read_frame_len,
+            options.max_stream_payload,
+        )
+        .await
+        .context("read source stream frame from quic")?;
+        let Some(frame_bytes) = maybe_frame else {
+            break;
+        };
+        let (frame, payload) =
+            crate::protocol::decode(&frame_bytes).context("decode source frame")?;
+        match frame {
+            Frame::SourceStreamFileStart(meta) => {
+                if active.is_some() {
+                    bail!(
+                        "received nested source stream file start for {}",
+                        meta.relative_path
+                    );
+                }
+                if !options.path_filter.allows(&meta.relative_path) {
+                    active = Some(PullActiveFile {
+                        destination_path: options.destination.join(Path::new(&meta.relative_path)),
+                        writer: None,
+                        offset: 0,
+                        copy: false,
+                        meta,
+                    });
+                    continue;
+                }
+                keep.insert(meta.relative_path.clone());
+                let destination_path = options.destination.join(Path::new(&meta.relative_path));
+                let is_symlink = matches!(meta.entry_kind, SourceEntryKind::Symlink);
+                let mut copy = true;
+                if is_symlink {
+                    if let Ok(existing) = fs::symlink_metadata(&handle, &destination_path).await {
+                        #[cfg(unix)]
+                        let existing_mtime = existing.mtime();
+                        #[cfg(not(unix))]
+                        let existing_mtime = 0i64;
+                        if options.update_only {
+                            if existing_mtime >= meta.mtime_sec {
+                                copy = false;
+                            }
+                        } else if existing_mtime == meta.mtime_sec {
+                            if let Some(target) = meta.symlink_target.as_deref() {
+                                copy = !existing_symlink_matches(&destination_path, target);
+                            }
+                        }
+                    }
+                } else if let Ok(existing) = fs::metadata_lite(&handle, &destination_path).await {
+                    if options.update_only {
+                        if existing.mtime_sec >= meta.mtime_sec {
+                            copy = false;
+                        }
+                    } else if existing.size == meta.size && existing.mtime_sec == meta.mtime_sec {
+                        copy = false;
+                    }
+                }
+
+                if options.dry_run {
+                    if copy {
+                        summary.files_copied = summary.files_copied.saturating_add(1);
+                        summary.bytes_received = summary.bytes_received.saturating_add(meta.size);
+                    } else {
+                        summary.files_skipped = summary.files_skipped.saturating_add(1);
+                    }
+                    maybe_print_pull_progress(
+                        options.progress,
+                        summary.files_copied,
+                        summary.files_skipped,
+                        summary.bytes_received,
+                    );
+                    copy = false;
+                } else if copy {
+                    if let Some(parent) = destination_path.parent() {
+                        fs::create_dir_all(&handle, parent).await.with_context(|| {
+                            format!("create destination parent {}", parent.display())
+                        })?;
+                    }
+                    if is_symlink {
+                        let target = meta.symlink_target.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("missing symlink target for {}", meta.relative_path)
+                        })?;
+                        create_or_replace_symlink(&handle, &destination_path, target).await?;
+                        apply_pulled_metadata(
+                            &handle,
+                            &destination_path,
+                            meta.mode,
+                            meta.mtime_sec,
+                            meta.uid,
+                            meta.gid,
+                            &meta.xattrs,
+                            options.preserve_metadata,
+                            options.preserve_xattrs,
+                            false,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "apply metadata to pulled symlink {}",
+                                destination_path.display()
+                            )
+                        })?;
+                    }
+                } else {
+                    if options.preserve_metadata && !options.update_only {
+                        let follow_symlink = !is_symlink;
+                        apply_pulled_metadata(
+                            &handle,
+                            &destination_path,
+                            meta.mode,
+                            meta.mtime_sec,
+                            meta.uid,
+                            meta.gid,
+                            &meta.xattrs,
+                            options.preserve_metadata,
+                            options.preserve_xattrs,
+                            follow_symlink,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "apply metadata to skipped pulled path {}",
+                                destination_path.display()
+                            )
+                        })?;
+                    }
+                    summary.files_skipped = summary.files_skipped.saturating_add(1);
+                    maybe_print_pull_progress(
+                        options.progress,
+                        summary.files_copied,
+                        summary.files_skipped,
+                        summary.bytes_received,
+                    );
+                }
+
+                let writer = if copy {
+                    if is_symlink {
+                        None
+                    } else {
+                        Some(
+                            fs::File::create(handle.clone(), &destination_path)
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "create destination file {}",
+                                        destination_path.display()
+                                    )
+                                })?,
+                        )
+                    }
+                } else {
+                    None
+                };
+                active = Some(PullActiveFile {
+                    meta,
+                    destination_path,
+                    writer,
+                    offset: 0,
+                    copy,
+                });
+            }
+            Frame::SourceStreamChunk(chunk) => {
+                let Some(state) = active.as_mut() else {
+                    bail!("received source chunk without active file");
+                };
+                if matches!(state.meta.entry_kind, SourceEntryKind::Symlink) {
+                    bail!(
+                        "received data chunk for symlink {}",
+                        state.meta.relative_path
+                    );
+                }
+                if payload.len() != chunk.chunk_len as usize {
+                    bail!(
+                        "source chunk payload mismatch for {}: header={} payload={}",
+                        state.meta.relative_path,
+                        chunk.chunk_len,
+                        payload.len()
+                    );
+                }
+                if state.copy && !options.dry_run {
+                    if let Some(limiter) = &bw_limiter {
+                        limiter.throttle(payload.len()).await;
+                    }
+                    let writer = state.writer.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing destination writer for {}",
+                            state.meta.relative_path
+                        )
+                    })?;
+                    writer
+                        .write_all_at(state.offset, payload)
+                        .await
+                        .with_context(|| {
+                            format!("write destination {}", state.destination_path.display())
+                        })?;
+                    summary.bytes_received =
+                        summary.bytes_received.saturating_add(payload.len() as u64);
+                }
+                state.offset = state.offset.saturating_add(payload.len() as u64);
+            }
+            Frame::SourceStreamFileEnd(end) => {
+                let Some(mut state) = active.take() else {
+                    bail!("received source file end without active file");
+                };
+                if end.relative_path != state.meta.relative_path {
+                    bail!(
+                        "source stream file mismatch: start={} end={}",
+                        state.meta.relative_path,
+                        end.relative_path
+                    );
+                }
+                if matches!(state.meta.entry_kind, SourceEntryKind::File)
+                    && !options.metadata_only
+                    && state.offset != state.meta.size
+                {
+                    bail!(
+                        "source stream size mismatch for {}: expected {} got {}",
+                        state.meta.relative_path,
+                        state.meta.size,
+                        state.offset
+                    );
+                }
+                if state.copy && !options.dry_run {
+                    if matches!(state.meta.entry_kind, SourceEntryKind::File) {
+                        if let Some(writer) = state.writer.take() {
+                            writer.fsync().await.with_context(|| {
+                                format!("fsync {}", state.destination_path.display())
+                            })?;
+                        }
+                        apply_pulled_metadata(
+                            &handle,
+                            &state.destination_path,
+                            state.meta.mode,
+                            state.meta.mtime_sec,
+                            state.meta.uid,
+                            state.meta.gid,
+                            &state.meta.xattrs,
+                            options.preserve_metadata,
+                            options.preserve_xattrs,
+                            true,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "apply metadata to pulled file {}",
+                                state.destination_path.display()
+                            )
+                        })?;
+                    }
+                    summary.files_copied = summary.files_copied.saturating_add(1);
+                    maybe_print_pull_progress(
+                        options.progress,
+                        summary.files_copied,
+                        summary.files_skipped,
+                        summary.bytes_received,
+                    );
+                }
+            }
+            Frame::SourceStreamDone(done) => {
+                done_summary = Some(done);
+            }
+            Frame::Error(err) => bail!("remote source stream error: {}", err.message),
+            other => bail!("unexpected frame in source stream: {other:?}"),
+        }
+    }
+
+    if let Some(active) = active {
+        bail!(
+            "source stream ended mid-file for {} at offset {}",
+            active.meta.relative_path,
+            active.offset
+        );
+    }
+    if let Some(done) = done_summary {
+        if done.files != keep.len() as u64 {
+            bail!(
+                "source stream file count mismatch: remote={} local={}",
+                done.files,
+                keep.len()
+            );
+        }
+    }
+    if options.delete {
+        summary.files_deleted = crate::local_copy::prune_destination(
+            &handle,
+            &options.destination,
+            &keep,
+            &options.path_filter,
+            options.dry_run,
+        )
+        .await?;
+    }
+    summary.elapsed = started.elapsed();
+    Ok(summary)
+}
+
+async fn read_next_frame_from_quic_recv(
+    recv: &mut QuicRecvStream,
+    buffer: &mut Vec<u8>,
+    expected_len: &mut Option<usize>,
+    max_stream_payload: usize,
+) -> Result<Option<Vec<u8>>> {
+    loop {
+        if let Some(frame) = try_extract_frame(buffer, expected_len, max_stream_payload)? {
+            return Ok(Some(frame));
+        }
+
+        let remaining = max_stream_payload
+            .saturating_sub(buffer.len())
+            .min(256 * 1024)
+            .max(1);
+        let chunk = recv
+            .read_chunk(remaining)
+            .await
+            .context("read source frame bytes from quic")?;
+        let Some(chunk) = chunk else {
+            if buffer.is_empty() && expected_len.is_none() {
+                return Ok(None);
+            }
+            if let Some(expected) = *expected_len {
+                bail!(
+                    "quic source stream closed with partial frame: have {} expected {}",
+                    buffer.len(),
+                    expected
+                );
+            }
+            bail!(
+                "quic source stream closed with {} buffered bytes",
+                buffer.len()
+            );
+        };
+        if !chunk.is_empty() {
+            buffer.extend_from_slice(chunk.as_ref());
+        }
+    }
 }
 
 async fn read_next_frame_from_fd(
@@ -3948,25 +5200,75 @@ async fn write_all_to_fd(native: &spargio::UringNativeAny, fd: RawFd, bytes: &[u
     Ok(())
 }
 
+async fn remove_existing_path_for_symlink(handle: &RuntimeHandle, path: &Path) -> Result<()> {
+    match fs::symlink_metadata(handle, path).await {
+        Ok(meta) => {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("remove existing directory {}", path.display()))?;
+            } else {
+                fs::remove_file(handle, path)
+                    .await
+                    .with_context(|| format!("remove existing file {}", path.display()))?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("lstat {}", path.display())),
+    }
+}
+
+async fn create_or_replace_symlink(
+    handle: &RuntimeHandle,
+    destination: &Path,
+    target: &str,
+) -> Result<()> {
+    remove_existing_path_for_symlink(handle, destination).await?;
+    fs::symlink(handle, Path::new(target), destination)
+        .await
+        .with_context(|| format!("create symlink {} -> {}", destination.display(), target))
+}
+
+fn existing_symlink_matches(path: &Path, target: &str) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    metadata::read_link_target(path)
+        .map(|value| value == target)
+        .unwrap_or(false)
+}
+
 async fn apply_pulled_metadata(
     handle: &RuntimeHandle,
     path: &Path,
     mode: u32,
     mtime_sec: i64,
+    uid: u32,
+    gid: u32,
+    xattrs: &[XattrEntry],
     preserve: bool,
+    preserve_xattrs: bool,
+    follow_symlink: bool,
 ) -> Result<()> {
     if !preserve {
         return Ok(());
     }
     #[cfg(unix)]
     {
-        let perms = std::fs::Permissions::from_mode(mode & 0o7777);
-        fs::set_permissions(handle, path, perms)
-            .await
-            .with_context(|| format!("set permissions {}", path.display()))?;
+        if follow_symlink {
+            let perms = std::fs::Permissions::from_mode(mode & 0o7777);
+            fs::set_permissions(handle, path, perms)
+                .await
+                .with_context(|| format!("set permissions {}", path.display()))?;
+        }
     }
-    let file_time = filetime::FileTime::from_unix_time(mtime_sec, 0);
-    filetime::set_file_mtime(path, file_time)
-        .with_context(|| format!("set mtime {}", path.display()))?;
+    metadata::set_owner(path, uid, gid, follow_symlink)?;
+    if preserve_xattrs {
+        metadata::apply_xattrs(path, xattrs, follow_symlink)?;
+    }
+    metadata::set_mtime(path, mtime_sec, follow_symlink)?;
     Ok(())
 }

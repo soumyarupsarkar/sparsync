@@ -7,6 +7,8 @@ use spargio::{RuntimeHandle, fs};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,9 +33,19 @@ pub struct ScanStats {
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub relative_path: String,
+    pub kind: FileEntryKind,
+    pub symlink_target: Option<String>,
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileEntryKind {
+    File,
+    Symlink,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +73,7 @@ pub async fn build_manifest(
         .with_context(|| format!("canonicalize {}", root.display()))?;
 
     let enum_started = Instant::now();
-    let files = enumerate_files(handle.clone(), &root, options.scan_workers.max(1)).await?;
+    let files = enumerate_paths(handle.clone(), &root, options.scan_workers.max(1), false).await?;
     let enumeration_elapsed = enum_started.elapsed();
     let chunk_size = options.chunk_size.max(1);
 
@@ -109,7 +121,7 @@ pub async fn build_file_list(
         .with_context(|| format!("canonicalize {}", root.display()))?;
 
     let enum_started = Instant::now();
-    let files = enumerate_files(handle.clone(), &root, scan_workers.max(1)).await?;
+    let files = enumerate_paths(handle.clone(), &root, scan_workers.max(1), true).await?;
     let enumeration_elapsed = enum_started.elapsed();
 
     let metadata_started = Instant::now();
@@ -120,10 +132,11 @@ pub async fn build_file_list(
     Ok((root, entries, enumeration_elapsed, metadata_elapsed))
 }
 
-async fn enumerate_files(
+async fn enumerate_paths(
     handle: RuntimeHandle,
     root: &Path,
     workers: usize,
+    include_symlinks: bool,
 ) -> Result<Vec<PathBuf>> {
     let directories = Arc::new(Mutex::new(VecDeque::from([root.to_path_buf()])));
     let files = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
@@ -164,6 +177,12 @@ async fn enumerate_files(
                                     guard.push_back(entry.path);
                                 }
                                 fs::DirEntryType::File => {
+                                    let mut guard = files
+                                        .lock()
+                                        .map_err(|_| anyhow::anyhow!("file list mutex poisoned"))?;
+                                    guard.push(entry.path);
+                                }
+                                fs::DirEntryType::Symlink if include_symlinks => {
                                     let mut guard = files
                                         .lock()
                                         .map_err(|_| anyhow::anyhow!("file list mutex poisoned"))?;
@@ -332,6 +351,8 @@ async fn hash_one_file(
                 size: metadata.size,
                 mode: metadata.mode as u32,
                 mtime_sec: metadata.mtime_sec,
+                uid: metadata.uid,
+                gid: metadata.gid,
                 file_hash: entry.file_hash.clone(),
                 total_chunks: entry.total_chunks,
             });
@@ -370,6 +391,8 @@ async fn hash_one_file(
         size: metadata.size,
         mode: metadata.mode as u32,
         mtime_sec: metadata.mtime_sec,
+        uid: metadata.uid,
+        gid: metadata.gid,
         file_hash: file_hasher.finalize().to_hex().to_string(),
         total_chunks,
     })
@@ -380,19 +403,61 @@ async fn metadata_one_file(
     root: &Path,
     absolute_path: &Path,
 ) -> Result<FileEntry> {
+    let relative_path = relative_path_string(root, absolute_path)?;
+    let symlink_metadata = fs::symlink_metadata(&handle, absolute_path)
+        .await
+        .with_context(|| format!("lstat {}", absolute_path.display()))?;
+    if symlink_metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(absolute_path)
+            .with_context(|| format!("read symlink {}", absolute_path.display()))?;
+        #[cfg(unix)]
+        {
+            return Ok(FileEntry {
+                relative_path,
+                kind: FileEntryKind::Symlink,
+                symlink_target: Some(target.to_string_lossy().into_owned()),
+                size: symlink_metadata.len(),
+                mode: symlink_metadata.mode() as u32,
+                mtime_sec: symlink_metadata.mtime(),
+                uid: symlink_metadata.uid(),
+                gid: symlink_metadata.gid(),
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            return Ok(FileEntry {
+                relative_path,
+                kind: FileEntryKind::Symlink,
+                symlink_target: None,
+                size: symlink_metadata.len(),
+                mode: 0,
+                mtime_sec: 0,
+                uid: 0,
+                gid: 0,
+            });
+        }
+    }
+
     let metadata = fs::metadata_lite(&handle, absolute_path)
         .await
         .with_context(|| format!("stat {}", absolute_path.display()))?;
     if !metadata.is_file() {
-        return Err(anyhow::anyhow!("{} is not a file", absolute_path.display()));
+        return Err(anyhow::anyhow!(
+            "{} is neither file nor symlink",
+            absolute_path.display()
+        ));
     }
 
-    let relative_path = relative_path_string(root, absolute_path)?;
     Ok(FileEntry {
         relative_path,
+        kind: FileEntryKind::File,
+        symlink_target: None,
         size: metadata.size,
         mode: metadata.mode as u32,
         mtime_sec: metadata.mtime_sec,
+        uid: metadata.uid,
+        gid: metadata.gid,
     })
 }
 

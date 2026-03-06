@@ -2,12 +2,17 @@ use crate::auth::{AuthzPolicy, load_authz_policy};
 use crate::certs;
 use crate::compression;
 use crate::filter::PathFilter;
+use crate::metadata;
 use crate::protocol::{
-    DeletePlanRequest, DeletePlanResponse, ErrorFrame, Frame, HelloRequest, HelloResponse,
-    InitAction, InitBatchRequest, InitBatchResponse, InitBatchResult, InitFileRequest,
-    InitFileResponse, PROTOCOL_VERSION, UploadBatchRequest, UploadBatchResponse,
-    UploadColdBatchRequest, UploadColdBatchResponse, UploadColdFileMeta, UploadColdFileResult,
-    UploadSmallBatchRequest, UploadSmallBatchResponse, UploadSmallFileMeta, UploadSmallFileResult,
+    DeletePlanRequest, DeletePlanResponse, DeletePlanStage, ErrorFrame, Frame, HelloRequest,
+    HelloResponse, InitAction, InitBatchRequest, InitBatchResponse, InitBatchResult,
+    InitFileRequest, InitFileResponse, PROTOCOL_VERSION, SourceEntryKind, SourceStreamChunk,
+    SourceStreamDone, SourceStreamFileEnd, SourceStreamFileStart, SourceStreamRequest, SymlinkMeta,
+    SyncFileMetadataBatchRequest, SyncFileMetadataBatchResponse, SyncFileMetadataResult,
+    SyncSymlinkBatchRequest, SyncSymlinkBatchResponse, SyncSymlinkResult, UploadBatchRequest,
+    UploadBatchResponse, UploadColdBatchRequest, UploadColdBatchResponse, UploadColdFileMeta,
+    UploadColdFileResult, UploadSmallBatchRequest, UploadSmallBatchResponse, UploadSmallFileMeta,
+    UploadSmallFileResult, XattrEntry,
 };
 use crate::state::{CompleteFileInput, StateStore};
 use crate::util::{partial_path, sanitize_relative};
@@ -17,6 +22,8 @@ use spargio::{RuntimeHandle, fs};
 use spargio_quic::{QuicBackend, QuicEndpoint, QuicEndpointOptions};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +40,7 @@ pub struct ServeOptions {
     pub authz: Option<PathBuf>,
     pub max_stream_payload: usize,
     pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
     pub once: bool,
     pub once_idle_timeout: Duration,
 }
@@ -44,6 +52,7 @@ struct ServerContext {
     state: StateStore,
     max_stream_payload: usize,
     preserve_metadata: bool,
+    preserve_xattrs: bool,
     partials_maybe_empty: Arc<AtomicBool>,
     authz_policy: Option<Arc<AuthzPolicy>>,
     connection_auth: Option<Arc<ConnectionAuth>>,
@@ -56,6 +65,14 @@ struct ConnectionAuth {
     fingerprint_sha256: String,
     allowed_prefixes: Vec<String>,
     bytes_written: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct DeletePlanState {
+    dry_run: bool,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    keep: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -269,6 +286,7 @@ pub async fn run_server(handle: RuntimeHandle, options: ServeOptions) -> Result<
         state,
         max_stream_payload: options.max_stream_payload,
         preserve_metadata: options.preserve_metadata,
+        preserve_xattrs: options.preserve_xattrs,
         partials_maybe_empty: Arc::new(AtomicBool::new(partials_maybe_empty)),
         authz_policy: options
             .authz
@@ -597,6 +615,7 @@ async fn handle_stream(
     let stream_idx = context.profile.add_stream();
     let mut read_buffer = Vec::with_capacity(64 * 1024);
     let mut expected_len = None;
+    let mut delete_plan_state: Option<DeletePlanState> = None;
 
     loop {
         let bytes =
@@ -611,6 +630,22 @@ async fn handle_stream(
         context.profile.add_decode(decode_started.elapsed());
 
         let process_started = Instant::now();
+        if let Frame::SourceStreamRequest(req) = frame {
+            let stream_result =
+                process_source_stream_request(&context, &mut send, req, payload).await;
+            if let Err(err) = stream_result {
+                let response = Frame::Error(ErrorFrame {
+                    message: format!("{err:#}"),
+                });
+                let response_bytes = crate::protocol::encode(&response, None)
+                    .context("encode source stream error response")?;
+                send.write_all(&response_bytes)
+                    .await
+                    .context("write source stream error response")?;
+            }
+            context.profile.add_process(process_started.elapsed());
+            continue;
+        }
         let response = match frame {
             Frame::HelloRequest(req) => process_hello(req).await,
             Frame::InitFileRequest(req) => process_init_file(&context, req).await,
@@ -622,7 +657,15 @@ async fn handle_stream(
             Frame::UploadColdBatchRequest(req) => {
                 process_upload_cold_batch(&context, req, payload).await
             }
-            Frame::DeletePlanRequest(req) => process_delete_plan(&context, req, payload).await,
+            Frame::SyncSymlinkBatchRequest(req) => {
+                process_sync_symlink_batch(&context, req, payload).await
+            }
+            Frame::SyncFileMetadataBatchRequest(req) => {
+                process_sync_file_metadata_batch(&context, req, payload).await
+            }
+            Frame::DeletePlanRequest(req) => {
+                process_delete_plan(&context, &mut delete_plan_state, req, payload).await
+            }
             Frame::HelloResponse(_) => Ok(Frame::Error(ErrorFrame {
                 message: "unexpected hello response on server".to_string(),
             })),
@@ -856,19 +899,12 @@ async fn process_init_batch(context: &ServerContext, req: InitBatchRequest) -> R
     }
 
     let mut results = Vec::with_capacity(prepared.len());
-    for (file, relative, skip) in prepared {
-        let response = if skip {
-            InitFileResponse {
-                action: InitAction::Skip,
-                next_chunk: file.total_chunks,
-                message: "already up to date".to_string(),
-            }
-        } else {
-            initialize_one_file_with_relative(context, &file, &relative, false).await?
-        };
+    for (file, relative, _) in prepared {
+        let response = initialize_one_file_with_relative(context, &file, &relative, false).await?;
         results.push(InitBatchResult {
             action: response.action,
             next_chunk: response.next_chunk,
+            metadata_sync_required: response.metadata_sync_required,
             message: response.message,
         });
     }
@@ -876,9 +912,9 @@ async fn process_init_batch(context: &ServerContext, req: InitBatchRequest) -> R
     Ok(Frame::InitBatchResponse(InitBatchResponse { results }))
 }
 
-fn parse_keep_payload(payload: &[u8]) -> Result<HashSet<String>> {
+fn parse_keep_payload(payload: &[u8]) -> Result<Vec<String>> {
     let text = std::str::from_utf8(payload).context("decode delete keep-list payload as utf-8")?;
-    let mut keep = HashSet::new();
+    let mut keep = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -888,7 +924,7 @@ fn parse_keep_payload(payload: &[u8]) -> Result<HashSet<String>> {
             .with_context(|| format!("normalize keep path '{}'", trimmed))?
             .to_string_lossy()
             .replace('\\', "/");
-        keep.insert(normalized);
+        keep.push(normalized);
     }
     Ok(keep)
 }
@@ -927,6 +963,16 @@ async fn enumerate_relative_files(handle: &RuntimeHandle, root: &Path) -> Result
                     })?;
                     out.push(rel.to_path_buf());
                 }
+                fs::DirEntryType::Symlink => {
+                    let rel = entry.path.strip_prefix(root).with_context(|| {
+                        format!(
+                            "path {} escaped root {}",
+                            entry.path.display(),
+                            root.display()
+                        )
+                    })?;
+                    out.push(rel.to_path_buf());
+                }
                 _ => {}
             }
         }
@@ -937,18 +983,147 @@ async fn enumerate_relative_files(handle: &RuntimeHandle, root: &Path) -> Result
 
 async fn process_delete_plan(
     context: &ServerContext,
+    state: &mut Option<DeletePlanState>,
     req: DeletePlanRequest,
     payload: &[u8],
 ) -> Result<Frame> {
-    let keep = parse_keep_payload(payload)?;
-    let filter =
-        PathFilter::from_patterns(&req.include, &req.exclude).context("compile delete filter")?;
-    let mut deleted = 0u64;
+    match req.stage {
+        DeletePlanStage::Begin => {
+            *state = Some(DeletePlanState {
+                dry_run: req.dry_run,
+                include: req.include,
+                exclude: req.exclude,
+                keep: HashSet::new(),
+            });
+            Ok(Frame::DeletePlanResponse(DeletePlanResponse {
+                accepted: true,
+                message: "delete plan initialized".to_string(),
+                deleted: 0,
+                keep_paths: 0,
+            }))
+        }
+        DeletePlanStage::AddKeepChunk => {
+            let Some(plan) = state.as_mut() else {
+                return Ok(Frame::DeletePlanResponse(DeletePlanResponse {
+                    accepted: false,
+                    message: "delete plan add-chunk before begin".to_string(),
+                    deleted: 0,
+                    keep_paths: 0,
+                }));
+            };
+            for path in parse_keep_payload(payload)? {
+                plan.keep.insert(path);
+            }
+            Ok(Frame::DeletePlanResponse(DeletePlanResponse {
+                accepted: true,
+                message: "delete plan chunk accepted".to_string(),
+                deleted: 0,
+                keep_paths: plan.keep.len() as u64,
+            }))
+        }
+        DeletePlanStage::Apply => {
+            let Some(plan) = state.take() else {
+                return Ok(Frame::DeletePlanResponse(DeletePlanResponse {
+                    accepted: false,
+                    message: "delete plan apply before begin".to_string(),
+                    deleted: 0,
+                    keep_paths: 0,
+                }));
+            };
+            let filter = PathFilter::from_patterns(&plan.include, &plan.exclude)
+                .context("compile delete filter")?;
+            let mut deleted = 0u64;
+            let destination_files =
+                enumerate_relative_files(&context.handle, context.destination.as_ref())
+                    .await
+                    .context("enumerate destination files for delete planning")?;
+            for rel in destination_files {
+                let rel_text = rel.to_string_lossy().replace('\\', "/");
+                if !filter.allows(&rel_text) {
+                    continue;
+                }
+                if !is_delete_path_allowed(context, &rel_text) {
+                    continue;
+                }
+                if plan.keep.contains(&rel_text) {
+                    continue;
+                }
+                let path = context.destination.join(&rel);
+                if plan.dry_run {
+                    deleted = deleted.saturating_add(1);
+                    continue;
+                }
+                match fs::remove_file(&context.handle, &path).await {
+                    Ok(()) => {
+                        deleted = deleted.saturating_add(1);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("delete {}", path.display()));
+                    }
+                }
+            }
+            Ok(Frame::DeletePlanResponse(DeletePlanResponse {
+                accepted: true,
+                message: "delete plan applied".to_string(),
+                deleted,
+                keep_paths: plan.keep.len() as u64,
+            }))
+        }
+    }
+}
 
-    let destination_files = enumerate_relative_files(&context.handle, context.destination.as_ref())
+async fn write_stream_frame(
+    send: &mut spargio_quic::QuicSendStream,
+    max_stream_payload: usize,
+    frame: &Frame,
+    payload: Option<&[u8]>,
+) -> Result<()> {
+    let payload_len = payload.map_or(0usize, |bytes| bytes.len());
+    let header =
+        crate::protocol::encode_header(frame, payload_len).context("encode source stream frame")?;
+    let encoded_len = header.len().saturating_add(payload_len);
+    if encoded_len > max_stream_payload {
+        bail!(
+            "source stream frame too large: {} > max_stream_payload {}",
+            encoded_len,
+            max_stream_payload
+        );
+    }
+    send.write_all(&header)
         .await
-        .context("enumerate destination files for delete planning")?;
-    for rel in destination_files {
+        .context("write source stream frame header")?;
+    if let Some(payload) = payload {
+        send.write_all(payload)
+            .await
+            .context("write source stream frame payload")?;
+    }
+    Ok(())
+}
+
+async fn process_source_stream_request(
+    context: &ServerContext,
+    send: &mut spargio_quic::QuicSendStream,
+    req: SourceStreamRequest,
+    payload: &[u8],
+) -> Result<()> {
+    if !payload.is_empty() {
+        bail!(
+            "source stream request does not accept payload (received {} bytes)",
+            payload.len()
+        );
+    }
+    let filter =
+        PathFilter::from_patterns(&req.include, &req.exclude).context("compile source filter")?;
+    let chunk_size = req.chunk_size.max(1);
+
+    let mut files_streamed = 0u64;
+    let mut bytes_streamed = 0u64;
+    let files = enumerate_relative_files(&context.handle, context.destination.as_ref())
+        .await
+        .context("enumerate source files for stream request")?;
+
+    for rel in files {
         let rel_text = rel.to_string_lossy().replace('\\', "/");
         if !filter.allows(&rel_text) {
             continue;
@@ -956,24 +1131,126 @@ async fn process_delete_plan(
         if !is_delete_path_allowed(context, &rel_text) {
             continue;
         }
-        if keep.contains(&rel_text) {
-            continue;
-        }
-        let path = context.destination.join(&rel);
-        if req.dry_run {
-            deleted = deleted.saturating_add(1);
-            continue;
-        }
-        match fs::remove_file(&context.handle, &path).await {
-            Ok(()) => {
-                deleted = deleted.saturating_add(1);
+        let source_path = context.destination.join(&rel);
+        let symlink_meta = fs::symlink_metadata(&context.handle, &source_path)
+            .await
+            .with_context(|| format!("lstat {}", source_path.display()))?;
+        let is_symlink = symlink_meta.file_type().is_symlink();
+        let (entry_kind, symlink_target, size, mode, mtime_sec, uid, gid, follow_symlink) =
+            if is_symlink {
+                #[cfg(unix)]
+                let mode = symlink_meta.mode() as u32;
+                #[cfg(not(unix))]
+                let mode = 0u32;
+                #[cfg(unix)]
+                let mtime_sec = symlink_meta.mtime();
+                #[cfg(not(unix))]
+                let mtime_sec = 0i64;
+                #[cfg(unix)]
+                let uid = symlink_meta.uid();
+                #[cfg(not(unix))]
+                let uid = 0u32;
+                #[cfg(unix)]
+                let gid = symlink_meta.gid();
+                #[cfg(not(unix))]
+                let gid = 0u32;
+                let target = metadata::read_link_target(&source_path)
+                    .with_context(|| format!("read symlink {}", source_path.display()))?;
+                (
+                    SourceEntryKind::Symlink,
+                    Some(target),
+                    0,
+                    mode,
+                    mtime_sec,
+                    uid,
+                    gid,
+                    false,
+                )
+            } else {
+                let meta = fs::metadata_lite(&context.handle, &source_path)
+                    .await
+                    .with_context(|| format!("metadata {}", source_path.display()))?;
+                if !meta.is_file() {
+                    continue;
+                }
+                (
+                    SourceEntryKind::File,
+                    None,
+                    meta.size,
+                    meta.mode as u32,
+                    meta.mtime_sec,
+                    meta.uid,
+                    meta.gid,
+                    true,
+                )
+            };
+        let xattrs = if req.preserve_xattrs {
+            metadata::collect_xattrs(&source_path, follow_symlink)
+                .with_context(|| format!("collect xattrs {}", source_path.display()))?
+        } else {
+            Vec::new()
+        };
+        let start = Frame::SourceStreamFileStart(SourceStreamFileStart {
+            relative_path: rel_text.clone(),
+            entry_kind,
+            symlink_target,
+            size,
+            mode,
+            mtime_sec,
+            uid,
+            gid,
+            xattrs,
+        });
+        write_stream_frame(send, context.max_stream_payload, &start, None).await?;
+
+        if !req.metadata_only && !is_symlink {
+            let file = fs::File::open(context.handle.clone(), &source_path)
+                .await
+                .with_context(|| format!("open source stream file {}", source_path.display()))?;
+            let mut offset = 0u64;
+            loop {
+                let chunk = file.read_at(offset, chunk_size).await.with_context(|| {
+                    format!("read source stream file {}", source_path.display())
+                })?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let chunk_len = u32::try_from(chunk.len()).with_context(|| {
+                    format!(
+                        "source stream chunk too large ({} bytes) for {}",
+                        chunk.len(),
+                        source_path.display()
+                    )
+                })?;
+                let chunk_frame = Frame::SourceStreamChunk(SourceStreamChunk { chunk_len });
+                write_stream_frame(
+                    send,
+                    context.max_stream_payload,
+                    &chunk_frame,
+                    Some(chunk.as_ref()),
+                )
+                .await?;
+                offset = offset.saturating_add(chunk.len() as u64);
+                bytes_streamed = bytes_streamed.saturating_add(chunk.len() as u64);
+                if chunk.len() < chunk_size {
+                    break;
+                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).with_context(|| format!("delete {}", path.display())),
         }
+
+        let end = Frame::SourceStreamFileEnd(SourceStreamFileEnd {
+            relative_path: rel_text,
+        });
+        write_stream_frame(send, context.max_stream_payload, &end, None).await?;
+        files_streamed = files_streamed.saturating_add(1);
     }
 
-    Ok(Frame::DeletePlanResponse(DeletePlanResponse { deleted }))
+    let done = Frame::SourceStreamDone(SourceStreamDone {
+        files: files_streamed,
+        bytes: bytes_streamed,
+    });
+    write_stream_frame(send, context.max_stream_payload, &done, None).await?;
+    Ok(())
 }
 
 async fn initialize_one_file(
@@ -990,17 +1267,6 @@ async fn initialize_one_file_with_relative(
     relative: &Path,
     prepare_dirs: bool,
 ) -> Result<InitFileResponse> {
-    if context
-        .state
-        .is_complete_match(&req.relative_path, &req.file_hash, req.size)?
-    {
-        return Ok(InitFileResponse {
-            action: InitAction::Skip,
-            next_chunk: req.total_chunks,
-            message: "already up to date".to_string(),
-        });
-    }
-
     let final_path = context.destination.join(relative);
     let partial_path = partial_path(context.state.partial_root(), &relative);
     if req.update_only {
@@ -1009,6 +1275,7 @@ async fn initialize_one_file_with_relative(
                 return Ok(InitFileResponse {
                     action: InitAction::Skip,
                     next_chunk: req.total_chunks,
+                    metadata_sync_required: false,
                     message: format!(
                         "destination is newer (dst_mtime={} src_mtime={})",
                         meta.mtime_sec, req.mtime_sec
@@ -1400,6 +1667,201 @@ async fn process_upload_cold_batch(
     }))
 }
 
+async fn remove_existing_path_for_symlink(handle: &RuntimeHandle, path: &Path) -> Result<()> {
+    match fs::symlink_metadata(handle, path).await {
+        Ok(meta) => {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("remove existing directory {}", path.display()))?;
+            } else {
+                fs::remove_file(handle, path)
+                    .await
+                    .with_context(|| format!("remove existing file {}", path.display()))?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("lstat {}", path.display())),
+    }
+}
+
+async fn apply_symlink_meta(
+    context: &ServerContext,
+    path: &Path,
+    meta: &SymlinkMeta,
+) -> Result<()> {
+    if !context.preserve_metadata {
+        return Ok(());
+    }
+    metadata::set_owner(path, meta.uid, meta.gid, false)?;
+    if context.preserve_xattrs {
+        metadata::apply_xattrs(path, &meta.xattrs, false)?;
+    }
+    metadata::set_mtime(path, meta.mtime_sec, false)?;
+    Ok(())
+}
+
+async fn process_sync_symlink_batch(
+    context: &ServerContext,
+    req: SyncSymlinkBatchRequest,
+    payload: &[u8],
+) -> Result<Frame> {
+    if !payload.is_empty() {
+        bail!(
+            "sync symlink batch request does not accept payload (received {} bytes)",
+            payload.len()
+        );
+    }
+    let mut results = Vec::with_capacity(req.entries.len());
+    for entry in req.entries {
+        authorize_relative_path(context, &entry.relative_path)?;
+        let relative = sanitize_relative(&entry.relative_path)?;
+        let destination = context.destination.join(&relative);
+
+        let mut skipped = false;
+        if let Ok(existing_meta) = fs::symlink_metadata(&context.handle, &destination).await {
+            #[cfg(unix)]
+            let existing_mtime = existing_meta.mtime();
+            #[cfg(not(unix))]
+            let existing_mtime = 0i64;
+            if existing_meta.file_type().is_symlink()
+                && existing_mtime == entry.mtime_sec
+                && metadata::read_link_target(&destination)
+                    .map(|value| value == entry.target)
+                    .unwrap_or(false)
+            {
+                apply_symlink_meta(context, &destination, &entry).await?;
+                skipped = true;
+            }
+        }
+        if skipped {
+            results.push(SyncSymlinkResult {
+                accepted: true,
+                skipped: true,
+                message: "already up to date".to_string(),
+            });
+            continue;
+        }
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(&context.handle, parent)
+                .await
+                .with_context(|| format!("create destination parent {}", parent.display()))?;
+        }
+        remove_existing_path_for_symlink(&context.handle, &destination).await?;
+        fs::symlink(&context.handle, Path::new(&entry.target), &destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "create destination symlink {} -> {}",
+                    destination.display(),
+                    entry.target
+                )
+            })?;
+        apply_symlink_meta(context, &destination, &entry).await?;
+        results.push(SyncSymlinkResult {
+            accepted: true,
+            skipped: false,
+            message: "symlink updated".to_string(),
+        });
+    }
+    Ok(Frame::SyncSymlinkBatchResponse(SyncSymlinkBatchResponse {
+        results,
+    }))
+}
+
+async fn process_sync_file_metadata_batch(
+    context: &ServerContext,
+    req: SyncFileMetadataBatchRequest,
+    payload: &[u8],
+) -> Result<Frame> {
+    if !payload.is_empty() {
+        bail!(
+            "sync file metadata request does not accept payload (received {} bytes)",
+            payload.len()
+        );
+    }
+    let mut results = Vec::with_capacity(req.entries.len());
+    for entry in req.entries {
+        authorize_relative_path(context, &entry.relative_path)?;
+        if !context
+            .state
+            .is_complete_match(&entry.relative_path, &entry.file_hash, entry.size)?
+        {
+            results.push(SyncFileMetadataResult {
+                accepted: false,
+                skipped: false,
+                message: "state mismatch; file no longer complete for hash/size".to_string(),
+            });
+            continue;
+        }
+        let relative = sanitize_relative(&entry.relative_path)?;
+        let destination = context.destination.join(&relative);
+        let existing = match fs::metadata_lite(&context.handle, &destination).await {
+            Ok(meta) if meta.is_file() => meta,
+            Ok(_) => {
+                results.push(SyncFileMetadataResult {
+                    accepted: false,
+                    skipped: false,
+                    message: "destination is not a regular file".to_string(),
+                });
+                continue;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                results.push(SyncFileMetadataResult {
+                    accepted: false,
+                    skipped: false,
+                    message: "destination missing".to_string(),
+                });
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("read destination metadata {}", destination.display())
+                });
+            }
+        };
+        if existing.size != entry.size {
+            results.push(SyncFileMetadataResult {
+                accepted: false,
+                skipped: false,
+                message: format!(
+                    "destination size mismatch: expected {} got {}",
+                    entry.size, existing.size
+                ),
+            });
+            continue;
+        }
+        if !context.preserve_metadata {
+            results.push(SyncFileMetadataResult {
+                accepted: true,
+                skipped: true,
+                message: "metadata preservation disabled".to_string(),
+            });
+            continue;
+        }
+        apply_metadata(
+            &context.handle,
+            &destination,
+            entry.mode,
+            entry.mtime_sec,
+            entry.uid,
+            entry.gid,
+            &entry.xattrs,
+            context.preserve_xattrs,
+        )
+        .await?;
+        results.push(SyncFileMetadataResult {
+            accepted: true,
+            skipped: false,
+            message: "metadata updated".to_string(),
+        });
+    }
+    Ok(Frame::SyncFileMetadataBatchResponse(
+        SyncFileMetadataBatchResponse { results },
+    ))
+}
+
 async fn run_small_upload_task(
     context: ServerContext,
     meta: UploadSmallFileMeta,
@@ -1483,11 +1945,25 @@ async fn process_upload_cold_one(
             .state
             .is_complete_match(&meta.relative_path, &meta.file_hash, meta.size)?
     {
+        if context.preserve_metadata {
+            let final_path = context.destination.join(&relative);
+            apply_metadata(
+                &context.handle,
+                &final_path,
+                meta.mode,
+                meta.mtime_sec,
+                meta.uid,
+                meta.gid,
+                &meta.xattrs,
+                context.preserve_xattrs,
+            )
+            .await?;
+        }
         return Ok(ColdTaskResult {
             result: UploadColdFileResult {
                 accepted: true,
                 skipped: true,
-                message: "already completed".to_string(),
+                message: "already completed; metadata reconciled".to_string(),
                 bytes_written: 0,
             },
             completion: None,
@@ -1543,7 +2019,17 @@ async fn process_upload_cold_one(
         .with_context(|| format!("write destination {}", final_path.display()))?;
 
     if context.preserve_metadata {
-        apply_metadata(&context.handle, &final_path, meta.mode, meta.mtime_sec).await?;
+        apply_metadata(
+            &context.handle,
+            &final_path,
+            meta.mode,
+            meta.mtime_sec,
+            meta.uid,
+            meta.gid,
+            &meta.xattrs,
+            context.preserve_xattrs,
+        )
+        .await?;
     }
 
     if !context.partials_maybe_empty.load(Ordering::Relaxed) {
@@ -1564,6 +2050,7 @@ async fn process_upload_cold_one(
             size: meta.size,
             mode: meta.mode,
             mtime_sec: meta.mtime_sec,
+            xattr_sig: metadata::xattr_signature(&meta.xattrs),
             total_chunks: meta.total_chunks,
         }),
     })
@@ -1661,6 +2148,7 @@ async fn process_upload_small_one(
                 size: meta.size,
                 mode: meta.mode,
                 mtime_sec: meta.mtime_sec,
+                xattr_sig: metadata::xattr_signature(&meta.xattrs),
                 total_chunks: meta.total_chunks,
             }),
         });
@@ -1698,6 +2186,9 @@ async fn process_upload_small_one(
             size: meta.size,
             mode: meta.mode,
             mtime_sec: meta.mtime_sec,
+            uid: meta.uid,
+            gid: meta.gid,
+            xattrs: &meta.xattrs,
             total_chunks: meta.total_chunks,
         },
     )
@@ -1736,7 +2227,17 @@ async fn write_small_file_direct(
         .with_context(|| format!("write destination {}", final_path.display()))?;
 
     if context.preserve_metadata {
-        apply_metadata(&context.handle, &final_path, meta.mode, meta.mtime_sec).await?;
+        apply_metadata(
+            &context.handle,
+            &final_path,
+            meta.mode,
+            meta.mtime_sec,
+            meta.uid,
+            meta.gid,
+            &meta.xattrs,
+            context.preserve_xattrs,
+        )
+        .await?;
     }
 
     if !context.partials_maybe_empty.load(Ordering::Relaxed) {
@@ -1753,6 +2254,9 @@ struct FileFinalize<'a> {
     size: u64,
     mode: u32,
     mtime_sec: i64,
+    uid: u32,
+    gid: u32,
+    xattrs: &'a [XattrEntry],
     total_chunks: usize,
 }
 
@@ -1772,6 +2276,9 @@ async fn finalize_uploaded_file(
             size: req.size,
             mode: req.mode,
             mtime_sec: req.mtime_sec,
+            uid: req.uid,
+            gid: req.gid,
+            xattrs: &req.xattrs,
             total_chunks: req.total_chunks,
         },
     )
@@ -1814,7 +2321,17 @@ async fn finalize_partial_file(
         })?;
 
     if context.preserve_metadata {
-        apply_metadata(&context.handle, &final_path, meta.mode, meta.mtime_sec).await?;
+        apply_metadata(
+            &context.handle,
+            &final_path,
+            meta.mode,
+            meta.mtime_sec,
+            meta.uid,
+            meta.gid,
+            meta.xattrs,
+            context.preserve_xattrs,
+        )
+        .await?;
     }
 
     context
@@ -1825,6 +2342,7 @@ async fn finalize_partial_file(
             meta.size,
             meta.mode,
             meta.mtime_sec,
+            metadata::xattr_signature(meta.xattrs),
             meta.total_chunks,
         )
         .await
@@ -1838,6 +2356,10 @@ async fn apply_metadata(
     path: &Path,
     mode: u32,
     mtime_sec: i64,
+    uid: u32,
+    gid: u32,
+    xattrs: &[XattrEntry],
+    preserve_xattrs: bool,
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1847,10 +2369,11 @@ async fn apply_metadata(
             .await
             .with_context(|| format!("set permissions for {}", path.display()))?;
     }
-
-    let file_time = filetime::FileTime::from_unix_time(mtime_sec, 0);
-    filetime::set_file_mtime(path, file_time)
-        .with_context(|| format!("set file mtime for {}", path.display()))?;
+    metadata::set_owner(path, uid, gid, true)?;
+    if preserve_xattrs {
+        metadata::apply_xattrs(path, xattrs, true)?;
+    }
+    metadata::set_mtime(path, mtime_sec, true)?;
 
     Ok(())
 }

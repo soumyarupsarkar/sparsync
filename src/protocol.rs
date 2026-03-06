@@ -23,6 +23,11 @@ pub enum Frame {
     UploadSmallBatchResponse(UploadSmallBatchResponse),
     UploadColdBatchRequest(UploadColdBatchRequest),
     UploadColdBatchResponse(UploadColdBatchResponse),
+    SyncSymlinkBatchRequest(SyncSymlinkBatchRequest),
+    SyncSymlinkBatchResponse(SyncSymlinkBatchResponse),
+    SyncFileMetadataBatchRequest(SyncFileMetadataBatchRequest),
+    SyncFileMetadataBatchResponse(SyncFileMetadataBatchResponse),
+    SourceStreamRequest(SourceStreamRequest),
     SourceStreamFileStart(SourceStreamFileStart),
     SourceStreamChunk(SourceStreamChunk),
     SourceStreamFileEnd(SourceStreamFileEnd),
@@ -94,6 +99,7 @@ pub struct InitFileRequest {
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub xattr_sig: Option<u64>,
     pub update_only: bool,
     pub file_hash: String,
     pub chunk_size: usize,
@@ -106,6 +112,7 @@ pub struct InitFileRequest {
 pub struct InitFileResponse {
     pub action: InitAction,
     pub next_chunk: usize,
+    pub metadata_sync_required: bool,
     pub message: String,
 }
 
@@ -123,6 +130,9 @@ pub struct UploadBatchRequest {
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
+    pub xattrs: Vec<XattrEntry>,
     pub file_hash: String,
     pub total_chunks: usize,
     pub start_chunk: usize,
@@ -158,6 +168,7 @@ pub struct InitBatchResponse {
 pub struct InitBatchResult {
     pub action: InitAction,
     pub next_chunk: usize,
+    pub metadata_sync_required: bool,
     pub message: String,
 }
 
@@ -174,6 +185,9 @@ pub struct UploadSmallFileMeta {
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
+    pub xattrs: Vec<XattrEntry>,
     pub file_hash: String,
     pub total_chunks: usize,
     pub compressed: bool,
@@ -210,6 +224,9 @@ pub struct UploadColdFileMeta {
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
+    pub xattrs: Vec<XattrEntry>,
     pub file_hash: String,
     pub total_chunks: usize,
     pub compressed: bool,
@@ -234,11 +251,99 @@ pub struct UploadColdFileResult {
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
+pub struct SyncSymlinkBatchRequest {
+    pub entries: Vec<SymlinkMeta>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SyncSymlinkBatchResponse {
+    pub results: Vec<SyncSymlinkResult>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SyncSymlinkResult {
+    pub accepted: bool,
+    pub skipped: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SyncFileMetadataBatchRequest {
+    pub entries: Vec<FileMetadataSyncEntry>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct FileMetadataSyncEntry {
+    pub relative_path: String,
+    pub size: u64,
+    pub file_hash: String,
+    pub mode: u32,
+    pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
+    pub xattrs: Vec<XattrEntry>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SyncFileMetadataBatchResponse {
+    pub results: Vec<SyncFileMetadataResult>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SyncFileMetadataResult {
+    pub accepted: bool,
+    pub skipped: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SymlinkMeta {
+    pub relative_path: String,
+    pub target: String,
+    pub mode: u32,
+    pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
+    pub xattrs: Vec<XattrEntry>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct SourceStreamRequest {
+    pub chunk_size: usize,
+    pub metadata_only: bool,
+    pub preserve_metadata: bool,
+    pub preserve_xattrs: bool,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct SourceStreamFileStart {
     pub relative_path: String,
+    pub entry_kind: SourceEntryKind,
+    pub symlink_target: Option<String>,
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
+    pub xattrs: Vec<XattrEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[archive(check_bytes)]
+pub enum SourceEntryKind {
+    File,
+    Symlink,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -263,21 +368,40 @@ pub struct SourceStreamDone {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub struct DeletePlanRequest {
+    pub stage: DeletePlanStage,
     pub dry_run: bool,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Archive, Serialize, Deserialize, PartialEq, Eq)]
+#[archive(check_bytes)]
+pub enum DeletePlanStage {
+    Begin,
+    AddKeepChunk,
+    Apply,
+}
+
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub struct DeletePlanResponse {
+    pub accepted: bool,
+    pub message: String,
     pub deleted: u64,
+    pub keep_paths: u64,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub struct ErrorFrame {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct XattrEntry {
+    pub name: String,
+    pub value: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -6,6 +6,7 @@ mod compression;
 mod endpoint;
 mod filter;
 mod local_copy;
+mod metadata;
 mod model;
 mod profile;
 mod protocol;
@@ -94,6 +95,9 @@ struct ServeArgs {
     preserve_metadata: bool,
 
     #[arg(long)]
+    preserve_xattrs: bool,
+
+    #[arg(long)]
     once: bool,
 
     #[arg(long, default_value_t = 60_000)]
@@ -110,6 +114,9 @@ struct ServeStdioArgs {
 
     #[arg(long)]
     preserve_metadata: bool,
+
+    #[arg(long)]
+    preserve_xattrs: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -224,6 +231,9 @@ struct SyncArgs {
 
     #[arg(short = 'u', long = "update")]
     update_only: bool,
+
+    #[arg(short = 'X', long = "xattrs")]
+    xattrs: bool,
 
     #[arg(long = "bwlimit")]
     bwlimit: Option<String>,
@@ -503,6 +513,12 @@ struct StreamSourceArgs {
 
     #[arg(long)]
     metadata_only: bool,
+
+    #[arg(long)]
+    preserve_metadata: bool,
+
+    #[arg(long)]
+    preserve_xattrs: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -692,6 +708,7 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 authz: args.authz,
                 max_stream_payload: args.max_stream_payload,
                 preserve_metadata: args.preserve_metadata,
+                preserve_xattrs: args.preserve_xattrs,
                 once: args.once,
                 once_idle_timeout: Duration::from_millis(args.once_idle_timeout_ms),
             };
@@ -702,6 +719,7 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 destination: args.destination,
                 max_stream_payload: args.max_stream_payload,
                 preserve_metadata: args.preserve_metadata,
+                preserve_xattrs: args.preserve_xattrs,
             };
             stdio_server::run_server_stdio(handle, options).await
         }
@@ -721,6 +739,8 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                     chunk_size: args.chunk_size.max(1),
                     max_stream_payload: args.max_stream_payload,
                     metadata_only: args.metadata_only,
+                    preserve_metadata: args.preserve_metadata,
+                    preserve_xattrs: args.preserve_xattrs,
                 },
             )
             .await
@@ -812,6 +832,8 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 update_only: args.update_only,
                 cold_start: args.cold_start,
                 manifest_out: args.manifest_out,
+                preserve_metadata: false,
+                preserve_xattrs: false,
                 path_filter: Some(path_filter),
                 bwlimit_kbps,
                 progress: false,
@@ -830,10 +852,10 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
         }
         Command::Sync(args) => run_sync_command(handle, args).await,
         Command::Enroll(args) => {
-            run_blocking_task("enroll", move || run_enroll_command(args)).await
+            run_blocking_task(&handle, "enroll", move || run_enroll_command(args)).await
         }
         Command::Server(args) => {
-            run_blocking_task("server", move || run_server_command(args)).await
+            run_blocking_task(&handle, "server", move || run_server_command(args)).await
         }
         Command::Auth(args) => {
             let resolve_dir = |input: Option<PathBuf>| -> Result<PathBuf> {
@@ -978,20 +1000,18 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
     }
 }
 
-async fn run_blocking_task<T, F>(label: &'static str, job: F) -> Result<T>
+async fn run_blocking_task<T, F>(handle: &RuntimeHandle, label: &'static str, job: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    let (tx, rx) = futures::channel::oneshot::channel::<Result<T>>();
-    std::thread::Builder::new()
-        .name(format!("sparsync-{label}"))
-        .spawn(move || {
-            let _ = tx.send(job());
-        })
-        .with_context(|| format!("spawn blocking task '{label}'"))?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("blocking task '{label}' cancelled"))?
+    let join = handle
+        .spawn_blocking(job)
+        .map_err(|err| anyhow::anyhow!("spawn blocking task '{label}': {:?}", err))?;
+    let inner: Result<T> = join
+        .await
+        .map_err(|err| anyhow::anyhow!("blocking task '{label}' cancelled: {:?}", err))?;
+    inner
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1226,6 +1246,7 @@ fn run_enroll_command(args: EnrollArgs) -> Result<()> {
         profile_name: profile_name.clone(),
         install_mode,
         preserve_metadata: args.preserve_metadata,
+        preserve_xattrs: args.preserve_metadata,
     };
 
     let enrollment = if args.start_server {
@@ -1362,6 +1383,7 @@ fn run_server_command(args: ServerArgs) -> Result<()> {
                 profile_name: profile_name.clone(),
                 install_mode,
                 preserve_metadata: cmd.preserve_metadata,
+                preserve_xattrs: cmd.preserve_metadata,
             };
             let enrollment =
                 bootstrap::start_remote_server(&options).context("start remote server")?;
@@ -1453,6 +1475,7 @@ fn run_service_daemon_command(args: ServiceDaemonArgs) -> Result<()> {
             }
             if cmd.preserve_metadata {
                 child_cmd.arg("--preserve-metadata");
+                child_cmd.arg("--preserve-xattrs");
             }
             child_cmd
                 .stdin(Stdio::null())
@@ -1586,6 +1609,7 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
         .with_context(|| format!("parse destination endpoint '{}'", args.destination))?;
     let filter = filter::PathFilter::from_patterns(&args.include, &args.exclude)?;
     let preserve_metadata = args.archive || args.preserve_metadata;
+    let preserve_xattrs = args.xattrs || args.preserve_metadata;
     let compression_level = if args.rsync_compress {
         args.compression_level.max(1)
     } else {
@@ -1619,6 +1643,7 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                     source,
                     destination,
                     preserve_metadata,
+                    preserve_xattrs,
                     dry_run: args.dry_run,
                     delete: args.delete,
                     update_only: args.update_only,
@@ -1688,16 +1713,17 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                                 "ssh" => {
                                     let install_mode =
                                         bootstrap::InstallMode::parse(&args.install)?;
-                                    let lease = run_blocking_task("ensure-remote-binary", {
-                                        let bootstrap_remote = bootstrap_remote.clone();
-                                        move || {
-                                            bootstrap::ensure_remote_binary_available(
-                                                &bootstrap_remote,
-                                                install_mode,
-                                            )
-                                        }
-                                    })
-                                    .await?;
+                                    let lease =
+                                        run_blocking_task(&handle, "ensure-remote-binary", {
+                                            let bootstrap_remote = bootstrap_remote.clone();
+                                            move || {
+                                                bootstrap::ensure_remote_binary_available(
+                                                    &bootstrap_remote,
+                                                    install_mode,
+                                                )
+                                            }
+                                        })
+                                        .await?;
                                     let shell_prefix = lease.shell_prefix().to_string();
                                     remote_binary_lease = Some(lease);
                                     Some(shell_prefix)
@@ -1732,20 +1758,22 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                                 )?;
                                 let install_mode = bootstrap::InstallMode::parse(&args.install)?;
                                 let client_id = bootstrap::default_client_id();
-                                let session = run_blocking_task("bootstrap-remote-push", {
-                                    let options = bootstrap::BootstrapOptions {
-                                        remote: bootstrap_remote.clone(),
-                                        destination: remote.path.clone(),
-                                        server_port: remote.port.unwrap_or(args.server_port),
-                                        server_name: remote.host.clone(),
-                                        client_id,
-                                        profile_name: profile_name.clone(),
-                                        install_mode,
-                                        preserve_metadata,
-                                    };
-                                    move || bootstrap::bootstrap_remote_push(&options)
-                                })
-                                .await?;
+                                let session =
+                                    run_blocking_task(&handle, "bootstrap-remote-push", {
+                                        let options = bootstrap::BootstrapOptions {
+                                            remote: bootstrap_remote.clone(),
+                                            destination: remote.path.clone(),
+                                            server_port: remote.port.unwrap_or(args.server_port),
+                                            server_name: remote.host.clone(),
+                                            client_id,
+                                            profile_name: profile_name.clone(),
+                                            install_mode,
+                                            preserve_metadata,
+                                            preserve_xattrs,
+                                        };
+                                        move || bootstrap::bootstrap_remote_push(&options)
+                                    })
+                                    .await?;
                                 upsert_profile_from_bootstrap(
                                     &profile_name,
                                     &bootstrap_remote,
@@ -1780,8 +1808,10 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                                     },
                                 )
                                 .await?;
-                                run_blocking_task("bootstrap-session-wait", move || session.wait())
-                                    .await?;
+                                run_blocking_task(&handle, "bootstrap-session-wait", move || {
+                                    session.wait()
+                                })
+                                .await?;
                             } else if args.bootstrap == "none" {
                                 let profile =
                                     profile::get_profile(&profile_name).with_context(|| {
@@ -1848,7 +1878,7 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                     let remote_shell_prefix = match args.bootstrap.as_str() {
                         "ssh" => {
                             let install_mode = bootstrap::InstallMode::parse(&args.install)?;
-                            let lease = run_blocking_task("ensure-remote-binary", {
+                            let lease = run_blocking_task(&handle, "ensure-remote-binary", {
                                 let bootstrap_remote = bootstrap_remote.clone();
                                 move || {
                                     bootstrap::ensure_remote_binary_available(
@@ -1882,6 +1912,7 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                             cold_start: args.cold_start,
                             manifest_out: args.manifest_out,
                             preserve_metadata,
+                            preserve_xattrs,
                             path_filter: Some(filter.clone()),
                             bwlimit_kbps,
                             progress: progress_enabled,
@@ -1922,7 +1953,7 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                             )?;
                             let install_mode = bootstrap::InstallMode::parse(&args.install)?;
                             let client_id = bootstrap::default_client_id();
-                            let session = run_blocking_task("bootstrap-remote-push", {
+                            let session = run_blocking_task(&handle, "bootstrap-remote-push", {
                                 let options = bootstrap::BootstrapOptions {
                                     remote: bootstrap_remote.clone(),
                                     destination: remote.path.clone(),
@@ -1932,6 +1963,7 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                                     profile_name: profile_name.clone(),
                                     install_mode,
                                     preserve_metadata,
+                                    preserve_xattrs,
                                 };
                                 move || bootstrap::bootstrap_remote_push(&options)
                             })
@@ -2000,6 +2032,8 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                             update_only: args.update_only,
                             cold_start: args.cold_start,
                             manifest_out: args.manifest_out,
+                            preserve_metadata,
+                            preserve_xattrs,
                             path_filter: Some(filter.clone()),
                             bwlimit_kbps,
                             progress: progress_enabled,
@@ -2032,7 +2066,10 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                         println!("delete complete removed_files={deleted}");
                     }
                     if let Some(session) = bootstrap_session {
-                        run_blocking_task("bootstrap-session-wait", move || session.wait()).await?;
+                        run_blocking_task(&handle, "bootstrap-session-wait", move || {
+                            session.wait()
+                        })
+                        .await?;
                     }
                     Ok(())
                 }
@@ -2042,69 +2079,176 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
             }
         }
         (endpoint::Endpoint::Remote(remote), endpoint::Endpoint::Local(destination)) => {
-            if matches!(
-                parse_transport(&args.transport, Some(&remote))?,
-                EffectiveTransport::Local
-            ) {
+            let effective_transport = parse_transport(&args.transport, Some(&remote))?;
+            if matches!(effective_transport, EffectiveTransport::Local) {
                 bail!("invalid transport local for remote->local endpoint");
             }
             let profile_name = args
                 .profile
                 .clone()
                 .unwrap_or_else(|| default_profile_name(&remote, args.server_port));
-            let bootstrap_remote =
-                resolve_bootstrap_remote(&remote, &profile_name, args.ssh_target.as_deref())?;
-
-            let install_mode = bootstrap::InstallMode::parse(&args.install)?;
-            let mut remote_binary_lease = None;
-            let remote_shell_prefix = match args.bootstrap.as_str() {
-                "ssh" => {
-                    let lease = run_blocking_task("ensure-remote-binary", {
-                        let bootstrap_remote = bootstrap_remote.clone();
-                        move || {
-                            bootstrap::ensure_remote_binary_available(
-                                &bootstrap_remote,
-                                install_mode,
-                            )
+            let pull = match effective_transport {
+                EffectiveTransport::Ssh => {
+                    let bootstrap_remote = resolve_bootstrap_remote(
+                        &remote,
+                        &profile_name,
+                        args.ssh_target.as_deref(),
+                    )?;
+                    let install_mode = bootstrap::InstallMode::parse(&args.install)?;
+                    let mut remote_binary_lease = None;
+                    let remote_shell_prefix = match args.bootstrap.as_str() {
+                        "ssh" => {
+                            let lease = run_blocking_task(&handle, "ensure-remote-binary", {
+                                let bootstrap_remote = bootstrap_remote.clone();
+                                move || {
+                                    bootstrap::ensure_remote_binary_available(
+                                        &bootstrap_remote,
+                                        install_mode,
+                                    )
+                                }
+                            })
+                            .await?;
+                            let shell = lease.shell_prefix().to_string();
+                            remote_binary_lease = Some(lease);
+                            Some(shell)
                         }
-                    })
+                        "none" => None,
+                        other => bail!("invalid bootstrap mode '{}' (expected ssh|none)", other),
+                    };
+                    let pull = transfer::pull_directory_over_ssh_stream(
+                        handle.clone(),
+                        transfer::PullOverSshStreamOptions {
+                            remote: bootstrap_remote.clone(),
+                            source: remote.path.clone(),
+                            destination: destination.clone(),
+                            remote_shell_prefix: remote_shell_prefix.clone(),
+                            scan: scan::ScanOptions {
+                                chunk_size: args.chunk_size.max(1),
+                                scan_workers: args.scan_workers.max(1),
+                                hash_workers: args.hash_workers.max(1),
+                            },
+                            path_filter: filter.clone(),
+                            update_only: args.update_only,
+                            preserve_metadata,
+                            preserve_xattrs,
+                            delete: args.delete,
+                            dry_run: args.dry_run,
+                            progress: progress_enabled,
+                            chunk_size: args.chunk_size.max(1),
+                            max_stream_payload: args.max_stream_payload,
+                            metadata_only: args.dry_run,
+                            bwlimit_kbps,
+                            include_patterns: args.include.clone(),
+                            exclude_patterns: args.exclude.clone(),
+                        },
+                    )
                     .await?;
-                    let shell = lease.shell_prefix().to_string();
-                    remote_binary_lease = Some(lease);
-                    Some(shell)
+                    drop(remote_binary_lease);
+                    pull
                 }
-                "none" => None,
-                other => bail!("invalid bootstrap mode '{}' (expected ssh|none)", other),
+                EffectiveTransport::Quic => {
+                    let (server, server_name, ca, client_cert, client_key, bootstrap_session) =
+                        if args.bootstrap == "ssh" {
+                            let bootstrap_remote = resolve_bootstrap_remote(
+                                &remote,
+                                &profile_name,
+                                args.ssh_target.as_deref(),
+                            )?;
+                            let install_mode = bootstrap::InstallMode::parse(&args.install)?;
+                            let client_id = bootstrap::default_client_id();
+                            let session = run_blocking_task(&handle, "bootstrap-remote-pull", {
+                                let options = bootstrap::BootstrapOptions {
+                                    remote: bootstrap_remote.clone(),
+                                    destination: remote.path.clone(),
+                                    server_port: remote.port.unwrap_or(args.server_port),
+                                    server_name: remote.host.clone(),
+                                    client_id,
+                                    profile_name: profile_name.clone(),
+                                    install_mode,
+                                    preserve_metadata,
+                                    preserve_xattrs,
+                                };
+                                move || bootstrap::bootstrap_remote_push(&options)
+                            })
+                            .await?;
+                            upsert_profile_from_bootstrap(
+                                &profile_name,
+                                &bootstrap_remote,
+                                &bootstrap::Enrollment {
+                                    server: session.server,
+                                    server_name: session.server_name.clone(),
+                                    ca: session.ca.clone(),
+                                    client_cert: session.client_cert.clone(),
+                                    client_key: session.client_key.clone(),
+                                },
+                                &remote.path,
+                            )?;
+                            (
+                                session.server,
+                                session.server_name.clone(),
+                                session.ca.clone(),
+                                Some(session.client_cert.clone()),
+                                Some(session.client_key.clone()),
+                                Some(session),
+                            )
+                        } else if args.bootstrap == "none" {
+                            let profile =
+                                profile::get_profile(&profile_name).with_context(|| {
+                                    format!("load profile '{}' for --bootstrap none", profile_name)
+                                })?;
+                            (
+                                parse_socket_address(&profile.server)?,
+                                profile.server_name,
+                                profile.ca,
+                                profile.client_cert,
+                                profile.client_key,
+                                None,
+                            )
+                        } else {
+                            bail!(
+                                "invalid bootstrap mode '{}' (expected ssh|none)",
+                                args.bootstrap
+                            );
+                        };
+                    let pull = transfer::pull_directory_over_quic(
+                        handle.clone(),
+                        transfer::PullOverQuicOptions {
+                            server,
+                            server_name,
+                            ca,
+                            client_cert,
+                            client_key,
+                            destination: destination.clone(),
+                            path_filter: filter.clone(),
+                            update_only: args.update_only,
+                            preserve_metadata,
+                            preserve_xattrs,
+                            delete: args.delete,
+                            dry_run: args.dry_run,
+                            progress: progress_enabled,
+                            chunk_size: args.chunk_size.max(1),
+                            max_stream_payload: args.max_stream_payload,
+                            metadata_only: args.dry_run,
+                            bwlimit_kbps,
+                            include_patterns: args.include.clone(),
+                            exclude_patterns: args.exclude.clone(),
+                            connect_timeout: Duration::from_millis(args.connect_timeout_ms),
+                            operation_timeout: Duration::from_millis(args.op_timeout_ms),
+                        },
+                    )
+                    .await?;
+                    if let Some(session) = bootstrap_session {
+                        run_blocking_task(&handle, "bootstrap-session-wait", move || {
+                            session.wait()
+                        })
+                        .await?;
+                    }
+                    pull
+                }
+                EffectiveTransport::Local => {
+                    bail!("invalid transport local for remote->local endpoint")
+                }
             };
-
-            let pull = transfer::pull_directory_over_ssh_stream(
-                handle.clone(),
-                transfer::PullOverSshStreamOptions {
-                    remote: bootstrap_remote.clone(),
-                    source: remote.path.clone(),
-                    destination: destination.clone(),
-                    remote_shell_prefix: remote_shell_prefix.clone(),
-                    scan: scan::ScanOptions {
-                        chunk_size: args.chunk_size.max(1),
-                        scan_workers: args.scan_workers.max(1),
-                        hash_workers: args.hash_workers.max(1),
-                    },
-                    path_filter: filter.clone(),
-                    update_only: args.update_only,
-                    preserve_metadata,
-                    delete: args.delete,
-                    dry_run: args.dry_run,
-                    progress: progress_enabled,
-                    chunk_size: args.chunk_size.max(1),
-                    max_stream_payload: args.max_stream_payload,
-                    metadata_only: args.dry_run,
-                    bwlimit_kbps,
-                    include_patterns: args.include.clone(),
-                    exclude_patterns: args.exclude.clone(),
-                },
-            )
-            .await?;
-            drop(remote_binary_lease);
 
             if args.dry_run {
                 println!(

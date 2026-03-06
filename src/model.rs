@@ -6,6 +6,8 @@ pub struct FileManifest {
     pub size: u64,
     pub mode: u32,
     pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
     pub file_hash: String,
     pub total_chunks: usize,
 }

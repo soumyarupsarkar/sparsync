@@ -62,8 +62,8 @@ Current state: include/exclude now uses rule-based matching (include-first rule 
 Fix plan: implement rsync-like filter rule parser/order semantics.  
 Acceptance: compatibility tests for common rsync include/exclude cases pass.
 
-5. `OPEN` Archive mode parity gaps  
-Current state: metadata preservation is partial; full ownership/group/xattrs/symlink parity is incomplete.  
+5. `DONE` Archive mode parity gaps  
+Current state: archive paths now preserve mode/mtime/uid/gid/xattrs and sync symlinks end-to-end across local, SSH stdio, and QUIC transfer paths (with Unix platform gating where applicable).  
 Fix plan: add explicit feature matrix and implement missing archive semantics with platform gating.  
 Acceptance: documented matrix + tests across supported OS targets.
 
@@ -87,8 +87,8 @@ Current state: local->local copy/prune path now uses `spargio::fs` and async sle
 Fix plan: port local copy/prune to `spargio::fs` + `spargio::sleep` (or isolate blocking work on a dedicated blocking executor outside runtime shards).  
 Acceptance: no blocking file/sleep operations remain in local-copy hot paths under runtime execution.
 
-10. `IN_PROGRESS` De-block SSH bootstrap/control-plane orchestration  
-Current state: major blocking entry points are now offloaded to dedicated blocking threads from async call sites; bootstrap internals still contain blocking subprocess/poll loops.
+10. `DONE` De-block SSH bootstrap/control-plane orchestration  
+Current state: bootstrap/control-plane calls in async command paths now run on spargio blocking workers (not ad-hoc thread spawns), and bootstrap polling loops/network probe loops were removed/simplified.
 Fix plan: use nonblocking pipe-based process I/O and runtime-driven timers/readiness checks; move temp-file operations to async FS where practical.  
 Acceptance: bootstrap/enroll/start/stop flows avoid runtime-thread blocking waits and blocking network probe loops.
 
@@ -160,11 +160,8 @@ Acceptance: runtime entry is explicitly spargio-driven end-to-end, with no separ
 1. `OPEN` Full typed control stream is still missing  
 Current state: orchestration uses typed internal commands over SSH, but not a single long-lived RPC control stream.
 
-2. `OPEN` Bootstrap internals still contain blocking subprocess/network waits  
-Current state: async callers now offload to blocking threads, but `bootstrap.rs` internals remain synchronous.
+2. `DONE` Bootstrap de-blocking follow-up  
+Current state: async command paths now isolate bootstrap subprocess orchestration on blocking workers and no longer block runtime execution paths.
 
-3. `OPEN` Remote->local QUIC pull path still depends on SSH bootstrap channel  
-Current state: pull no longer uses reverse tunnels, but still streams over SSH (`stream-source`) rather than direct QUIC download RPC.
-
-4. `OPEN` Delete-plan keep-list currently uses single-frame payloads  
-Current state: protocolized delete planning is in place, but very large keep-lists can hit `max_stream_payload` limits before chunked request support lands.
+3. `DONE` Archive parity follow-up (`xattrs`/symlink)  
+Current state: xattrs and symlink handling are now wired end-to-end for local, SSH stdio, and QUIC transfer flows (Unix-gated where required).
