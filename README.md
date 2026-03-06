@@ -6,7 +6,7 @@ sparsync is optimized for synchronizing large file trees with extremely high con
 For such workloads, our benchmarks show **20% faster performance than rsync-over-SSH for initial syncs, and up to 10x faster subsequent syncs.**
 
 ## Overview
-`sparsync` is a high-performance file synchronization tool, protocol, and server focused on directory trees where coordination cost matters as much as raw throughput. It provides rsync-like CLI ergonomics, but is designed around QUIC for transport and `io_uring` for IO operations.
+`sparsync` is a high-performance file synchronization tool, protocol, and server focused on syncing very large directory trees. It provides rsync-like CLI ergonomics, but is designed around QUIC for transport and `io_uring` for IO operations.
 
 The primary optimization target is sync workloads with many files and high metadata churn, especially repeated syncs where planning, comparison, and control-plane overhead dominate. `sparsync` also supports local copy, SSH stdio transport, and a [QUIC transport path (`sparsync://`) with optional mTLS authorization](./PROTOCOL.md).
 
