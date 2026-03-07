@@ -3,7 +3,7 @@
 
 sparsync is optimized for synchronizing large file trees with extremely high concurrency (not multiplexing over an SSH session). It works well for backups to a NAS. It is Linux-only for now.
 
-For such workloads, our latest benchmark snapshot shows `sparsync` about **30% faster than rsync-over-SSH on initial sync**, and roughly **5-8x faster on repeated no-change/changed runs**.
+For such workloads, our benchmarks show **30% faster performance than rsync-over-SSH for initial syncs, and up to 10x faster subsequent syncs.**
 
 ## Overview
 `sparsync` is a high-performance file synchronization tool, protocol, and server focused on syncing very large directory trees. It provides rsync-like CLI ergonomics, but is designed around QUIC for transport and `io_uring` for IO operations.
