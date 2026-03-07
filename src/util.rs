@@ -1,5 +1,8 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use spargio::{RuntimeHandle, fs};
 use std::path::{Component, Path, PathBuf};
+
+pub const QUICK_CHECK_TOKEN_PREFIX: &str = "qc:";
 
 pub fn relative_path_string(root: &Path, absolute: &Path) -> Result<String> {
     let relative = absolute.strip_prefix(root).map_err(|_| {
@@ -72,4 +75,58 @@ pub fn runtime_error(context: &str, err: spargio::RuntimeError) -> anyhow::Error
 
 pub fn join_error(context: &str, err: spargio::JoinError) -> anyhow::Error {
     anyhow!("{context}: {err:?}")
+}
+
+pub fn quick_check_token(size: u64, mtime_sec: i64) -> String {
+    format!("{QUICK_CHECK_TOKEN_PREFIX}{size}:{mtime_sec}")
+}
+
+pub fn parse_quick_check_token(value: &str) -> Option<(u64, i64)> {
+    let rest = value.strip_prefix(QUICK_CHECK_TOKEN_PREFIX)?;
+    let (size, mtime_sec) = rest.split_once(':')?;
+    let size = size.parse::<u64>().ok()?;
+    let mtime_sec = mtime_sec.parse::<i64>().ok()?;
+    Some((size, mtime_sec))
+}
+
+pub fn is_quick_check_token(value: &str) -> bool {
+    parse_quick_check_token(value).is_some()
+}
+
+pub fn total_chunks_for_size(size: u64, chunk_size: usize) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    let chunk = chunk_size.max(1) as u64;
+    ((size + chunk - 1) / chunk) as usize
+}
+
+pub async fn remove_dir_tree(handle: &RuntimeHandle, root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut remove_order = Vec::new();
+
+    while let Some(dir) = pending.pop() {
+        remove_order.push(dir.clone());
+        let entries = fs::read_dir(handle, &dir)
+            .await
+            .with_context(|| format!("read directory {}", dir.display()))?;
+        for entry in entries {
+            match entry.entry_type {
+                fs::DirEntryType::Directory => pending.push(entry.path),
+                fs::DirEntryType::File | fs::DirEntryType::Symlink => {
+                    fs::remove_file(handle, &entry.path)
+                        .await
+                        .with_context(|| format!("remove {}", entry.path.display()))?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for dir in remove_order.into_iter().rev() {
+        fs::remove_dir(handle, &dir)
+            .await
+            .with_context(|| format!("remove directory {}", dir.display()))?;
+    }
+    Ok(())
 }

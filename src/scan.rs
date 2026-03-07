@@ -1,5 +1,7 @@
 use crate::model::{FileManifest, Manifest};
-use crate::util::{join_error, relative_path_string, runtime_error};
+use crate::util::{
+    join_error, quick_check_token, relative_path_string, runtime_error, total_chunks_for_size,
+};
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -182,15 +184,69 @@ pub async fn build_file_list(
         .with_context(|| format!("canonicalize {}", root.display()))?;
 
     let enum_started = Instant::now();
-    let files = enumerate_paths(handle.clone(), &root, scan_workers.max(1), true).await?;
+    let (files, symlinks) =
+        enumerate_paths_split(handle.clone(), &root, scan_workers.max(1), true).await?;
     let enumeration_elapsed = enum_started.elapsed();
 
     let metadata_started = Instant::now();
-    let entries =
-        collect_file_metadata(handle.clone(), &root, files, metadata_workers.max(1)).await?;
+    let mut entries =
+        collect_regular_file_metadata(handle.clone(), &root, files, metadata_workers.max(1))
+            .await?;
+    if !symlinks.is_empty() {
+        let mut symlink_entries =
+            collect_file_metadata(handle.clone(), &root, symlinks, metadata_workers.max(1)).await?;
+        entries.append(&mut symlink_entries);
+    }
+    entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     let metadata_elapsed = metadata_started.elapsed();
 
     Ok((root, entries, enumeration_elapsed, metadata_elapsed))
+}
+
+pub async fn build_quick_manifest_with_symlinks(
+    handle: RuntimeHandle,
+    root: &Path,
+    options: ScanOptions,
+) -> Result<(PathBuf, Vec<FileManifest>, Vec<FileEntry>, ScanStats)> {
+    let total_started = Instant::now();
+    let root = fs::canonicalize(&handle, root)
+        .await
+        .with_context(|| format!("canonicalize {}", root.display()))?;
+
+    let enum_started = Instant::now();
+    let (files, symlink_paths) =
+        enumerate_paths_split(handle.clone(), &root, options.scan_workers.max(1), true).await?;
+    let enumeration_elapsed = enum_started.elapsed();
+
+    let metadata_started = Instant::now();
+    let chunk_size = options.chunk_size.max(1);
+    let file_manifests = collect_quick_file_manifests(
+        handle.clone(),
+        &root,
+        files,
+        options.hash_workers.max(1),
+        chunk_size,
+    )
+    .await?;
+    let symlink_entries = if symlink_paths.is_empty() {
+        Vec::new()
+    } else {
+        collect_file_metadata(
+            handle.clone(),
+            &root,
+            symlink_paths,
+            options.hash_workers.max(1),
+        )
+        .await?
+    };
+    let metadata_elapsed = metadata_started.elapsed();
+
+    let stats = ScanStats {
+        enumeration_elapsed,
+        hash_elapsed: metadata_elapsed,
+        total_elapsed: total_started.elapsed(),
+    };
+    Ok((root, file_manifests, symlink_entries, stats))
 }
 
 async fn enumerate_paths(
@@ -379,6 +435,85 @@ async fn collect_file_metadata(
     Ok(out)
 }
 
+async fn collect_regular_file_metadata(
+    handle: RuntimeHandle,
+    root: &Path,
+    files: Vec<PathBuf>,
+    workers: usize,
+) -> Result<Vec<FileEntry>> {
+    let root = root.to_path_buf();
+    let mut iter = files.into_iter();
+    let mut running = FuturesUnordered::new();
+
+    for _ in 0..workers {
+        if let Some(path) = iter.next() {
+            running.push(spawn_regular_metadata_job(
+                handle.clone(),
+                root.clone(),
+                path,
+            )?);
+        }
+    }
+
+    let mut out = Vec::new();
+    while let Some(joined) = running.next().await {
+        let item = joined.map_err(|err| join_error("metadata worker canceled", err))??;
+        out.push(item);
+
+        if let Some(path) = iter.next() {
+            running.push(spawn_regular_metadata_job(
+                handle.clone(),
+                root.clone(),
+                path,
+            )?);
+        }
+    }
+
+    out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(out)
+}
+
+async fn collect_quick_file_manifests(
+    handle: RuntimeHandle,
+    root: &Path,
+    files: Vec<PathBuf>,
+    workers: usize,
+    chunk_size: usize,
+) -> Result<Vec<FileManifest>> {
+    let root = root.to_path_buf();
+    let mut iter = files.into_iter();
+    let mut running = FuturesUnordered::new();
+
+    for _ in 0..workers {
+        if let Some(path) = iter.next() {
+            running.push(spawn_quick_manifest_job(
+                handle.clone(),
+                root.clone(),
+                path,
+                chunk_size,
+            )?);
+        }
+    }
+
+    let mut out = Vec::new();
+    while let Some(joined) = running.next().await {
+        let item = joined.map_err(|err| join_error("quick manifest worker canceled", err))??;
+        out.push(item);
+
+        if let Some(path) = iter.next() {
+            running.push(spawn_quick_manifest_job(
+                handle.clone(),
+                root.clone(),
+                path,
+                chunk_size,
+            )?);
+        }
+    }
+
+    out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(out)
+}
+
 fn spawn_hash_job(
     handle: RuntimeHandle,
     root: PathBuf,
@@ -410,6 +545,33 @@ fn spawn_metadata_job(
     handle
         .spawn_stealable(async move { metadata_one_file(task_handle, &root, &absolute_path).await })
         .map_err(|err| runtime_error("spawn metadata task", err))
+}
+
+fn spawn_regular_metadata_job(
+    handle: RuntimeHandle,
+    root: PathBuf,
+    absolute_path: PathBuf,
+) -> Result<spargio::JoinHandle<Result<FileEntry>>> {
+    let task_handle = handle.clone();
+    handle
+        .spawn_stealable(async move {
+            regular_metadata_one_file(task_handle, &root, &absolute_path).await
+        })
+        .map_err(|err| runtime_error("spawn regular metadata task", err))
+}
+
+fn spawn_quick_manifest_job(
+    handle: RuntimeHandle,
+    root: PathBuf,
+    absolute_path: PathBuf,
+    chunk_size: usize,
+) -> Result<spargio::JoinHandle<Result<FileManifest>>> {
+    let task_handle = handle.clone();
+    handle
+        .spawn_stealable(async move {
+            quick_manifest_one_file(task_handle, &root, &absolute_path, chunk_size).await
+        })
+        .map_err(|err| runtime_error("spawn quick manifest task", err))
 }
 
 async fn hash_one_file(
@@ -541,6 +703,63 @@ async fn metadata_one_file(
         mtime_sec: metadata.mtime_sec,
         uid: metadata.uid,
         gid: metadata.gid,
+    })
+}
+
+async fn regular_metadata_one_file(
+    handle: RuntimeHandle,
+    root: &Path,
+    absolute_path: &Path,
+) -> Result<FileEntry> {
+    let relative_path = relative_path_string(root, absolute_path)?;
+    let metadata = fs::metadata_lite(&handle, absolute_path)
+        .await
+        .with_context(|| format!("stat {}", absolute_path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "{} is not a regular file",
+            absolute_path.display()
+        ));
+    }
+
+    Ok(FileEntry {
+        relative_path,
+        kind: FileEntryKind::File,
+        symlink_target: None,
+        size: metadata.size,
+        mode: metadata.mode as u32,
+        mtime_sec: metadata.mtime_sec,
+        uid: metadata.uid,
+        gid: metadata.gid,
+    })
+}
+
+async fn quick_manifest_one_file(
+    handle: RuntimeHandle,
+    root: &Path,
+    absolute_path: &Path,
+    chunk_size: usize,
+) -> Result<FileManifest> {
+    let relative_path = relative_path_string(root, absolute_path)?;
+    let metadata = fs::metadata_lite(&handle, absolute_path)
+        .await
+        .with_context(|| format!("stat {}", absolute_path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "{} is not a regular file",
+            absolute_path.display()
+        ));
+    }
+
+    Ok(FileManifest {
+        relative_path,
+        size: metadata.size,
+        mode: metadata.mode as u32,
+        mtime_sec: metadata.mtime_sec,
+        uid: metadata.uid,
+        gid: metadata.gid,
+        file_hash: quick_check_token(metadata.size, metadata.mtime_sec),
+        total_chunks: total_chunks_for_size(metadata.size, chunk_size),
     })
 }
 

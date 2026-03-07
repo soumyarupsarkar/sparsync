@@ -1,4 +1,5 @@
 use crate::protocol::{InitAction, InitFileRequest, InitFileResponse};
+use crate::util::parse_quick_check_token;
 use anyhow::{Context, Result};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,11 @@ impl StateStore {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("state mutex poisoned"))?;
+        if let Some((token_size, token_mtime)) = parse_quick_check_token(file_hash) {
+            return Ok(guard.complete.get(relative_path).is_some_and(|done| {
+                done.size == size && token_size == size && done.mtime_sec == token_mtime
+            }));
+        }
         Ok(guard
             .complete
             .get(relative_path)
@@ -120,7 +126,14 @@ impl StateStore {
                 .map_err(|_| anyhow::anyhow!("state mutex poisoned"))?;
 
             if let Some(done) = guard.complete.get(&req.relative_path) {
-                if done.file_hash == req.file_hash && done.size == req.size {
+                let complete_match = if let Some((token_size, token_mtime)) =
+                    parse_quick_check_token(&req.file_hash)
+                {
+                    done.size == req.size && token_size == req.size && done.mtime_sec == token_mtime
+                } else {
+                    done.file_hash == req.file_hash && done.size == req.size
+                };
+                if complete_match {
                     let resp = InitFileResponse {
                         action: InitAction::Skip,
                         next_chunk: req.total_chunks,

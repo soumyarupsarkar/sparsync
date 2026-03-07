@@ -3,7 +3,7 @@ use crate::compression;
 use crate::endpoint::RemoteEndpoint;
 use crate::filter::PathFilter;
 use crate::metadata;
-use crate::model::FileManifest;
+use crate::model::{FileManifest, Manifest};
 use crate::protocol::{
     DeletePlanRequest, DeletePlanResponse, DeletePlanStage, FileMetadataSyncEntry, Frame,
     HelloRequest, HelloResponse, InitAction, InitBatchRequest, InitFileRequest, InitFileResponse,
@@ -13,7 +13,7 @@ use crate::protocol::{
     UploadSmallBatchRequest, UploadSmallFileMeta, XattrEntry,
 };
 use crate::scan::{self, FileEntryKind, ScanOptions};
-use crate::util::{join_error, runtime_error};
+use crate::util::{is_quick_check_token, join_error, remove_dir_tree, runtime_error};
 use anyhow::{Context, Result, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use spargio::{RuntimeHandle, fs};
@@ -62,6 +62,7 @@ pub struct PushOptions {
     pub max_stream_payload: usize,
     pub resume: bool,
     pub update_only: bool,
+    pub checksum: bool,
     pub cold_start: bool,
     pub manifest_out: Option<PathBuf>,
     pub preserve_metadata: bool,
@@ -82,6 +83,7 @@ pub struct PushOverSshOptions {
     pub max_stream_payload: usize,
     pub resume: bool,
     pub update_only: bool,
+    pub checksum: bool,
     pub cold_start: bool,
     pub manifest_out: Option<PathBuf>,
     pub preserve_metadata: bool,
@@ -204,6 +206,236 @@ impl PushSummary {
         }
         ((self.bytes_sent as f64) * 8.0) / secs / 1_000_000.0
     }
+}
+
+#[derive(Debug)]
+struct PreparedPushScan {
+    root: PathBuf,
+    files: Vec<FileManifest>,
+    symlinks: Vec<SymlinkMeta>,
+    enumerate_elapsed: Duration,
+    hash_elapsed: Duration,
+    total_elapsed: Duration,
+    total_bytes: u64,
+}
+
+async fn prepare_push_scan(
+    handle: RuntimeHandle,
+    source: &Path,
+    scan_options: ScanOptions,
+    path_filter: Option<&PathFilter>,
+    preserve_xattrs: bool,
+    checksum: bool,
+) -> Result<PreparedPushScan> {
+    if checksum {
+        let (mut manifest, symlink_entries, scan_stats) =
+            scan::build_manifest_with_symlinks(handle, source, scan_options)
+                .await
+                .with_context(|| format!("build source manifest {}", source.display()))?;
+        if let Some(filter) = path_filter {
+            let before = manifest.files.len();
+            manifest
+                .files
+                .retain(|file| filter.allows(&file.relative_path));
+            manifest.total_bytes = manifest.files.iter().map(|item| item.size).sum();
+            if manifest.files.len() != before {
+                println!(
+                    "filter applied kept_files={} dropped_files={}",
+                    manifest.files.len(),
+                    before.saturating_sub(manifest.files.len())
+                );
+            }
+        }
+        let root = PathBuf::from(&manifest.root);
+        let symlinks =
+            symlink_batch_from_entries(&root, symlink_entries, path_filter, preserve_xattrs)?;
+        return Ok(PreparedPushScan {
+            root,
+            files: manifest.files,
+            symlinks,
+            enumerate_elapsed: scan_stats.enumeration_elapsed,
+            hash_elapsed: scan_stats.hash_elapsed,
+            total_elapsed: scan_stats.total_elapsed,
+            total_bytes: manifest.total_bytes,
+        });
+    }
+
+    let (root, mut files, mut symlink_entries, scan_stats) =
+        scan::build_quick_manifest_with_symlinks(handle, source, scan_options)
+            .await
+            .with_context(|| format!("build source quick manifest {}", source.display()))?;
+
+    if let Some(filter) = path_filter {
+        let before_files = files.len();
+        let before_symlinks = symlink_entries.len();
+        files.retain(|file| filter.allows(&file.relative_path));
+        symlink_entries.retain(|entry| filter.allows(&entry.relative_path));
+        let dropped = before_files
+            .saturating_sub(files.len())
+            .saturating_add(before_symlinks.saturating_sub(symlink_entries.len()));
+        if dropped > 0 {
+            println!(
+                "filter applied kept_files={} dropped_files={}",
+                files.len().saturating_add(symlink_entries.len()),
+                dropped
+            );
+        }
+    }
+
+    let total_bytes = files.iter().map(|item| item.size).sum::<u64>();
+    let symlinks = symlink_batch_from_entries(&root, symlink_entries, None, preserve_xattrs)?;
+
+    Ok(PreparedPushScan {
+        root,
+        files,
+        symlinks,
+        enumerate_elapsed: scan_stats.enumeration_elapsed,
+        hash_elapsed: scan_stats.hash_elapsed,
+        total_elapsed: scan_stats.total_elapsed,
+        total_bytes,
+    })
+}
+
+async fn write_manifest_output(
+    handle: &RuntimeHandle,
+    path: &Path,
+    root: &Path,
+    chunk_size: usize,
+    files: &[FileManifest],
+    total_bytes: u64,
+) -> Result<()> {
+    let manifest = Manifest {
+        root: root.to_string_lossy().into_owned(),
+        chunk_size,
+        files: files.to_vec(),
+        total_bytes,
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    fs::write(handle, path, bytes)
+        .await
+        .with_context(|| format!("write manifest {}", path.display()))
+}
+
+async fn compute_file_hash(
+    handle: &RuntimeHandle,
+    source_path: &Path,
+    chunk_size: usize,
+    expected_size: u64,
+) -> Result<String> {
+    let metadata = fs::metadata_lite(handle, source_path)
+        .await
+        .with_context(|| format!("stat {}", source_path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", source_path.display());
+    }
+    if metadata.size != expected_size {
+        bail!(
+            "source file size changed before hashing {}: expected {} got {}",
+            source_path.display(),
+            expected_size,
+            metadata.size
+        );
+    }
+
+    let file = fs::File::open(handle.clone(), source_path)
+        .await
+        .with_context(|| format!("open {}", source_path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0u64;
+    let chunk_size = chunk_size.max(1);
+    loop {
+        let chunk = file
+            .read_at(offset, chunk_size)
+            .await
+            .with_context(|| format!("read {} at offset {}", source_path.display(), offset))?;
+        if chunk.is_empty() {
+            break;
+        }
+        hasher.update(&chunk);
+        offset = offset.saturating_add(chunk.len() as u64);
+        if chunk.len() < chunk_size {
+            break;
+        }
+    }
+
+    if offset != expected_size {
+        bail!(
+            "source file size changed during hashing {}: expected {} got {}",
+            source_path.display(),
+            expected_size,
+            offset
+        );
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn spawn_hash_resolve_job(
+    handle: RuntimeHandle,
+    source_path: PathBuf,
+    chunk_size: usize,
+    expected_size: u64,
+    file_index: usize,
+) -> Result<spargio::JoinHandle<Result<(usize, String)>>> {
+    let task_handle = handle.clone();
+    handle
+        .spawn_stealable(async move {
+            let hash = compute_file_hash(&task_handle, &source_path, chunk_size, expected_size)
+                .await
+                .with_context(|| format!("hash upload candidate {}", source_path.display()))?;
+            Ok::<(usize, String), anyhow::Error>((file_index, hash))
+        })
+        .map_err(|err| runtime_error("spawn streamed hash task", err))
+}
+
+async fn resolve_streamed_file_hashes(
+    handle: &RuntimeHandle,
+    options: &FileTransferOptions,
+    files: &mut [(FileManifest, InitFileResponse)],
+    workers: usize,
+) -> Result<()> {
+    let mut pending = VecDeque::new();
+    for (index, (file, _)) in files.iter().enumerate() {
+        if is_quick_check_token(&file.file_hash) {
+            let source_path = options.source_root.join(Path::new(&file.relative_path));
+            pending.push_back((index, source_path, file.size));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let max_workers = workers.max(1).min(pending.len());
+    let mut running = FuturesUnordered::new();
+    for _ in 0..max_workers {
+        if let Some((index, source_path, size)) = pending.pop_front() {
+            running.push(spawn_hash_resolve_job(
+                handle.clone(),
+                source_path,
+                options.chunk_size,
+                size,
+                index,
+            )?);
+        }
+    }
+
+    while let Some(joined) = running.next().await {
+        let (index, hash) =
+            joined.map_err(|err| join_error("streamed hash task canceled", err))??;
+        files[index].0.file_hash = hash;
+
+        if let Some((next_index, source_path, size)) = pending.pop_front() {
+            running.push(spawn_hash_resolve_job(
+                handle.clone(),
+                source_path,
+                options.chunk_size,
+                size,
+                next_index,
+            )?);
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_path_xattrs(
@@ -1258,50 +1490,49 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         return Ok(summary);
     }
 
-    let (mut manifest, symlink_entries, scan_stats) =
-        scan::build_manifest_with_symlinks(handle.clone(), &options.source, options.scan)
-            .await
-            .with_context(|| format!("build source manifest {}", options.source.display()))?;
-    if let Some(path_filter) = options.path_filter.as_ref() {
-        let before = manifest.files.len();
-        manifest
-            .files
-            .retain(|file| path_filter.allows(&file.relative_path));
-        manifest.total_bytes = manifest.files.iter().map(|item| item.size).sum();
-        if manifest.files.len() != before {
-            println!(
-                "filter applied kept_files={} dropped_files={}",
-                manifest.files.len(),
-                before.saturating_sub(manifest.files.len())
-            );
-        }
-    }
+    let scan = prepare_push_scan(
+        handle.clone(),
+        &options.source,
+        options.scan,
+        options.path_filter.as_ref(),
+        options.preserve_xattrs,
+        options.checksum,
+    )
+    .await?;
+    let PreparedPushScan {
+        root: scan_root,
+        files: scan_files,
+        symlinks: scan_symlinks,
+        enumerate_elapsed: scan_enumerate_elapsed,
+        hash_elapsed: scan_hash_elapsed,
+        total_elapsed: _,
+        total_bytes: scan_total_bytes,
+    } = scan;
 
     if let Some(path) = &options.manifest_out {
-        let bytes = serde_json::to_vec_pretty(&manifest)?;
-        fs::write(&handle, path, bytes)
-            .await
-            .with_context(|| format!("write manifest {}", path.display()))?;
+        write_manifest_output(
+            &handle,
+            path,
+            &scan_root,
+            options.scan.chunk_size.max(1),
+            &scan_files,
+            scan_total_bytes,
+        )
+        .await?;
     }
 
     println!(
         "scan complete files={} bytes={} enumerate_ms={} hash_ms={}",
-        manifest.files.len(),
-        manifest.total_bytes,
-        scan_stats.enumeration_elapsed.as_millis(),
-        scan_stats.hash_elapsed.as_millis(),
+        scan_files.len().saturating_add(scan_symlinks.len()),
+        scan_total_bytes,
+        scan_enumerate_elapsed.as_millis(),
+        scan_hash_elapsed.as_millis(),
     );
-    let symlinks = symlink_batch_from_entries(
-        Path::new(&manifest.root),
-        symlink_entries,
-        options.path_filter.as_ref(),
-        options.preserve_xattrs,
-    )?;
-    let total_files = manifest.files.len().saturating_add(symlinks.len());
+    let total_files = scan_files.len().saturating_add(scan_symlinks.len());
 
     let transfer_options = FileTransferOptions {
-        source_root: PathBuf::from(&manifest.root),
-        chunk_size: manifest.chunk_size,
+        source_root: scan_root,
+        chunk_size: options.scan.chunk_size.max(1),
         compression_level: options.compression_level,
         max_stream_payload: options.max_stream_payload,
         resume: options.resume,
@@ -1316,7 +1547,7 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
 
     let mut totals = BatchResult::default();
     let (init_totals, small_upload_files, uploads) =
-        initialize_files_for_push(&connections[0], &transfer_options, manifest.files).await?;
+        initialize_files_for_push(&connections[0], &transfer_options, scan_files).await?;
     totals.merge(init_totals);
     maybe_print_transfer_progress(
         options.progress,
@@ -1373,8 +1604,15 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
         }
     }
 
-    let (direct_files, streamed_files) =
+    let (direct_files, mut streamed_files) =
         split_direct_uploads(uploads, transfer_options.direct_file_max_bytes);
+    resolve_streamed_file_hashes(
+        &handle,
+        &transfer_options,
+        &mut streamed_files,
+        options.scan.hash_workers.max(1),
+    )
+    .await?;
     let direct_totals = transfer_initialized_direct_batches(
         handle.clone(),
         &connections,
@@ -1448,7 +1686,7 @@ pub async fn push_directory(handle: RuntimeHandle, options: PushOptions) -> Resu
 
     let (symlink_transferred, symlink_skipped) = sync_symlinks_over_quic(
         &connections[0],
-        &symlinks,
+        &scan_symlinks,
         transfer_options.max_stream_payload,
         &stats,
     )
@@ -1520,51 +1758,50 @@ pub async fn push_directory_over_ssh_stdio(
         return Ok(summary);
     }
 
-    let (mut manifest, symlink_entries, scan_stats) =
-        scan::build_manifest_with_symlinks(handle.clone(), &options.source, options.scan)
-            .await
-            .with_context(|| format!("build source manifest {}", options.source.display()))?;
-    if let Some(path_filter) = options.path_filter.as_ref() {
-        let before = manifest.files.len();
-        manifest
-            .files
-            .retain(|file| path_filter.allows(&file.relative_path));
-        manifest.total_bytes = manifest.files.iter().map(|item| item.size).sum();
-        if manifest.files.len() != before {
-            println!(
-                "filter applied kept_files={} dropped_files={}",
-                manifest.files.len(),
-                before.saturating_sub(manifest.files.len())
-            );
-        }
-    }
-    ssh_profile.add_scan_time(scan_stats.total_elapsed);
+    let scan = prepare_push_scan(
+        handle.clone(),
+        &options.source,
+        options.scan,
+        options.path_filter.as_ref(),
+        options.preserve_xattrs,
+        options.checksum,
+    )
+    .await?;
+    let PreparedPushScan {
+        root: scan_root,
+        files: scan_files,
+        symlinks: scan_symlinks,
+        enumerate_elapsed: scan_enumerate_elapsed,
+        hash_elapsed: scan_hash_elapsed,
+        total_elapsed: scan_total_elapsed,
+        total_bytes: scan_total_bytes,
+    } = scan;
+    ssh_profile.add_scan_time(scan_total_elapsed);
 
     if let Some(path) = &options.manifest_out {
-        let bytes = serde_json::to_vec_pretty(&manifest)?;
-        fs::write(&handle, path, bytes)
-            .await
-            .with_context(|| format!("write manifest {}", path.display()))?;
+        write_manifest_output(
+            &handle,
+            path,
+            &scan_root,
+            options.scan.chunk_size.max(1),
+            &scan_files,
+            scan_total_bytes,
+        )
+        .await?;
     }
 
     println!(
         "scan complete files={} bytes={} enumerate_ms={} hash_ms={}",
-        manifest.files.len(),
-        manifest.total_bytes,
-        scan_stats.enumeration_elapsed.as_millis(),
-        scan_stats.hash_elapsed.as_millis(),
+        scan_files.len().saturating_add(scan_symlinks.len()),
+        scan_total_bytes,
+        scan_enumerate_elapsed.as_millis(),
+        scan_hash_elapsed.as_millis(),
     );
-    let symlinks = symlink_batch_from_entries(
-        Path::new(&manifest.root),
-        symlink_entries,
-        options.path_filter.as_ref(),
-        options.preserve_xattrs,
-    )?;
-    let total_files = manifest.files.len().saturating_add(symlinks.len());
+    let total_files = scan_files.len().saturating_add(scan_symlinks.len());
 
     let transfer_options = FileTransferOptions {
-        source_root: PathBuf::from(&manifest.root),
-        chunk_size: manifest.chunk_size,
+        source_root: scan_root,
+        chunk_size: options.scan.chunk_size.max(1),
         compression_level: options.compression_level,
         max_stream_payload: options.max_stream_payload,
         resume: options.resume,
@@ -1578,7 +1815,7 @@ pub async fn push_directory_over_ssh_stdio(
     };
 
     let (small_files, large_files) = partition_small_files(
-        manifest.files,
+        scan_files,
         transfer_options.chunk_size,
         transfer_options.small_file_max_bytes,
     );
@@ -1613,8 +1850,15 @@ pub async fn push_directory_over_ssh_stdio(
     );
     ssh_profile.add_init_time(init_started.elapsed());
 
-    let (direct_files, streamed_files) =
+    let (direct_files, mut streamed_files) =
         split_direct_uploads(uploads, transfer_options.direct_file_max_bytes);
+    resolve_streamed_file_hashes(
+        &handle,
+        &transfer_options,
+        &mut streamed_files,
+        options.scan.hash_workers.max(1),
+    )
+    .await?;
     let upload_started = Instant::now();
     let direct_totals = transfer_initialized_direct_batches_over_ssh(
         &handle,
@@ -1648,9 +1892,12 @@ pub async fn push_directory_over_ssh_stdio(
     }
     ssh_profile.add_upload_time(upload_started.elapsed());
 
-    let (symlink_transferred, symlink_skipped) =
-        sync_symlinks_over_ssh(&mut session, &symlinks, transfer_options.max_stream_payload)
-            .await?;
+    let (symlink_transferred, symlink_skipped) = sync_symlinks_over_ssh(
+        &mut session,
+        &scan_symlinks,
+        transfer_options.max_stream_payload,
+    )
+    .await?;
     totals.files_transferred = totals.files_transferred.saturating_add(symlink_transferred);
     totals.files_skipped = totals.files_skipped.saturating_add(symlink_skipped);
     maybe_print_transfer_progress(
@@ -2009,6 +2256,11 @@ async fn transfer_small_batch_over_ssh(
                 raw.len()
             );
         }
+        let file_hash = if is_quick_check_token(&file.file_hash) {
+            blake3::hash(&raw).to_hex().to_string()
+        } else {
+            file.file_hash.clone()
+        };
 
         let raw_len = raw.len();
         let encode_started = Instant::now();
@@ -2032,7 +2284,7 @@ async fn transfer_small_batch_over_ssh(
             uid: file.uid,
             gid: file.gid,
             xattrs,
-            file_hash: file.file_hash.clone(),
+            file_hash,
             total_chunks: file.total_chunks,
             compressed,
             raw_len,
@@ -2080,7 +2332,13 @@ async fn transfer_small_batch_over_ssh(
         }
     }
 
-    for (file, init) in fallback {
+    for (mut file, init) in fallback {
+        if is_quick_check_token(&file.file_hash) {
+            let source_path = options.source_root.join(Path::new(&file.relative_path));
+            file.file_hash = compute_file_hash(handle, &source_path, options.chunk_size, file.size)
+                .await
+                .with_context(|| format!("hash resumed upload {}", file.relative_path))?;
+        }
         let result = upload_file_batches_over_ssh(handle, session, options, &file, &init).await?;
         totals.add_file_result(result);
     }
@@ -2130,6 +2388,11 @@ async fn transfer_initialized_direct_batches_over_ssh(
                 raw.len()
             );
         }
+        let file_hash = if is_quick_check_token(&file.file_hash) {
+            blake3::hash(&raw).to_hex().to_string()
+        } else {
+            file.file_hash.clone()
+        };
 
         let raw_len = raw.len();
         let encode_started = Instant::now();
@@ -2167,7 +2430,7 @@ async fn transfer_initialized_direct_batches_over_ssh(
             uid: file.uid,
             gid: file.gid,
             xattrs,
-            file_hash: file.file_hash,
+            file_hash,
             total_chunks: file.total_chunks,
             compressed,
             raw_len,
@@ -3168,6 +3431,11 @@ async fn transfer_initialized_direct_batches(
                 raw.len()
             );
         }
+        let file_hash = if is_quick_check_token(&file.file_hash) {
+            blake3::hash(&raw).to_hex().to_string()
+        } else {
+            file.file_hash.clone()
+        };
 
         let raw_len = raw.len();
         let encode_started = Instant::now();
@@ -3215,7 +3483,7 @@ async fn transfer_initialized_direct_batches(
             uid: file.uid,
             gid: file.gid,
             xattrs,
-            file_hash: file.file_hash,
+            file_hash,
             total_chunks: file.total_chunks,
             compressed,
             raw_len,
@@ -3504,6 +3772,11 @@ async fn transfer_small_upload_batch(
                 raw.len()
             );
         }
+        let file_hash = if is_quick_check_token(&file.file_hash) {
+            blake3::hash(&raw).to_hex().to_string()
+        } else {
+            file.file_hash.clone()
+        };
 
         let raw_len = raw.len();
         let encode_started = Instant::now();
@@ -3527,7 +3800,7 @@ async fn transfer_small_upload_batch(
             uid: file.uid,
             gid: file.gid,
             xattrs,
-            file_hash: file.file_hash.clone(),
+            file_hash,
             total_chunks: file.total_chunks,
             compressed,
             raw_len,
@@ -4343,7 +4616,9 @@ pub async fn pull_directory_over_ssh_stream(
                             }
                         } else if existing_mtime == meta.mtime_sec {
                             if let Some(target) = meta.symlink_target.as_deref() {
-                                copy = !existing_symlink_matches(&destination_path, target);
+                                copy =
+                                    !existing_symlink_matches(&handle, &destination_path, target)
+                                        .await;
                             }
                         }
                     }
@@ -4734,7 +5009,9 @@ pub async fn pull_directory_over_quic(
                             }
                         } else if existing_mtime == meta.mtime_sec {
                             if let Some(target) = meta.symlink_target.as_deref() {
-                                copy = !existing_symlink_matches(&destination_path, target);
+                                copy =
+                                    !existing_symlink_matches(&handle, &destination_path, target)
+                                        .await;
                             }
                         }
                     }
@@ -5127,8 +5404,7 @@ async fn remove_existing_path_for_symlink(handle: &RuntimeHandle, path: &Path) -
     match fs::symlink_metadata(handle, path).await {
         Ok(meta) => {
             if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-                std::fs::remove_dir_all(path)
-                    .with_context(|| format!("remove existing directory {}", path.display()))?;
+                remove_dir_tree(handle, path).await?;
             } else {
                 fs::remove_file(handle, path)
                     .await
@@ -5152,8 +5428,8 @@ async fn create_or_replace_symlink(
         .with_context(|| format!("create symlink {} -> {}", destination.display(), target))
 }
 
-fn existing_symlink_matches(path: &Path, target: &str) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+async fn existing_symlink_matches(handle: &RuntimeHandle, path: &Path, target: &str) -> bool {
+    let Ok(meta) = fs::symlink_metadata(handle, path).await else {
         return false;
     };
     if !meta.file_type().is_symlink() {

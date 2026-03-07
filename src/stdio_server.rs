@@ -13,7 +13,7 @@ use crate::protocol::{
     XattrEntry,
 };
 use crate::state::{CompleteFileInput, StateStore};
-use crate::util::{partial_path, sanitize_relative};
+use crate::util::{is_quick_check_token, partial_path, remove_dir_tree, sanitize_relative};
 use anyhow::{Context, Result, bail};
 use spargio::{RuntimeHandle, fs};
 use std::collections::HashSet;
@@ -870,8 +870,7 @@ async fn remove_existing_path_for_symlink(handle: &RuntimeHandle, path: &Path) -
     match fs::symlink_metadata(handle, path).await {
         Ok(meta) => {
             if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-                std::fs::remove_dir_all(path)
-                    .with_context(|| format!("remove existing directory {}", path.display()))?;
+                remove_dir_tree(handle, path).await?;
             } else {
                 fs::remove_file(handle, path)
                     .await
@@ -981,17 +980,11 @@ async fn process_sync_file_metadata_batch(
     }
     let mut results = Vec::with_capacity(req.entries.len());
     for entry in req.entries {
-        if !context
-            .state
-            .is_complete_match(&entry.relative_path, &entry.file_hash, entry.size)?
-        {
-            results.push(SyncFileMetadataResult {
-                accepted: false,
-                skipped: false,
-                message: "state mismatch; file no longer complete for hash/size".to_string(),
-            });
-            continue;
-        }
+        let state_match =
+            context
+                .state
+                .is_complete_match(&entry.relative_path, &entry.file_hash, entry.size)?;
+        let quick_check = is_quick_check_token(&entry.file_hash);
         let relative = sanitize_relative(&entry.relative_path)?;
         let destination = context.destination.join(&relative);
         let existing = match fs::metadata_lite(&context.handle, &destination).await {
@@ -1018,6 +1011,14 @@ async fn process_sync_file_metadata_batch(
                 });
             }
         };
+        if !state_match && !quick_check {
+            results.push(SyncFileMetadataResult {
+                accepted: false,
+                skipped: false,
+                message: "state mismatch; file no longer complete for hash/size".to_string(),
+            });
+            continue;
+        }
         if existing.size != entry.size {
             results.push(SyncFileMetadataResult {
                 accepted: false,
@@ -1025,6 +1026,17 @@ async fn process_sync_file_metadata_batch(
                 message: format!(
                     "destination size mismatch: expected {} got {}",
                     entry.size, existing.size
+                ),
+            });
+            continue;
+        }
+        if quick_check && existing.mtime_sec != entry.mtime_sec {
+            results.push(SyncFileMetadataResult {
+                accepted: false,
+                skipped: false,
+                message: format!(
+                    "destination mtime mismatch: expected {} got {}",
+                    entry.mtime_sec, existing.mtime_sec
                 ),
             });
             continue;

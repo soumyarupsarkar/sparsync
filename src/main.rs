@@ -175,6 +175,9 @@ struct PushArgs {
     #[arg(short = 'u', long = "update")]
     update_only: bool,
 
+    #[arg(short = 'c', long = "checksum")]
+    checksum: bool,
+
     #[arg(long = "exclude")]
     exclude: Vec<String>,
 
@@ -231,6 +234,9 @@ struct SyncArgs {
 
     #[arg(short = 'u', long = "update")]
     update_only: bool,
+
+    #[arg(short = 'c', long = "checksum")]
+    checksum: bool,
 
     #[arg(short = 'X', long = "xattrs")]
     xattrs: bool,
@@ -830,6 +836,7 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                 max_stream_payload: args.max_stream_payload,
                 resume: !args.no_resume,
                 update_only: args.update_only,
+                checksum: args.checksum,
                 cold_start: args.cold_start,
                 manifest_out: args.manifest_out,
                 preserve_metadata: false,
@@ -1620,11 +1627,12 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
     let progress_enabled = args.partial_progress || args.progress;
     if args.verbose {
         println!(
-            "sync options transport={} bootstrap={} archive={} compress={} update_only={} delete={} include_patterns={} exclude_patterns={} bwlimit_kbps={}",
+            "sync options transport={} bootstrap={} archive={} compress={} checksum={} update_only={} delete={} include_patterns={} exclude_patterns={} bwlimit_kbps={}",
             args.transport,
             args.bootstrap,
             args.archive,
             args.rsync_compress,
+            args.checksum,
             args.update_only,
             args.delete,
             args.include.len(),
@@ -1909,6 +1917,7 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                             max_stream_payload: args.max_stream_payload,
                             resume: !args.no_resume || partial_enabled,
                             update_only: args.update_only,
+                            checksum: args.checksum,
                             cold_start: args.cold_start,
                             manifest_out: args.manifest_out,
                             preserve_metadata,
@@ -2030,6 +2039,7 @@ async fn run_sync_command(handle: RuntimeHandle, args: SyncArgs) -> Result<()> {
                             max_stream_payload: args.max_stream_payload,
                             resume: !args.no_resume || partial_enabled,
                             update_only: args.update_only,
+                            checksum: args.checksum,
                             cold_start: args.cold_start,
                             manifest_out: args.manifest_out,
                             preserve_metadata,

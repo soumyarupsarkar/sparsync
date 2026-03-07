@@ -1,5 +1,6 @@
 use crate::filter::PathFilter;
 use crate::metadata;
+use crate::util::remove_dir_tree;
 use anyhow::{Context, Result};
 use spargio::{RuntimeHandle, fs};
 use std::collections::HashSet;
@@ -426,8 +427,7 @@ async fn remove_existing_path_for_symlink(handle: &RuntimeHandle, path: &Path) -
     match fs::symlink_metadata(handle, path).await {
         Ok(meta) => {
             if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-                std::fs::remove_dir_all(path)
-                    .with_context(|| format!("remove existing directory {}", path.display()))?;
+                remove_dir_tree(handle, path).await?;
             } else {
                 fs::remove_file(handle, path)
                     .await
