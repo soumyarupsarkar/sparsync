@@ -3,7 +3,7 @@
 
 sparsync is optimized for synchronizing large file trees with extremely high concurrency (not multiplexing over an SSH session). It works well for backups to a NAS. It is Linux-only for now.
 
-For such workloads, our benchmarks show **20% faster performance than rsync-over-SSH for initial syncs, and up to 10x faster subsequent syncs.**
+For such workloads, our latest benchmark snapshot shows `sparsync` about **30% faster than rsync-over-SSH on initial sync**, and roughly **5-8x faster on repeated no-change/changed runs**.
 
 ## Overview
 `sparsync` is a high-performance file synchronization tool, protocol, and server focused on syncing very large directory trees. It provides rsync-like CLI ergonomics, but is designed around QUIC for transport and `io_uring` for IO operations.
@@ -82,7 +82,7 @@ Runtime and protocol notes:
 ## Benchmarks
 Note that performance depends heavily on dataset shape, storage characteristics, CPU, network path, and transport mode.
 
-Current published snapshots are in [`BENCHMARKS.md`](./BENCHMARKS.md). The latest section (March 6, 2026) includes medians from repeated localhost-loopback runs on a personal laptop.
+Current published snapshots are in [`BENCHMARKS.md`](./BENCHMARKS.md). The latest section (March 7, 2026) includes medians from repeated localhost-loopback runs on a personal laptop.
 
 ### Latest published snapshot (from `BENCHMARKS.md`)
 Dataset in that run:
@@ -94,9 +94,9 @@ Baseline harness (`RUNS=3`, QUIC vs rsync over SSH):
 
 | Metric | sparsync QUIC (ms) | rsync over SSH (ms) | sparsync / rsync |
 |---|---:|---:|---:|
-| Initial sync | 416 | 520 | 0.80x |
-| Second sync (no changes) | 26 | 245 | 0.11x |
-| Changed sync | 51 | 263 | 0.19x |
+| Initial sync | 404 | 582 | 0.69x |
+| Second sync (no changes) | 29 | 245 | 0.12x |
+| Changed sync | 52 | 262 | 0.20x |
 
 ## Reproducing the benchmark
 Build:

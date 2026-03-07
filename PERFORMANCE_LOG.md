@@ -3,7 +3,6 @@
 ## Scope
 
 This note captures the cold-start optimization work and profiling results for `sparsync` as of **March 4, 2026**.
-Forward-looking execution plan is in [PERF_PLAN.md](./PERF_PLAN.md).
 
 Primary goal in this pass:
 

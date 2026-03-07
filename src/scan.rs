@@ -653,8 +653,7 @@ async fn metadata_one_file(
         .await
         .with_context(|| format!("lstat {}", absolute_path.display()))?;
     if symlink_metadata.file_type().is_symlink() {
-        let target = std::fs::read_link(absolute_path)
-            .with_context(|| format!("read symlink {}", absolute_path.display()))?;
+        let target = read_link_target(handle.clone(), absolute_path.to_path_buf()).await?;
         #[cfg(unix)]
         {
             return Ok(FileEntry {
@@ -704,6 +703,16 @@ async fn metadata_one_file(
         uid: metadata.uid,
         gid: metadata.gid,
     })
+}
+
+async fn read_link_target(handle: RuntimeHandle, path: PathBuf) -> Result<PathBuf> {
+    let display = path.display().to_string();
+    let join = handle
+        .spawn_blocking(move || std::fs::read_link(&path))
+        .map_err(|err| runtime_error("spawn read-link task", err))?;
+    join.await
+        .map_err(|err| join_error("read-link task canceled", err))?
+        .with_context(|| format!("read symlink {display}"))
 }
 
 async fn regular_metadata_one_file(

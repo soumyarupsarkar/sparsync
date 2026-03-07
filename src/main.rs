@@ -745,7 +745,6 @@ async fn run_command(handle: RuntimeHandle, cli: Cli) -> Result<()> {
                     chunk_size: args.chunk_size.max(1),
                     max_stream_payload: args.max_stream_payload,
                     metadata_only: args.metadata_only,
-                    preserve_metadata: args.preserve_metadata,
                     preserve_xattrs: args.preserve_xattrs,
                 },
             )

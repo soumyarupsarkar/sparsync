@@ -1,6 +1,25 @@
 # Benchmark Summary
 
-## Latest Snapshot (March 6, 2026)
+## Latest Snapshot (March 7, 2026)
+
+After planner quick-check + hash parallelism + blocking-path cleanup, median benchmark reruns were executed with:
+
+- `RUNS=3 TRANSPORTS=ssh ./scripts/bench_remote_rsync_vs_sparsync_median.sh`
+
+Dataset (median across runs):
+
+- `files=1008`
+- `bytes=20873216`
+
+### SSH Transport (`RUNS=3`)
+
+| Metric | sparsync (ms) | rsync over SSH (ms) | sparsync / rsync |
+|---|---:|---:|---:|
+| Initial sync | 404 | 582 | 0.69x |
+| Second sync (no changes) | 29 | 245 | 0.12x |
+| Changed sync | 52 | 262 | 0.20x |
+
+## Previous Snapshot (March 6, 2026)
 
 After QUIC no-change overhead reductions (`7f3137c`), median benchmark reruns were executed with:
 
@@ -145,8 +164,7 @@ Note: this is a reduced-size smoke dataset to validate behavior after major CLI/
 - Profiling used `valgrind` (`callgrind` and `cachegrind`) plus targeted `perf stat` and `strace -c` passes.
 - Top instruction consumers were memory initialization/copy (`memset`/`memcpy`) and QUIC/TLS crypto paths (`ring`/`quinn`), indicating first-sync is currently dominated by payload movement + encrypted transport overhead rather than scan/hashing.
 - Scan/hashing is not the main bottleneck in the benchmark profile: first push logs consistently show single-digit to low-double-digit millisecond scan phases versus ~400ms+ total push elapsed.
-- Full profiling/optimization log: [PERFORMANCE.md](./PERFORMANCE.md)
-- Ongoing execution roadmap: [PERF_PLAN.md](./PERF_PLAN.md)
+- Full profiling/optimization log: [PERFORMANCE_LOG.md](./PERFORMANCE_LOG.md)
 
 ## Reproduce
 

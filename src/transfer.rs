@@ -101,7 +101,6 @@ pub struct StreamSourceOptions {
     pub chunk_size: usize,
     pub max_stream_payload: usize,
     pub metadata_only: bool,
-    pub preserve_metadata: bool,
     pub preserve_xattrs: bool,
 }
 
