@@ -29,6 +29,8 @@ use std::process::Stdio;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
+const DEFAULT_SERVER_PORT: u16 = 28792;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "sparsync",
@@ -70,7 +72,7 @@ enum Command {
 
 #[derive(Debug, Args, Clone)]
 struct ServeArgs {
-    #[arg(long, default_value = "0.0.0.0:7844")]
+    #[arg(long, default_value = "0.0.0.0:28792")]
     bind: SocketAddr,
 
     #[arg(long)]
@@ -259,7 +261,7 @@ struct SyncArgs {
     #[arg(long)]
     ssh_target: Option<String>,
 
-    #[arg(long, default_value_t = 7844)]
+    #[arg(long, default_value_t = DEFAULT_SERVER_PORT)]
     server_port: u16,
 
     #[arg(long, default_value_t = 1024 * 1024)]
@@ -312,7 +314,7 @@ struct EnrollArgs {
     #[arg(long, default_value = "ephemeral")]
     install: String,
 
-    #[arg(long, default_value_t = 7844)]
+    #[arg(long, default_value_t = DEFAULT_SERVER_PORT)]
     server_port: u16,
 
     #[arg(long)]
@@ -354,7 +356,7 @@ struct ServerStartArgs {
     #[arg(long, default_value = "auto")]
     install: String,
 
-    #[arg(long, default_value_t = 7844)]
+    #[arg(long, default_value_t = DEFAULT_SERVER_PORT)]
     server_port: u16,
 
     #[arg(long)]
@@ -1307,7 +1309,7 @@ fn resolve_server_target(
                     }
                 })
                 .ok_or_else(|| anyhow::anyhow!("missing destination (pass --destination)"))?;
-            let profile_name = default_profile_name(&remote, 7844);
+            let profile_name = default_profile_name(&remote, DEFAULT_SERVER_PORT);
             let remote = if remote.is_ssh() {
                 remote
             } else {
@@ -1320,7 +1322,7 @@ fn resolve_server_target(
             let destination = destination_override
                 .map(ToString::to_string)
                 .ok_or_else(|| anyhow::anyhow!("missing destination (pass --destination)"))?;
-            let profile_name = default_profile_name(&remote, 7844);
+            let profile_name = default_profile_name(&remote, DEFAULT_SERVER_PORT);
             Ok((remote, destination, profile_name))
         }
     }
@@ -1343,7 +1345,7 @@ fn resolve_server_management_target(
     }
 
     if let Ok(remote) = endpoint::parse_ssh_target(target) {
-        let profile_name = default_profile_name(&remote, 7844);
+        let profile_name = default_profile_name(&remote, DEFAULT_SERVER_PORT);
         return Ok((remote, profile_name));
     }
 
@@ -1355,7 +1357,7 @@ fn resolve_server_management_target(
             ..remote
         },
         endpoint::Endpoint::Remote(remote) => {
-            let profile_name = default_profile_name(&remote, 7844);
+            let profile_name = default_profile_name(&remote, DEFAULT_SERVER_PORT);
             endpoint::RemoteEndpoint {
                 path: String::new(),
                 ..resolve_bootstrap_remote(&remote, &profile_name, None)?
@@ -1365,7 +1367,7 @@ fn resolve_server_management_target(
             bail!("server management target must be an ssh host or remote endpoint")
         }
     };
-    let profile_name = default_profile_name(&remote, 7844);
+    let profile_name = default_profile_name(&remote, DEFAULT_SERVER_PORT);
     Ok((remote, profile_name))
 }
 

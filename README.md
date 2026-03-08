@@ -20,22 +20,23 @@ Familiar rsync-style invocation:
 sparsync -avzP --delete -u ./src user@host:/srv/data
 ```
 
-Dedicated high-performance QUIC path leveraging the [`sparsync://` protocol](./PROTOCOL.md):
+Dedicated high-performance QUIC+mTLS path leveraging the [`sparsync://` protocol](./PROTOCOL.md):
 
 ```bash
+# start server + authorize this client for writes to /srv only (prefix-scoped mTLS policy)
+sparsync server start user@host --destination /srv
+
+# sync files
 sparsync -avzP --delete -u \
-  --transport quic --bootstrap ssh --ssh-target user@host \
-  ./src sparsync://host:7844/srv/data
+  --transport quic \
+  ./src sparsync://host:28792/srv/data
+
+# stop server
+sparsync server stop user@host
 ```
 
 Use the first form for compatibility.  
 Use the second form when you want the fastest path.
-
-Optionally, use the server CLI to manage the remote QUIC server. For example, to stop it:
-
-```bash
-sparsync server stop user@host
-```
 
 ## Why use sparsync?
 

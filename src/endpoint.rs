@@ -177,12 +177,12 @@ mod tests {
 
     #[test]
     fn parses_quic_url_remote() {
-        let parsed = parse_endpoint("sparsync://example.com:7844/srv/data").expect("parse remote");
+        let parsed = parse_endpoint("sparsync://example.com:28792/srv/data").expect("parse remote");
         match parsed {
             Endpoint::Remote(remote) => {
                 assert_eq!(remote.user, None);
                 assert_eq!(remote.host, "example.com");
-                assert_eq!(remote.port, Some(7844));
+                assert_eq!(remote.port, Some(28792));
                 assert_eq!(remote.path, "/srv/data");
                 assert_eq!(remote.kind, RemoteKind::Quic);
             }

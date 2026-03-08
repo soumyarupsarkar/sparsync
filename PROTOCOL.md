@@ -23,7 +23,7 @@ sparsync://<host>[:<port>]/<path>
 ```
 
 Notes:
-- Default port is implementation-configured (`7844` in current CLI defaults).
+- Default port is implementation-configured (`28792` in current CLI defaults).
 - The URI path is consumed by higher-level orchestration, not by the protocol frames themselves.
 - The protocol transfers **relative paths** rooted at the server's configured destination root.
 
