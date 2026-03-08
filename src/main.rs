@@ -75,7 +75,7 @@ struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:28792")]
     bind: SocketAddr,
 
-    #[arg(long)]
+    #[arg(long, default_value = "/")]
     destination: PathBuf,
 
     #[arg(long)]
@@ -108,7 +108,7 @@ struct ServeArgs {
 
 #[derive(Debug, Args, Clone)]
 struct ServeStdioArgs {
-    #[arg(long)]
+    #[arg(long, default_value = "/")]
     destination: PathBuf,
 
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
@@ -1290,7 +1290,7 @@ fn resolve_server_target(
         let destination = destination_override
             .map(ToString::to_string)
             .or(profile.destination.clone())
-            .ok_or_else(|| anyhow::anyhow!("profile '{}' has no destination", name))?;
+            .unwrap_or_else(|| "/".to_string());
         let remote = parse_ssh_endpoint(&ssh_target, &destination)?;
         return Ok((remote, destination, name.to_string()));
     }
@@ -1303,12 +1303,12 @@ fn resolve_server_target(
                 .map(ToString::to_string)
                 .or_else(|| {
                     if remote.path == "/" {
-                        None
+                        Some("/".to_string())
                     } else {
                         Some(remote.path.clone())
                     }
                 })
-                .ok_or_else(|| anyhow::anyhow!("missing destination (pass --destination)"))?;
+                .unwrap_or_else(|| "/".to_string());
             let profile_name = default_profile_name(&remote, DEFAULT_SERVER_PORT);
             let remote = if remote.is_ssh() {
                 remote
@@ -1318,10 +1318,10 @@ fn resolve_server_target(
             Ok((remote, destination, profile_name))
         }
         endpoint::Endpoint::Local(_) => {
-            let remote = parse_ssh_endpoint(target, destination_override.unwrap_or("/"))?;
             let destination = destination_override
                 .map(ToString::to_string)
-                .ok_or_else(|| anyhow::anyhow!("missing destination (pass --destination)"))?;
+                .unwrap_or_else(|| "/".to_string());
+            let remote = parse_ssh_endpoint(target, &destination)?;
             let profile_name = default_profile_name(&remote, DEFAULT_SERVER_PORT);
             Ok((remote, destination, profile_name))
         }

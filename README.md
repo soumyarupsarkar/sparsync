@@ -23,8 +23,8 @@ sparsync -avzP --delete -u ./src user@host:/srv/data
 Dedicated high-performance QUIC+mTLS path leveraging the [`sparsync://` protocol](./PROTOCOL.md):
 
 ```bash
-# start server + authorize this client for writes to /srv only (prefix-scoped mTLS policy)
-sparsync server start user@host --destination /srv
+# start server + authorize this client
+sparsync server start user@host
 
 # sync files
 sparsync -avzP --delete -u \
@@ -66,7 +66,7 @@ Finally, it's not the fastest if you're mainly making small changes to very larg
 - optional **mTLS** authorization for QUIC server mode
 - built on **Spargio** and `io_uring` for high concurrency on Linux
 
-## Note: why not just rsync?
+## Why not just rsync?
 `rsync` is mature, widely deployed, portable, and generally excellent software. The ability to specify any remote shell composably enables it to leverage any protocol. It should remain the default.
 
 However, when syncing a large file tree (e.g., home dir backup) between two systems, it can take hours; `sparsync` is noticeably faster.
@@ -76,7 +76,7 @@ However, when syncing a large file tree (e.g., home dir backup) between two syst
 ## Features
 - rsync-style primary CLI: `sparsync [OPTIONS] SRC DEST`
 - Transport auto-selection by endpoint (`user@host:/path` and `ssh://...` use SSH stdio; `sparsync://host[:port]/path` uses QUIC), with support for local copies without remote transport
-- Optional mTLS and prefix-scoped authorization for QUIC server mode
+- Optional mTLS authorization for QUIC server mode
 - Benchmark scripts and CI benchmark gate for reproducible performance tracking after release
 
 Additionally (like rsync),
