@@ -2,26 +2,9 @@
 
 `sparsync` is a Linux-first, rsync-style file synchronization tool optimized for very large directory trees and repeated syncs.
 
-It keeps familiar `rsync`-like CLI ergonomics, but adds a dedicated high-performance path built around QUIC, io_uring, and the [`spargio`](https://github.com/soumyarupsarkar/spargio) runtime, and uses `rkyv` for zero-copy metadata serialization. In our benchmarks (involving lots of little files), `sparsync` is about **30% faster than rsync-over-SSH on initial syncs and up to 10x faster on subsequent syncs.**
+It keeps familiar `rsync`-like CLI ergonomics, but adds a dedicated high-performance path built around QUIC, io_uring, and the [`spargio`](https://github.com/soumyarupsarkar/spargio) runtime, and uses `rkyv` for zero-copy metadata serialization.
 
-## Why use sparsync?
-
-Use `sparsync` when:
-
-- you sync large trees with many small files
-- you run the same sync repeatedly
-- metadata traversal, comparison, and per-file coordination dominate runtime
-- you can run a dedicated remote server path for maximum performance
-
-`sparsync` is especially aimed at workloads like home directory backups, NAS sync, and other cases where `rsync` works, but feels too slow on modern multi-core machines.
-
-## When not to use sparsync
-
-Don't use if you can't open UDP (QUIC) ports: for best performance, `sparsync` uses a remote daemon and QUIC over UDP. If you cannot use that deployment model, `sparsync` still supports SSH stdio transport, but likely won't be faster than plain `rsync`.
-
-Don't use if you work across heterogeneous machines (e.g., Mac and Linux). sparsync trades off portability for performance: it is Linux-only (kernel version 6.0+ recommended for io_uring/msg_ring support), and strictly enforces compatibility between clients and servers (matching protocol expectations including endianness and binary version). This is often the case when transferring files between machines, but when it isn't, sparsync will fail early with an explicit error message without initiating data transfer instead of falling back to a slower compatibility mode.
-
-Finally, don't use if you're mainly making small changes to very large files. Take a look at [Content Defined Chunking tools](https://github.com/google/cdc-file-transfer) instead for these workloads.
+In our benchmarks (involving lots of little files), `sparsync` is about **30% faster than rsync-over-SSH on initial syncs and up to 10x faster on subsequent syncs.**
 
 ## Quick start
 
@@ -47,6 +30,25 @@ Optionally, use the server CLI to manage the remote QUIC server. For example, to
 ```bash
 sparsync server stop user@host
 ```
+
+## Why use sparsync?
+
+Use `sparsync` when:
+
+- you sync large trees with many small files
+- you run the same sync repeatedly
+- metadata traversal, comparison, and per-file coordination dominate runtime
+- you can run a dedicated remote server path for maximum performance
+
+`sparsync` is especially aimed at workloads like home directory backups, NAS sync, and other cases where `rsync` works, but feels too slow on modern multi-core machines.
+
+## When not to use sparsync
+
+Don't use if you can't open UDP (QUIC) ports: for best performance, `sparsync` uses a remote daemon and QUIC over UDP. If you cannot use that deployment model, `sparsync` still supports SSH stdio transport, but likely won't be faster than plain `rsync`.
+
+Don't use if you work across heterogeneous machines (e.g., Mac and Linux). sparsync trades off portability for performance: it is Linux-only (kernel version 6.0+ recommended for io_uring/msg_ring support), and strictly enforces compatibility between clients and servers (matching protocol expectations including endianness and binary version). This is often the case when transferring files between machines, but when it isn't, sparsync will fail early with an explicit error message without initiating data transfer instead of falling back to a slower compatibility mode.
+
+Finally, it's not the fastest if you're mainly making small changes to very large files. Take a look at [Content Defined Chunking tools](https://github.com/google/cdc-file-transfer) instead for these workloads.
 
 ## What makes it different?
 
