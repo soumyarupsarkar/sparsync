@@ -23,7 +23,7 @@ sparsync -avzP --delete -u ./src user@host:/srv/data
 Dedicated high-performance QUIC+mTLS path leveraging the [`sparsync://` protocol](./PROTOCOL.md):
 
 ```bash
-# start server + authorize this client
+# remotely start server + authorize the client over SSH
 sparsync server start user@host
 
 # sync files
@@ -31,7 +31,7 @@ sparsync -avzP --delete -u \
   --transport quic \
   ./src sparsync://host:28792/srv/data
 
-# stop server
+# remotely stop server
 sparsync server stop user@host
 ```
 
