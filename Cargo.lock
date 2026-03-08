@@ -1374,9 +1374,9 @@ dependencies = [
 
 [[package]]
 name = "spargio"
-version = "0.5.9"
+version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c6250c8a2ed1a4c758ec2698fc38c5409b3b6898b3af37df937ffb93c27a486"
+checksum = "ec81ce05b075c4bc25c1d32e28511d33cd2d396d746108152111028c1ddbe37f"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
@@ -1388,9 +1388,9 @@ dependencies = [
 
 [[package]]
 name = "spargio-quic"
-version = "0.5.9"
+version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceb542d47dc580326583d5bc486e38f637d593f6483e0b8eb235da4bb7443e66"
+checksum = "2234a9fc7c5b5370ac11476535a21bb471d467f7f956559e99a504f002eebca1"
 dependencies = [
  "bytes",
  "quinn",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "sparsync"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "blake3",

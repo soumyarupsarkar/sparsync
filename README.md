@@ -1,54 +1,68 @@
 # sparsync
-`rsync`-compatible high-performance remote file synchronization utility (and optional server) built on QUIC and the [`spargio`](https://github.com/soumyarupsarkar/spargio) `io_uring` runtime, using `rkyv` for zero-copy metadata serialization.
 
-sparsync is optimized for synchronizing large file trees with extremely high concurrency (not multiplexing over an SSH session). It works well for backups to a NAS. It is Linux-only for now.
+`sparsync` is a Linux-first, rsync-style file synchronization tool optimized for very large directory trees and repeated syncs.
 
-For such workloads, our benchmarks show **30% faster performance than rsync-over-SSH for initial syncs, and up to 10x faster subsequent syncs.**
+It keeps familiar `rsync`-like CLI ergonomics, but adds a dedicated high-performance path built around QUIC, io_uring, and the [`spargio`](https://github.com/soumyarupsarkar/spargio) runtime, and uses `rkyv` for zero-copy metadata serialization. In our benchmarks (involving lots of little files), `sparsync` is about **30% faster than rsync-over-SSH on initial syncs and up to 10x faster on subsequent syncs.**
 
-## Overview
-`sparsync` is a high-performance file synchronization tool, protocol, and server focused on syncing very large directory trees. It provides rsync-like CLI ergonomics, but is designed around QUIC for transport and `io_uring` for IO operations.
+## Why use sparsync?
 
-The primary optimization target is sync workloads with many files and high metadata churn, especially repeated syncs where planning, comparison, and control-plane overhead dominate. `sparsync` also supports local copy, SSH stdio transport, and a [QUIC transport path (`sparsync://`) with optional mTLS authorization](./PROTOCOL.md).
+Use `sparsync` when:
 
-## Quick example
+- you sync large trees with many small files
+- you run the same sync repeatedly
+- metadata traversal, comparison, and per-file coordination dominate runtime
+- you can run a dedicated remote server path for maximum performance
+
+`sparsync` is especially aimed at workloads like home directory backups, NAS sync, and other cases where `rsync` works, but feels too slow on modern multi-core machines.
+
+## When not to use sparsync
+
+Don't use if you can't open UDP (QUIC) ports: for best performance, `sparsync` uses a remote daemon and QUIC over UDP. If you cannot use that deployment model, `sparsync` still supports SSH stdio transport, but likely won't be faster than plain `rsync`.
+
+Don't use if you work across heterogeneous machines (e.g., Mac and Linux). sparsync trades off portability for performance: it is Linux-only (kernel version 6.0+ recommended for io_uring/msg_ring support), and strictly enforces compatibility between clients and servers (matching protocol expectations including endianness and binary version). This is often the case when transferring files between machines, but when it isn't, sparsync will fail early with an explicit error message without initiating data transfer instead of falling back to a slower compatibility mode.
+
+Finally, don't use if you're mainly making small changes to very large files. Take a look at [Content Defined Chunking tools](https://github.com/google/cdc-file-transfer) instead for these workloads.
+
+## Quick start
+
+Familiar rsync-style invocation:
+
 ```bash
-# rsync-style invocation (implicit `sync` command)
-sparsync -av --delete ./src user@host:/srv/data
+sparsync -avzP --delete -u ./src user@host:/srv/data
 ```
 
+Dedicated high-performance QUIC path leveraging the [`sparsync://` protocol](./PROTOCOL.md):
+
 ```bash
-# explicit QUIC path with SSH bootstrap on first contact
-# this initializes a sparsync server on a host, enrolls the client, and connects via QUIC+mTLS
-sparsync -av \
-  --delete \
-  --transport quic \
-  --bootstrap ssh \
-  --ssh-target user@host \
+sparsync -avzP --delete -u \
+  --transport quic --bootstrap ssh --ssh-target user@host \
   ./src sparsync://host:7844/srv/data
 ```
 
+Use the first form for compatibility.  
+Use the second form when you want the fastest path.
+
+Optionally, use the server CLI to manage the remote QUIC server. For example, to stop it:
+
 ```bash
-# stop the remote server if you'd like when done
 sparsync server stop user@host
 ```
 
-## Why sparsync?
-Most file sync tools were designed for earlier machine profiles. Current systems often have many cores, NVMe-backed storage, and (most importantly) very large trees of many small files. In these workloads, sync time can be dominated by metadata traversal, scheduling overhead, and per-file coordination.
+## What makes it different?
 
-`sparsync` is designed to reduce those bottlenecks by batching control work, parallelizing scan/hash/transfer stages, and keeping transport overhead low on repeat runs.
+- **rsync-style CLI** with support for local copy, SSH stdio transport, and `sparsync://` QUIC transport
+- **parallel scan, hash, and transfer pipeline**
+- **persistent hash cache** to accelerate repeated syncs
+- **batched control flow** to reduce per-file overhead
+- optional **mTLS** authorization for QUIC server mode
+- built on **Spargio** and `io_uring` for high concurrency on Linux
 
-## Why not just rsync?
+## Note: why not just rsync?
 `rsync` is mature, widely deployed, portable, and generally excellent software. The ability to specify any remote shell composably enables it to leverage any protocol. It should remain the default.
 
-However, sometimes I kick off a sync for a large file tree (e.g., home dir backup) between two systems, it takes hours, and I get very impatient. `sparsync` is noticeably faster.
+However, when syncing a large file tree (e.g., home dir backup) between two systems, it can take hours; `sparsync` is noticeably faster.
 
-## When shouldn't I use sparsync?
-For maximum performance, `sparsync` requires running a daemon on the server and connecting through UDP (QUIC) ports. If this isn't possible, `sparsync` still works but it likely won't be faster than just using `rsync`.
-
-Additionally, sparsync trades off portability for performance: it is Linux-only (kernel version 6.0+ recommended for io_uring/msg_ring support), and strictly enforces compatibility between clients and servers (matching protocol expectations including endianness and binary version). This is often the case when transferring files between machines, but when it isn't, sparsync will fail early with an explicit error message without initiating data transfer instead of falling back to a slower compatibility mode.
-
-## Disclaimer
-Like `spargio`, this is an experimental crate, with contributions from Codex that haven't been fully audited yet. Keep backups and do not use in production.
+`sparsync` is designed to reduce bottlenecks when syncing lots of little files (metadata traversal, scheduling overhead, and per-file coordination) by batching control work, parallelizing scan/hash/transfer stages, and keeping transport overhead low on repeat runs.
 
 ## Features
 - rsync-style primary CLI: `sparsync [OPTIONS] SRC DEST`
@@ -161,7 +175,9 @@ sparsync --help
 ```
 
 ## Project status
-`sparsync` is experimental with further performance and compatibility work pending.
+`sparsync` is currently Linux-only and experimental. Do not treat it as production-hardened software yet.
+
+Further performance and compatibility work is pending.
 
 Current state:
 - Core sync paths and benchmark harnesses are present.

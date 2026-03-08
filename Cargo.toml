@@ -1,6 +1,6 @@
 [package]
 name = "sparsync"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.85"
 description = "rsync-style high-performance file synchronization over QUIC and Spargio"
@@ -37,5 +37,5 @@ zstd = "0.13"
 io-uring = "0.7"
 libc = "0.2"
 globset = "0.4"
-spargio = { version = "0.5.9", features = ["uring-native"] }
-spargio-quic = "0.5.9"
+spargio = { version = "0.5", features = ["uring-native"] }
+spargio-quic = "0.5"
