@@ -2,11 +2,17 @@
 
 `sparsync` is a Linux-first, rsync-style file synchronization tool optimized for very large directory trees and repeated syncs.
 
-It keeps familiar `rsync`-like CLI ergonomics, but adds a dedicated high-performance path built around QUIC, io_uring, and the [`spargio`](https://github.com/soumyarupsarkar/spargio) runtime, and uses `rkyv` for zero-copy metadata serialization.
+It's built around QUIC, io_uring, and the [`spargio`](https://github.com/soumyarupsarkar/spargio) runtime, and uses `rkyv` for zero-copy metadata serialization.
 
-In our benchmarks (involving lots of little files), `sparsync` is about **30% faster than rsync-over-SSH on initial syncs and up to 10x faster on subsequent syncs.**
+In our current published benchmarks (involving lots of little files), `sparsync` is about **30% faster than rsync-over-SSH on initial syncs and up to 10x faster on subsequent syncs.**
 
-## Quick start
+## Installation and quick start
+
+Install from crates.io:
+
+```bash
+cargo install sparsync
+```
 
 Familiar rsync-style invocation:
 
@@ -156,30 +162,8 @@ sparsync bench --files 1000000 --tasks 500000 --io-ops 100000 --in-flight 8192
 - Small, infrequent sync jobs where setup overhead dominates
 - Environments requiring maximal rsync flag/protocol compatibility today
 
-## Installation
-From crates.io:
-```bash
-cargo install sparsync
-```
-
-From source:
-```bash
-git clone https://github.com/soumyarupsarkar/sparsync.git
-cd sparsync
-cargo install --path .
-# or: cargo build --release
-```
-
-Binary path:
-```bash
-sparsync --help
-# or: ./target/release/sparsync --help
-```
-
 ## Project status
-`sparsync` is currently Linux-only and experimental. Do not treat it as production-hardened software yet.
-
-Further performance and compatibility work is pending.
+`sparsync` is currently Linux-only and experimental. Test carefully before using it for important data. Near-term work is focused on performance tuning and compatibility improvements.
 
 Current state:
 - Core sync paths and benchmark harnesses are present.
